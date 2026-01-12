@@ -40,7 +40,14 @@ TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
 PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "9100"))
 HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", "8080"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-TOP_STREAMERS_COUNT = 5
+
+# Hysteresis thresholds for chat room management
+# Join chat when streamer enters top JOIN_THRESHOLD
+# Leave chat only when streamer exits top LEAVE_THRESHOLD
+# This preserves Flink baseline data during rank fluctuations
+JOIN_THRESHOLD = 5   # Join chat rooms for top 5 streamers
+LEAVE_THRESHOLD = 10  # Only leave when streamer drops out of top 10
+
 REDIS_STREAMER_TTL = 180  # 3 minutes TTL for streamer online status
 POLL_INTERVAL_SECONDS = 120  # Poll every 2 minutes
 
@@ -179,8 +186,11 @@ class StreamMonitoringService:
         if self.scheduler:
             self.scheduler.shutdown(wait=True)
 
-        if self.chat:
-            await self.chat.stop()
+        if self.chat is not None:
+            try:
+                await self.chat.stop()
+            except Exception as e:
+                logger.warning("Error stopping chat client", extra={"error": str(e)})
 
         if self.twitch:
             await self.twitch.close()
@@ -201,20 +211,27 @@ class StreamMonitoringService:
         try:
             logger.info("Polling for top streams")
 
-            # Get top live streams
+            # Get top LEAVE_THRESHOLD streams (we need to know who's in top 10 for hysteresis)
             streams = []
-            async for stream in self.twitch.get_streams(first=TOP_STREAMERS_COUNT):
+            async for stream in self.twitch.get_streams(first=LEAVE_THRESHOLD):
                 streams.append(stream)
-                if len(streams) >= TOP_STREAMERS_COUNT:
+                if len(streams) >= LEAVE_THRESHOLD:
                     break
 
-            current_streamers = set()
+            # Track streamers by rank for hysteresis logic
+            top_join_streamers = set()  # Streamers in top JOIN_THRESHOLD (eligible to join)
+            top_leave_streamers = set()  # Streamers in top LEAVE_THRESHOLD (not yet eligible to leave)
 
             for rank, stream in enumerate(streams, 1):
                 broadcaster_login = stream.user_login.lower()
                 broadcaster_id = int(stream.user_id)
-                current_streamers.add(broadcaster_login)
                 self.broadcaster_ids[broadcaster_login] = broadcaster_id
+
+                # Track which threshold each streamer is in
+                if rank <= JOIN_THRESHOLD:
+                    top_join_streamers.add(broadcaster_login)
+                if rank <= LEAVE_THRESHOLD:
+                    top_leave_streamers.add(broadcaster_login)
 
                 # Update Redis with TTL
                 redis_key = f"streamer:online:{broadcaster_login}"
@@ -224,8 +241,8 @@ class StreamMonitoringService:
                 # Update Postgres
                 self._upsert_streamer(broadcaster_id, broadcaster_login)
 
-                # Publish lifecycle event if new
-                if is_new:
+                # Publish lifecycle event if new (only for top JOIN_THRESHOLD)
+                if is_new and rank <= JOIN_THRESHOLD:
                     self._publish_lifecycle_event("online", broadcaster_id, broadcaster_login, rank)
                     logger.info("Streamer online", extra={
                         "broadcaster_login": broadcaster_login,
@@ -233,9 +250,9 @@ class StreamMonitoringService:
                         "rank": rank
                     })
 
-            # Check for streamers that went offline
+            # Check for streamers that went offline (dropped out of top LEAVE_THRESHOLD)
             for login in list(self.joined_channels):
-                if login not in current_streamers:
+                if login not in top_leave_streamers:
                     redis_key = f"streamer:online:{login}"
                     if not self.redis_client.exists(redis_key):
                         broadcaster_id = self.broadcaster_ids.get(login, 0)
@@ -245,20 +262,35 @@ class StreamMonitoringService:
                             "broadcaster_id": broadcaster_id
                         })
 
-            # Update metrics
-            active_stream_count.set(len(current_streamers))
+            # Update metrics (count of streamers we're actively monitoring)
+            active_stream_count.set(len(self.joined_channels))
 
-            # Manage chat connections
-            await self._manage_chat_connections(current_streamers)
+            # Manage chat connections with hysteresis
+            await self._manage_chat_connections(top_join_streamers, top_leave_streamers)
 
         except Exception as e:
             logger.error("Error polling streams", extra={"error": str(e)})
             twitch_api_errors_total.labels(error_type="poll_streams").inc()
 
-    async def _manage_chat_connections(self, target_channels: Set[str]):
-        """Manage chat room connections based on target channels."""
-        channels_to_join = target_channels - self.joined_channels
-        channels_to_leave = self.joined_channels - target_channels
+    async def _manage_chat_connections(self, join_eligible: Set[str], leave_eligible: Set[str]):
+        """
+        Manage chat room connections with hysteresis.
+
+        Args:
+            join_eligible: Streamers in top JOIN_THRESHOLD (should join if not already joined)
+            leave_eligible: Streamers in top LEAVE_THRESHOLD (should NOT leave yet)
+
+        Hysteresis logic:
+        - Join chat when streamer enters top 5 (JOIN_THRESHOLD)
+        - Leave chat only when streamer drops out of top 10 (LEAVE_THRESHOLD)
+        - This prevents thrashing and preserves Flink baseline data
+        """
+        # Join channels for streamers who entered top JOIN_THRESHOLD
+        channels_to_join = join_eligible - self.joined_channels
+
+        # Only leave channels for streamers who dropped out of top LEAVE_THRESHOLD
+        # (i.e., they're currently joined but NOT in leave_eligible set)
+        channels_to_leave = self.joined_channels - leave_eligible
 
         # Initialize chat if needed
         if channels_to_join and not self.chat:
@@ -272,21 +304,27 @@ class StreamMonitoringService:
                 logger.error("Failed to start chat client", extra={"error": str(e)})
                 return
 
-        # Join new channels
+        # Join new channels (entered top JOIN_THRESHOLD)
         for channel in channels_to_join:
             try:
                 await self.chat.join_room(channel)
                 self.joined_channels.add(channel)
-                logger.info("Joined chat room", extra={"channel": channel})
+                logger.info("Joined chat room", extra={
+                    "channel": channel,
+                    "reason": f"entered top {JOIN_THRESHOLD}"
+                })
             except Exception as e:
                 logger.error("Failed to join chat room", extra={"channel": channel, "error": str(e)})
 
-        # Leave old channels
+        # Leave channels (dropped out of top LEAVE_THRESHOLD)
         for channel in channels_to_leave:
             try:
                 await self.chat.leave_room(channel)
                 self.joined_channels.discard(channel)
-                logger.info("Left chat room", extra={"channel": channel})
+                logger.info("Left chat room", extra={
+                    "channel": channel,
+                    "reason": f"exited top {LEAVE_THRESHOLD}"
+                })
             except Exception as e:
                 logger.error("Failed to leave chat room", extra={"channel": channel, "error": str(e)})
 

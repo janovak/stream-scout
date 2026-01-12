@@ -62,7 +62,12 @@
 1. **Stream Monitoring Service** (`stream_monitoring_service.py`)
    - **Responsibilities**:
      - Scheduled polling of Twitch Streams API (every 2 minutes)
-     - Manage chat room connections (join/leave)
+     - Manage chat room connections with hysteresis:
+       - Join threshold: top 5 (JOIN_THRESHOLD=5)
+       - Leave threshold: top 10 (LEAVE_THRESHOLD=10)
+       - Join chat when streamer enters top 5
+       - Leave chat only when streamer exits top 10
+       - Preserves Flink baseline data during rank fluctuations
      - Publish chat messages to Kafka
      - Publish stream lifecycle events to Kafka
      - Update streamer database
@@ -86,7 +91,7 @@
      - Filter command messages (starting with !)
      - Window messages by broadcaster_id using sliding windows (5-second buckets)
      - Calculate message rate statistics (mean, standard deviation)
-     - Detect anomalies (recent activity > baseline + 3 std dev)
+     - Detect anomalies (recent activity > baseline + 1 std dev)
      - Track 30-second cooldown per broadcaster in Flink state
      - Call Twitch Clips API to create clip on anomaly
      - Retry failed clips (max 3 attempts within 10-second window: 0s, 3s, 6s delays)

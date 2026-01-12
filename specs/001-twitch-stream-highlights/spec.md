@@ -10,6 +10,10 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 - Poll Twitch Streams API every 2 minutes to identify top live streamers
 - Filter streamers who have clipping disabled
 - Automatically join chat rooms of top-ranked streamers
+- Use hysteresis for chat room management to preserve Flink baseline data:
+  - Join chat room when streamer enters top 5
+  - Leave chat room only when streamer drops out of top 10
+  - This prevents thrashing when streamers fluctuate around rank boundaries
 - Listen to all messages in joined chat rooms and publish to Kafka
 - Dynamically manage chat room lifecycle based on stream status
 - Use Redis TTL to detect when streamers go offline
@@ -20,7 +24,7 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 - Consume chat messages from Kafka topic `chat-messages`
 - Filter out command messages (starting with !) to avoid false positives
 - Use sliding windows (5-second buckets) to track message frequency per broadcaster
-- Detect statistical anomalies using baseline comparison (mean + 3 standard deviations)
+- Detect statistical anomalies using baseline comparison (mean + 1 standard deviation)
 - Implement 30-second cooldown between detections per broadcaster using Flink state
 - On anomaly detection, call Twitch Clips API to create clip
 - Retry failed clip creation (max 3 attempts within 10-second window: 0s, 3s, 6s delays)
@@ -89,10 +93,11 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 5. Clip auto-plays with Twitch embed player
 
 **System Workflow** (Simplified):
-1. Stream Monitoring Service identifies top 5 live streamers every 2 minutes
-2. Same service joins those chat rooms and publishes messages to Kafka
-3. Flink job consumes messages, detects anomalies, creates clips, and stores in Postgres
-4. API Service queries Postgres and serves data to frontend
+1. Stream Monitoring Service identifies top 10 live streamers every 2 minutes
+2. Service joins chat rooms for streamers entering top 5, leaves only when they exit top 10 (hysteresis)
+3. Chat messages are published to Kafka for all joined streamers
+4. Flink job consumes messages, detects anomalies, creates clips, and stores in Postgres
+5. API Service queries Postgres and serves data to frontend
 
 ## Functional Requirements
 

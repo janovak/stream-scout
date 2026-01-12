@@ -16,6 +16,7 @@
 **Stream Monitoring Service**:
 - [X] Implement Twitch API polling scheduler
 - [X] Implement chat connection manager
+- [X] Implement hysteresis for chat room join/leave (join at top 5, leave at top 10)
 - [X] Implement Kafka producer for chat messages
 - [X] Implement Kafka producer for lifecycle events
 - [X] Implement Postgres streamer persistence
@@ -25,8 +26,8 @@
 - [X] Add graceful shutdown handling
 - [X] Implement headless OAuth authentication with pre-seeded tokens
 - [X] Implement token refresh callback to persist refreshed tokens
-- [ ] Unit tests for anomaly detection logic
-- [ ] Integration tests with mocked Twitch API
+- [X] Unit tests for anomaly detection logic
+- [X] Integration tests with mocked Twitch API
 
 **Twitch OAuth Token Seeding**:
 - [X] Create `seed_twitch_tokens.py` CLI tool using pyTwitchAPI CodeFlow
@@ -43,7 +44,7 @@
 - [X] Implement keyBy(broadcaster_id) for partitioned processing
 - [X] Implement sliding window (5-second window, 1-second slide)
 - [X] Implement window aggregation function (count messages per window)
-- [ ] Implement anomaly detection logic (mean + 1 std dev baseline comparison)
+- [X] Implement anomaly detection logic (mean + 1 std dev baseline comparison)
 - [X] Implement process function for stateful cooldown tracking (30 seconds)
 - [X] Implement Twitch API clip creation with async HTTP requests
 - [X] Implement retry logic within 10-second window (3 attempts: 0s, 3s, 6s delays)
@@ -51,7 +52,7 @@
 - [X] Add custom Flink metrics (anomalies_detected, clips_created, etc.)
 - [X] Configure Flink Prometheus reporter
 - [X] Implement proper error handling and logging
-- [ ] Unit tests for anomaly detection logic
+- [X] Unit tests for anomaly detection logic
 - [ ] Integration tests with Flink MiniCluster
 - [ ] End-to-end test with Kafka and Postgres
 
@@ -65,8 +66,8 @@
 - [X] Serve static frontend files
 - [X] Add database query optimization (indexes, EXPLAIN ANALYZE)
 - [X] Add request/response logging
-- [ ] Unit tests for API endpoints
-- [ ] Integration tests with Postgres
+- [X] Unit tests for API endpoints
+- [X] Integration tests with Postgres
 
 **Frontend Updates**:
 - [X] Update API endpoint URLs (if changed)
