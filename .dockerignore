@@ -1,0 +1,49 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+docs/
+
+# Tests
+tests/
+*_test.py
+test_*.py
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env*
+!.env.example
+
+# Specs
+.specify/
+specs/
+
+# Temporary
+*.tmp
+*.temp
+tmp/
+temp/

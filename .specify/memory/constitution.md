@@ -1,50 +1,28 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+# Twitch Stream Highlights System - Constitution
 
-## Core Principles
+## Project Governing Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+**Purpose**: Automatically identify and capture highlight-worthy moments from popular Twitch streams by detecting chat activity spikes and creating clips for user consumption.
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+**Core Values**:
+- Real-time responsiveness: Monitor live streams and detect anomalies as they happen
+- Scalability: Handle monitoring multiple high-traffic streams simultaneously
+- Reliability: Ensure no highlight moments are missed due to system failures
+- Simplicity: Reduce operational complexity through service consolidation
+- Data integrity: Accurately capture and store clip metadata for retrieval
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+**Technical Constraints**:
+- Must use Kafka for all message streaming between services
+- Must use Postgres exclusively for all persistent data storage
+- Must use Apache Flink (PyFlink) for stream processing and anomaly detection
+- Must integrate with Twitch API for stream data and clip creation
+- Must provide Prometheus metrics for monitoring
+- Must use Grafana/Loki for observability
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
-
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
-
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
-
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
-
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
-
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
-
-## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
-
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
-
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**Non-Negotiables**:
+- No data loss in the event pipeline (Kafka → Processing → Storage)
+- All services must expose health check endpoints
+- All services must log to centralized logging (Promtail → Loki)
+- Anomaly detection must filter out bot commands to avoid false positives
+- Single source of truth: All data in Postgres
+- Must always use Python virtual environments when installing packages

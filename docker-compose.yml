@@ -1,0 +1,282 @@
+services:
+  # =============================================================================
+  # Infrastructure Services
+  # =============================================================================
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: streamscout-postgres
+    environment:
+      POSTGRES_DB: twitch
+      POSTGRES_USER: twitch
+      POSTGRES_PASSWORD: twitch_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twitch -d twitch"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - streamscout
+
+  redis:
+    image: redis:7-alpine
+    container_name: streamscout-redis
+    command: redis-server --notify-keyspace-events Ex
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - streamscout
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: streamscout-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    networks:
+      - streamscout
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: streamscout-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - streamscout
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: streamscout-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Creating Kafka topics...'
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic stream-lifecycle --partitions 10 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic chat-messages --partitions 20 --replication-factor 1 --config retention.ms=3600000
+      echo 'Kafka topics created successfully!'
+      kafka-topics --bootstrap-server kafka:29092 --list
+      "
+    networks:
+      - streamscout
+
+  # =============================================================================
+  # Apache Flink Cluster
+  # =============================================================================
+
+  flink-jobmanager:
+    build:
+      context: ./services/flink-job
+      dockerfile: Dockerfile
+    container_name: streamscout-flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"
+      - "9249:9249"
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 1024m
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - POSTGRES_URL=jdbc:postgresql://postgres:5432/twitch
+      - POSTGRES_USER=twitch
+      - POSTGRES_PASSWORD=twitch_password
+      - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
+      - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - streamscout
+
+  flink-taskmanager:
+    build:
+      context: ./services/flink-job
+      dockerfile: Dockerfile
+    container_name: streamscout-flink-taskmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.memory.process.size: 2048m
+        taskmanager.numberOfTaskSlots: 4
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - POSTGRES_URL=jdbc:postgresql://postgres:5432/twitch
+      - POSTGRES_USER=twitch
+      - POSTGRES_PASSWORD=twitch_password
+      - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
+      - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+    depends_on:
+      - flink-jobmanager
+    networks:
+      - streamscout
+
+  # =============================================================================
+  # Application Services
+  # =============================================================================
+
+  stream-monitoring:
+    build:
+      context: ./services/stream-monitoring
+      dockerfile: Dockerfile
+    container_name: streamscout-stream-monitoring
+    ports:
+      - "8080:8080"
+      - "9100:9100"
+    environment:
+      - KAFKA_BROKER_URL=kafka:29092
+      - POSTGRES_URL=postgresql://twitch:twitch_password@postgres:5432/twitch
+      - REDIS_URL=redis://redis:6379
+      - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
+      - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+      - PROMETHEUS_PORT=9100
+      - HEALTH_CHECK_PORT=8080
+      - LOG_LEVEL=INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - streamscout
+
+  api-frontend:
+    build:
+      context: ./services/api-frontend
+      dockerfile: Dockerfile
+    container_name: streamscout-api-frontend
+    ports:
+      - "5000:5000"
+    environment:
+      - POSTGRES_URL=postgresql://twitch:twitch_password@postgres:5432/twitch
+      - HTTP_PORT=5000
+      - LOG_LEVEL=INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - streamscout
+
+  # =============================================================================
+  # Monitoring & Observability
+  # =============================================================================
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: streamscout-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    networks:
+      - streamscout
+
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: streamscout-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data:/loki
+    networks:
+      - streamscout
+
+  promtail:
+    image: grafana/promtail:2.9.0
+    container_name: streamscout-promtail
+    volumes:
+      - ./configs/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    networks:
+      - streamscout
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: streamscout-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./configs/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - streamscout
+
+networks:
+  streamscout:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:

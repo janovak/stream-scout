@@ -1,0 +1,28 @@
+# Flink Configuration for Clip Detector Job
+
+jobmanager.rpc.address: flink-jobmanager
+jobmanager.rpc.port: 6123
+jobmanager.memory.process.size: 1024m
+
+taskmanager.memory.process.size: 2048m
+taskmanager.numberOfTaskSlots: 4
+
+parallelism.default: 4
+
+# Disable checkpointing (hobby project - rebuild from Kafka on restart)
+execution.checkpointing.interval: 0
+
+# State backend
+state.backend: hashmap
+
+# Metrics
+metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prom.port: 9249
+
+# REST & Web UI
+rest.address: 0.0.0.0
+rest.port: 8081
+web.submit.enable: true
+
+# Logging
+env.log.dir: /opt/flink/log
