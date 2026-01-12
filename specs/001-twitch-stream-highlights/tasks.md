@@ -23,8 +23,18 @@
 - [X] Add Prometheus metrics
 - [X] Add health check endpoint
 - [X] Add graceful shutdown handling
+- [X] Implement headless OAuth authentication with pre-seeded tokens
+- [X] Implement token refresh callback to persist refreshed tokens
 - [ ] Unit tests for anomaly detection logic
 - [ ] Integration tests with mocked Twitch API
+
+**Twitch OAuth Token Seeding**:
+- [X] Create `seed_twitch_tokens.py` CLI tool using pyTwitchAPI CodeFlow
+- [X] Implement token file save/load functions (JSON format)
+- [X] Add secrets directory and Docker volume mount configuration
+- [X] Update docker-compose.yml with token file volume mount
+- [X] Update Stream Monitoring Service to load tokens from file on startup
+- [X] Register user_auth_refresh_callback to update token file on refresh
 
 **Flink Stream Processing Job**:
 - [X] Set up PyFlink development environment
@@ -33,7 +43,7 @@
 - [X] Implement keyBy(broadcaster_id) for partitioned processing
 - [X] Implement sliding window (5-second window, 1-second slide)
 - [X] Implement window aggregation function (count messages per window)
-- [X] Implement anomaly detection logic (mean + 3 std dev baseline comparison)
+- [ ] Implement anomaly detection logic (mean + 1 std dev baseline comparison)
 - [X] Implement process function for stateful cooldown tracking (30 seconds)
 - [X] Implement Twitch API clip creation with async HTTP requests
 - [X] Implement retry logic within 10-second window (3 attempts: 0s, 3s, 6s delays)

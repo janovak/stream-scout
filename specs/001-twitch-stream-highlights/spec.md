@@ -47,6 +47,20 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 - Centralized logging via Promtail to Grafana Loki
 - Grafana dashboards for operational visibility (services + Flink job)
 
+**5. Twitch OAuth Authentication (Headless)**
+- Support headless/server deployment without interactive browser authentication at runtime
+- One-time initial token seeding via CLI tool that uses pyTwitchAPI's `CodeFlow`:
+  - Generate authorization URL for user to visit in browser
+  - Wait for user to complete OAuth flow on Twitch website
+  - Receive and persist access token + refresh token to JSON file
+- Runtime authentication loads pre-seeded tokens from JSON file
+- Use `set_user_authentication()` with stored tokens and refresh token
+- Automatic token refresh via pyTwitchAPI's built-in refresh mechanism
+- Persist refreshed tokens via `user_auth_refresh_callback` to update JSON file
+- Required OAuth scopes: `chat:read` (join chat rooms), `clips:edit` (create clips)
+- Token file stored as Docker volume mount for persistence across container restarts
+- Refresh tokens never expire for Confidential client types (only invalidate if user changes password or disconnects app)
+
 ## Architecture Benefits
 
 **Simplicity**:

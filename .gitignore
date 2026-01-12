@@ -29,6 +29,11 @@ ENV/
 .env.*.local
 *.env
 
+# Secrets (OAuth tokens, credentials)
+secrets/
+*.tokens.json
+twitch_user_tokens.json
+
 # IDE
 .vscode/
 .idea/

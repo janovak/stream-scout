@@ -225,3 +225,50 @@ twitch-highlights/
 - `POSTGRES_URL`: Postgres connection string
 - `HTTP_PORT`: 5000
 - `LOG_LEVEL`: INFO
+
+## Twitch OAuth Headless Authentication
+
+**Token Seeding Tool** (`seed_twitch_tokens.py`):
+- Standalone CLI script for one-time token generation
+- Uses pyTwitchAPI's `CodeFlow` class for headless OAuth:
+  1. Initialize Twitch client with app credentials
+  2. Call `code_flow.get_code()` to get authorization URL
+  3. Print URL for user to visit in browser
+  4. Call `code_flow.wait_for_auth_complete()` to receive tokens
+  5. Save access token and refresh token to JSON file
+- Token file location: `./secrets/twitch_user_tokens.json`
+- Required scopes: `AuthScope.CHAT_READ`, `AuthScope.CLIPS_EDIT`
+
+**Token File Format**:
+```json
+{
+  "access_token": "xxx",
+  "refresh_token": "yyy",
+  "scopes": ["chat:read", "clips:edit"],
+  "created_at": "2026-01-11T00:00:00Z"
+}
+```
+
+**Runtime Authentication Flow** (Stream Monitoring Service):
+1. On startup, load tokens from JSON file (volume-mounted in Docker)
+2. Initialize Twitch client with app credentials (client_id, client_secret)
+3. Call `twitch.set_user_authentication(access_token, scopes, refresh_token)`
+4. Register `user_auth_refresh_callback` to persist new tokens on refresh
+5. pyTwitchAPI automatically refreshes expired access tokens using refresh token
+
+**Token Refresh Callback**:
+```python
+async def on_token_refresh(access_token: str, refresh_token: str):
+    # Update the JSON file with new tokens
+    save_tokens_to_file(access_token, refresh_token)
+```
+
+**Docker Volume Mount**:
+- Token file mounted as: `/app/secrets/twitch_user_tokens.json`
+- Volume defined in docker-compose.yml for persistence
+
+**Token Lifecycle**:
+- Access tokens expire (typically 4 hours)
+- Refresh tokens never expire for Confidential clients
+- Tokens invalidate only if: user changes password, user disconnects app
+- If refresh fails with InvalidRefreshTokenException, manual re-seeding required

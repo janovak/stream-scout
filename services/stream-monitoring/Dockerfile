@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY stream_monitoring_service.py .
+COPY token_manager.py .
 
 # Expose ports
 EXPOSE 8080 9100
