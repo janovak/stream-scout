@@ -106,7 +106,7 @@ services:
       context: ./services/flink-job
       dockerfile: Dockerfile
     container_name: streamscout-flink-jobmanager
-    command: jobmanager
+    command: /opt/flink/docker-entrypoint-job.sh
     ports:
       - "8081:8081"
       - "9249:9249"

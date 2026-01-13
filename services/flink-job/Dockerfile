@@ -21,6 +21,10 @@ COPY flink-conf.yaml /opt/flink/conf/flink-conf.yaml
 # Copy the PyFlink job
 COPY clip_detector_job.py /opt/flink/usrlib/
 
+# Copy custom entrypoint for auto-submitting the job
+COPY docker-entrypoint-job.sh /opt/flink/
+RUN chmod +x /opt/flink/docker-entrypoint-job.sh
+
 # Download Kafka connector
 RUN wget -P /opt/flink/lib/ https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.0.2-1.18/flink-sql-connector-kafka-3.0.2-1.18.jar
 
