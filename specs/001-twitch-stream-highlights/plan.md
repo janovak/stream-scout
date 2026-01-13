@@ -93,8 +93,11 @@
      - Calculate message rate statistics (mean, standard deviation)
      - Detect anomalies (recent activity > baseline + 1 std dev)
      - Track 30-second cooldown per broadcaster in Flink state
-     - Call Twitch Clips API to create clip on anomaly
-     - Retry failed clips (max 3 attempts within 10-second window: 0s, 3s, 6s delays)
+     - Call Twitch Clips API to create clip on anomaly using user OAuth tokens
+     - Smart retry logic (only retry transient errors):
+       - Retryable: 408, 429, 500, 502, 503, 504
+       - Non-retryable: 400, 401, 403, 404 (fail immediately)
+       - 401 triggers automatic token refresh before failing
      - Write clip metadata to Postgres clips table
    - **External Dependencies**:
      - Kafka (consumer)
@@ -222,6 +225,7 @@ twitch-highlights/
 - `POSTGRES_PASSWORD`: Database password
 - `TWITCH_CLIENT_ID`: Twitch API credentials
 - `TWITCH_CLIENT_SECRET`: Twitch API credentials
+- `TWITCH_TOKEN_FILE`: Path to user OAuth token file (shared with Stream Monitoring)
 - `FLINK_PARALLELISM`: 4
 - `FLINK_JOB_MANAGER_MEMORY`: 1024m
 - `FLINK_TASK_MANAGER_MEMORY`: 2048m
@@ -277,3 +281,91 @@ async def on_token_refresh(access_token: str, refresh_token: str):
 - Refresh tokens never expire for Confidential clients
 - Tokens invalidate only if: user changes password, user disconnects app
 - If refresh fails with InvalidRefreshTokenException, manual re-seeding required
+
+## Debugging & Bug Fixes (2026-01-12)
+
+### Issues Discovered and Resolved
+
+**1. Flink Job Not Auto-Starting**
+- **Issue**: Docker Compose only starts the Flink infrastructure (JobManager/TaskManager) but does not automatically submit jobs
+- **Fix**: Job must be manually submitted after cluster startup
+- **Command**: `docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d`
+
+**2. Invalid Checkpoint Interval Configuration**
+- **Issue**: `flink-conf.yaml` had `execution.checkpointing.interval: 0` which is invalid (Flink requires ≥10ms or omit entirely)
+- **Fix**: Removed the invalid configuration line; checkpointing is disabled by omitting the config
+
+**3. Tuple vs String Type Mismatch in AnomalyDetector**
+- **Issue**: Pipeline passes `(broadcaster_id, json_string)` tuples through `key_by()`, but `AnomalyDetector.process_element()` expected a plain JSON string
+- **Error**: `TypeError: the JSON object must be str, bytes or bytearray, not tuple`
+- **Fix**: Updated `process_element()` to detect tuple input and extract the JSON string:
+  ```python
+  if isinstance(value, tuple):
+      broadcaster_id, json_str = value
+      msg = json.loads(json_str)
+  else:
+      msg = json.loads(value)
+  ```
+
+**4. UnboundLocalError in Exception Handler**
+- **Issue**: Exception handler referenced `broadcaster_id` before it was assigned when JSON parsing failed early
+- **Fix**: Initialize `broadcaster_id = None` at function start and use safe fallback in error logging
+
+### Comprehensive Logging Added
+
+Enhanced logging throughout `clip_detector_job.py` for better debugging:
+
+- **Startup**: Configuration dump with all environment variables
+- **OAuth**: Token refresh attempts, successes, and failures with status codes
+- **Twitch API**: Request/response logging with status codes and response bodies (truncated)
+- **Database**: Connection establishment, insert success/conflict detection, error details
+- **Anomaly Detection**:
+  - Baseline data accumulation progress
+  - Anomaly detection with threshold details
+  - Cooldown rejection logging
+- **Clip Creation**:
+  - Full pipeline logging with timing
+  - Retry attempt tracking
+  - 15-second wait visibility
+
+## Flink Job OAuth Configuration
+
+The Flink job shares the same user OAuth tokens as the Stream Monitoring Service. This is required because the Twitch Create Clip API requires user-level authentication with the `clips:edit` scope.
+
+**Token File Volume Mount**:
+```yaml
+# docker-compose.yml
+flink-jobmanager:
+  environment:
+    - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+  volumes:
+    - ./secrets:/opt/flink/secrets:ro
+
+flink-taskmanager:
+  environment:
+    - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+  volumes:
+    - ./secrets:/opt/flink/secrets:ro
+```
+
+**TwitchAPIClient Authentication**:
+- Loads user tokens from shared JSON file on initialization
+- Uses refresh token flow (`grant_type=refresh_token`) when tokens expire
+- Auto-refreshes on 401 responses before retrying the request
+- Persists refreshed tokens back to file for other services
+
+**Smart Retry Logic**:
+The clip creation process uses intelligent retry logic that only retries transient errors:
+- **Retryable**: 408 (timeout), 429 (rate limit), 500, 502, 503, 504 (server errors)
+- **Non-retryable**: 400, 401, 403, 404 (client errors) - fail immediately
+- Custom `TwitchAPIError` exception with `is_retryable` flag
+- 401 triggers automatic token refresh before marking as non-retryable
+
+**Error Classification**:
+```python
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+```
+- Timeouts and connection errors are retryable
+- Server errors (5xx) are retryable
+- Rate limits (429) are retryable
+- Client errors (4xx) are not retryable (except 401 which triggers refresh)

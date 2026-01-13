@@ -56,6 +56,33 @@
 - [ ] Integration tests with Flink MiniCluster
 - [ ] End-to-end test with Kafka and Postgres
 
+**Flink Job Debugging & Fixes (2026-01-12)**:
+- [X] Diagnose why no clips were being created
+- [X] Identify Flink job not auto-starting after docker-compose up
+- [X] Fix invalid checkpoint interval config (`execution.checkpointing.interval: 0`)
+- [X] Fix tuple vs string type mismatch in AnomalyDetector.process_element()
+- [X] Fix UnboundLocalError in exception handler (broadcaster_id referenced before assignment)
+- [X] Add comprehensive logging to TwitchAPIClient (OAuth, create_clip, get_clip)
+- [X] Add comprehensive logging to PostgresClient (connection, insert, conflict detection)
+- [X] Add comprehensive logging to AnomalyDetector (baseline progress, anomaly detection, cooldown)
+- [X] Add comprehensive logging to ClipCreator (full pipeline with timing)
+- [X] Add startup configuration logging to main()
+- [X] Verify Flink job consumes from Kafka successfully
+- [X] Document manual job submission procedure
+
+**Flink Job OAuth & Retry Fixes (2026-01-13)**:
+- [X] Diagnose 401 "Missing User OAUTH Token" errors
+- [X] Mount user token file to Flink containers (docker-compose.yml)
+- [X] Update TwitchAPIClient to load user tokens from JSON file
+- [X] Implement token refresh flow using refresh_token grant type
+- [X] Save refreshed tokens back to file for persistence
+- [X] Add TwitchAPIError exception with is_retryable flag
+- [X] Define RETRYABLE_STATUS_CODES (408, 429, 500, 502, 503, 504)
+- [X] Update ClipCreator to use smart retry logic
+- [X] Stop retrying on non-retryable errors (400, 401, 403, 404)
+- [X] Auto-refresh token on 401 before marking as non-retryable
+- [X] Add TWITCH_TOKEN_FILE to startup configuration logging
+
 **API & Frontend Service**:
 - [X] Implement Flask application structure
 - [X] Implement Postgres connection pool
@@ -100,8 +127,8 @@
 - [ ] Flink deployment guide (Docker Compose)
 - [ ] Service deployment guides
 - [ ] API documentation (OpenAPI/Swagger)
-- [ ] Monitoring and alerting runbook
-- [ ] Troubleshooting guide
+- [X] Monitoring and alerting runbook (basic commands documented in spec.md)
+- [X] Troubleshooting guide (debugging section in plan.md)
 - [ ] Disaster recovery procedures
 - [ ] Capacity planning guide
 

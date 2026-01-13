@@ -26,12 +26,17 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 - Use sliding windows (5-second buckets) to track message frequency per broadcaster
 - Detect statistical anomalies using baseline comparison (mean + 1 standard deviation)
 - Implement 30-second cooldown between detections per broadcaster using Flink state
-- On anomaly detection, call Twitch Clips API to create clip
-- Retry failed clip creation (max 3 attempts within 10-second window: 0s, 3s, 6s delays)
+- On anomaly detection, call Twitch Clips API to create clip using user OAuth tokens
+- Smart retry logic for transient errors only:
+  - Retryable: 408 (timeout), 429 (rate limit), 500, 502, 503, 504 (server errors)
+  - Non-retryable: 400, 401, 403, 404 (client errors) - fail immediately
+  - 401 triggers token refresh before marking as non-retryable
+  - Max 3 attempts with delays: 0s, 3s, 6s
 - Wait for clip processing and retrieve metadata (15 sec after successful creation)
 - Store clip information directly in Postgres
 - Expose Flink metrics for monitoring (messages processed, anomalies detected, clips created)
 - Run as PyFlink job in standalone cluster via Docker Compose
+- Load user OAuth tokens from shared token file (same as Stream Monitoring Service)
 
 **3. API & Frontend Service**
 - Direct Postgres database access with connection pooling
@@ -172,3 +177,10 @@ CREATE INDEX idx_clips_broadcaster_id ON clips(broadcaster_id);
 ```
 
 Note: We no longer store individual chat messages in Postgres. They are only used transiently for anomaly detection.
+
+## Debugging & Operational Notes
+
+**Flink Job Submission**:
+- The Flink job must be manually submitted after the cluster starts
+- Submit command: `docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d`
+- The job requires ~5 minutes to build baseline data before detecting anomalies

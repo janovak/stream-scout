@@ -123,6 +123,9 @@ services:
       - POSTGRES_PASSWORD=twitch_password
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+      - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+    volumes:
+      - ./secrets:/opt/flink/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -151,6 +154,9 @@ services:
       - POSTGRES_PASSWORD=twitch_password
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+      - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+    volumes:
+      - ./secrets:/opt/flink/secrets:ro
     depends_on:
       - flink-jobmanager
     networks:

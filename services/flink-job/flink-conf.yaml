@@ -10,7 +10,7 @@ taskmanager.numberOfTaskSlots: 4
 parallelism.default: 4
 
 # Disable checkpointing (hobby project - rebuild from Kafka on restart)
-execution.checkpointing.interval: 0
+# Note: Setting to 0 is invalid, so we simply omit the config to disable checkpointing
 
 # State backend
 state.backend: hashmap
