@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamScout - Twitch Highlights</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>StreamScout</h1>
+            <p class="tagline">Automatically captured Twitch highlights</p>
+        </div>
+    </header>
+
+    <main class="container">
+        <div id="loading" class="loading">
+            <div class="spinner"></div>
+            <p>Loading clips...</p>
+        </div>
+
+        <div id="error" class="error hidden">
+            <p>Failed to load clips. <button onclick="loadClips()">Retry</button></p>
+        </div>
+
+        <div id="no-clips" class="no-clips hidden">
+            <p>No clips found in the last 7 days.</p>
+        </div>
+
+        <div id="clips-grid" class="clips-grid"></div>
+
+        <div id="clip-modal" class="modal hidden">
+            <div class="modal-content">
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+                <div id="clip-player"></div>
+                <div class="clip-info">
+                    <h3 id="clip-streamer"></h3>
+                    <p id="clip-time"></p>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>StreamScout detects chat activity spikes to capture highlight-worthy moments.</p>
+        </div>
+    </footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
