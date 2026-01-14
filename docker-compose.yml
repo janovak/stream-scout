@@ -118,7 +118,9 @@ services:
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9249
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-      - POSTGRES_URL=jdbc:postgresql://postgres:5432/twitch
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=twitch
       - POSTGRES_USER=twitch
       - POSTGRES_PASSWORD=twitch_password
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
@@ -126,6 +128,7 @@ services:
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
     volumes:
       - ./secrets:/opt/flink/secrets:ro
+      - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -149,7 +152,9 @@ services:
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9249
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-      - POSTGRES_URL=jdbc:postgresql://postgres:5432/twitch
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=twitch
       - POSTGRES_USER=twitch
       - POSTGRES_PASSWORD=twitch_password
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
@@ -157,6 +162,7 @@ services:
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
     volumes:
       - ./secrets:/opt/flink/secrets:ro
+      - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
     depends_on:
       - flink-jobmanager
     networks:

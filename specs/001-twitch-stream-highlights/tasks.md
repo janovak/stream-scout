@@ -53,6 +53,10 @@
 - [X] Configure Flink Prometheus reporter
 - [X] Implement proper error handling and logging
 - [X] Unit tests for anomaly detection logic
+- [X] Implement startup token validation (call /oauth2/validate endpoint)
+- [X] Add masked token logging at startup for debugging
+- [X] Implement proactive token refresh if expired at startup
+- [X] Add clear error messages for token issues (missing file, invalid token, refresh failure)
 - [ ] Integration tests with Flink MiniCluster
 - [ ] End-to-end test with Kafka and Postgres
 

@@ -350,9 +350,15 @@ flink-taskmanager:
 
 **TwitchAPIClient Authentication**:
 - Loads user tokens from shared JSON file on initialization
+- Validates tokens at startup before any clip creation attempts:
+  - Calls Twitch `/oauth2/validate` endpoint to verify token validity
+  - Logs token scopes and expiration status
+  - If expired, attempts refresh immediately
+  - If refresh fails or token invalid, logs clear error and raises exception
 - Uses refresh token flow (`grant_type=refresh_token`) when tokens expire
 - Auto-refreshes on 401 responses before retrying the request
 - Persists refreshed tokens back to file for other services
+- Startup logging includes masked token values (first 4 chars) for debugging
 
 **Smart Retry Logic**:
 The clip creation process uses intelligent retry logic that only retries transient errors:

@@ -27,6 +27,11 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 - Detect statistical anomalies using baseline comparison (mean + 1 standard deviation)
 - Implement 30-second cooldown between detections per broadcaster using Flink state
 - On anomaly detection, call Twitch Clips API to create clip using user OAuth tokens
+- Token validation at startup:
+  - Verify token file exists and contains required fields (access_token, refresh_token)
+  - Validate token with Twitch API before processing begins
+  - Log token status (valid/expired/missing) with masked values for debugging
+  - Fail fast with clear error message if tokens are invalid or missing
 - Smart retry logic for transient errors only:
   - Retryable: 408 (timeout), 429 (rate limit), 500, 502, 503, 504 (server errors)
   - Non-retryable: 400, 401, 403, 404 (client errors) - fail immediately

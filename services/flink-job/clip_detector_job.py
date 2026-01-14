@@ -50,7 +50,7 @@ RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 # Anomaly detection parameters
 WINDOW_SIZE_SECONDS = 5
-BASELINE_WINDOW_SECONDS = 300  # 5 minutes of baseline
+BASELINE_WINDOW_SECONDS = 300
 STD_DEV_THRESHOLD = 1.0
 COOLDOWN_SECONDS = 30
 MAX_RETRY_ATTEMPTS = 3
@@ -107,34 +107,119 @@ class TwitchAPIError(Exception):
         self.is_retryable = is_retryable
 
 
+class TokenValidationError(Exception):
+    """Raised when token validation fails at startup."""
+    pass
+
+
 class TwitchAPIClient:
     """Client for interacting with Twitch API using user OAuth tokens."""
 
-    def __init__(self, client_id: str, client_secret: str, token_file: str):
+    def __init__(self, client_id: str, client_secret: str, token_file: str, validate_on_init: bool = True):
         self.client_id = client_id
         self.client_secret = client_secret
         self.token_file = token_file
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self._load_tokens()
+        if validate_on_init:
+            self._validate_and_refresh_if_needed()
+
+    def _mask_token(self, token: Optional[str]) -> str:
+        """Mask a token for safe logging, showing only first 4 characters."""
+        if not token:
+            return "<empty>"
+        if len(token) <= 4:
+            return "****"
+        return f"{token[:4]}...{len(token) - 4} more chars"
 
     def _load_tokens(self):
         """Load user tokens from JSON file."""
+        logger.info(f"Loading tokens from file: {self.token_file}")
         try:
             with open(self.token_file, "r") as f:
                 data = json.load(f)
-            self.access_token = data.get("access_token")
-            self.refresh_token = data.get("refresh_token")
-            scopes = data.get("scopes", [])
-            logger.info(f"Loaded user tokens from {self.token_file}, scopes={scopes}")
-            if not self.access_token or not self.refresh_token:
-                raise ValueError("Token file missing access_token or refresh_token")
         except FileNotFoundError:
-            logger.error(f"Token file not found: {self.token_file}")
-            raise
+            logger.error(f"TOKEN FILE NOT FOUND: {self.token_file}")
+            logger.error("Please run seed_twitch_tokens.py to generate tokens first")
+            raise TokenValidationError(f"Token file not found: {self.token_file}")
+        except json.JSONDecodeError as e:
+            logger.error(f"TOKEN FILE INVALID JSON: {self.token_file} - {e}")
+            raise TokenValidationError(f"Token file contains invalid JSON: {e}")
         except Exception as e:
-            logger.error(f"Failed to load tokens: {e}")
-            raise
+            logger.error(f"TOKEN FILE READ ERROR: {self.token_file} - {e}")
+            raise TokenValidationError(f"Failed to read token file: {e}")
+
+        self.access_token = data.get("access_token")
+        self.refresh_token = data.get("refresh_token")
+        scopes = data.get("scopes", [])
+
+        # Log masked token values for debugging
+        logger.info(f"Token file loaded successfully:")
+        logger.info(f"  access_token: {self._mask_token(self.access_token)}")
+        logger.info(f"  refresh_token: {self._mask_token(self.refresh_token)}")
+        logger.info(f"  scopes: {scopes}")
+
+        if not self.access_token:
+            logger.error("TOKEN FILE MISSING access_token field")
+            raise TokenValidationError("Token file missing required 'access_token' field")
+        if not self.refresh_token:
+            logger.error("TOKEN FILE MISSING refresh_token field")
+            raise TokenValidationError("Token file missing required 'refresh_token' field")
+
+    def _validate_and_refresh_if_needed(self):
+        """Validate token with Twitch API and refresh if expired."""
+        logger.info("Validating access token with Twitch API...")
+
+        try:
+            response = requests.get(
+                "https://id.twitch.tv/oauth2/validate",
+                headers={"Authorization": f"OAuth {self.access_token}"},
+                timeout=30
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"TOKEN VALIDATION REQUEST FAILED: {e}")
+            raise TokenValidationError(f"Failed to connect to Twitch API for token validation: {e}")
+
+        if response.status_code == 200:
+            data = response.json()
+            expires_in = data.get("expires_in", 0)
+            scopes = data.get("scopes", [])
+            user_id = data.get("user_id", "unknown")
+            login = data.get("login", "unknown")
+
+            logger.info(f"TOKEN VALID:")
+            logger.info(f"  user_id: {user_id}")
+            logger.info(f"  login: {login}")
+            logger.info(f"  scopes: {scopes}")
+            logger.info(f"  expires_in: {expires_in}s ({expires_in // 3600}h {(expires_in % 3600) // 60}m)")
+
+            # Check required scopes
+            required_scopes = {"clips:edit"}
+            missing_scopes = required_scopes - set(scopes)
+            if missing_scopes:
+                logger.error(f"TOKEN MISSING REQUIRED SCOPES: {missing_scopes}")
+                logger.error("Please re-run seed_twitch_tokens.py with the correct scopes")
+                raise TokenValidationError(f"Token missing required scopes: {missing_scopes}")
+
+            # Proactively refresh if expiring soon (within 10 minutes)
+            if expires_in < 600:
+                logger.warning(f"Token expiring soon ({expires_in}s), refreshing proactively...")
+                self._refresh_access_token()
+
+        elif response.status_code == 401:
+            logger.warning("Access token expired or invalid, attempting refresh...")
+            try:
+                self._refresh_access_token()
+                # Validate the new token
+                self._validate_and_refresh_if_needed()
+            except Exception as e:
+                logger.error(f"TOKEN REFRESH FAILED: {e}")
+                logger.error("The refresh token may be invalid. Please re-run seed_twitch_tokens.py")
+                raise TokenValidationError(f"Token expired and refresh failed: {e}")
+        else:
+            logger.error(f"TOKEN VALIDATION FAILED: status={response.status_code}, body={response.text}")
+            raise TokenValidationError(f"Token validation failed with status {response.status_code}")
 
     def _save_tokens(self):
         """Save tokens back to file after refresh."""
@@ -590,6 +675,42 @@ class ClipCreator(ProcessFunction):
             logger.error(f"CLIP CREATION ERROR for value={value[:200]}: {e}", exc_info=True)
 
 
+def validate_tokens_at_startup():
+    """
+    Validate Twitch tokens before starting the Flink job.
+    Fails fast with clear error messages if tokens are invalid.
+    """
+    logger.info("=" * 60)
+    logger.info("STARTUP TOKEN VALIDATION")
+    logger.info("=" * 60)
+
+    # Check for required credentials
+    if not TWITCH_CLIENT_ID:
+        logger.error("TWITCH_CLIENT_ID environment variable is not set")
+        raise TokenValidationError("TWITCH_CLIENT_ID is required but not set")
+    if not TWITCH_CLIENT_SECRET:
+        logger.error("TWITCH_CLIENT_SECRET environment variable is not set")
+        raise TokenValidationError("TWITCH_CLIENT_SECRET is required but not set")
+
+    # Create client with validation (will raise TokenValidationError on failure)
+    try:
+        client = TwitchAPIClient(
+            TWITCH_CLIENT_ID,
+            TWITCH_CLIENT_SECRET,
+            TWITCH_TOKEN_FILE,
+            validate_on_init=True
+        )
+        logger.info("=" * 60)
+        logger.info("TOKEN VALIDATION SUCCESSFUL - Ready to create clips")
+        logger.info("=" * 60)
+        return client
+    except TokenValidationError:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during token validation: {e}")
+        raise TokenValidationError(f"Token validation failed: {e}")
+
+
 def main():
     """Main entry point for the Flink job."""
     logger.info("=" * 60)
@@ -607,6 +728,9 @@ def main():
     logger.info(f"  TWITCH_CLIENT_SECRET: {'set' if TWITCH_CLIENT_SECRET else 'NOT SET'}")
     logger.info(f"  TWITCH_TOKEN_FILE: {TWITCH_TOKEN_FILE}")
     logger.info(f"  RETRYABLE_STATUS_CODES: {RETRYABLE_STATUS_CODES}")
+
+    # Validate tokens before starting the pipeline
+    validate_tokens_at_startup()
 
     # Set up execution environment
     env = StreamExecutionEnvironment.get_execution_environment()
