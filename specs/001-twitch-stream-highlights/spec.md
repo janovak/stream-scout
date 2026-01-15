@@ -10,10 +10,7 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 - Poll Twitch Streams API every 2 minutes to identify top live streamers
 - Filter streamers who have clipping disabled
 - Automatically join chat rooms of top-ranked streamers
-- Use hysteresis for chat room management to preserve Flink baseline data:
-  - Join chat room when streamer enters top 5
-  - Leave chat room only when streamer drops out of top 10
-  - This prevents thrashing when streamers fluctuate around rank boundaries
+- Use hysteresis for chat room management to preserve Flink baseline data
 - Listen to all messages in joined chat rooms and publish to Kafka
 - Dynamically manage chat room lifecycle based on stream status
 - Use Redis TTL to detect when streamers go offline
@@ -24,19 +21,12 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 - Consume chat messages from Kafka topic `chat-messages`
 - Filter out command messages (starting with !) to avoid false positives
 - Use sliding windows (5-second buckets) to track message frequency per broadcaster
-- Detect statistical anomalies using baseline comparison (mean + 1 standard deviation)
+- Build baseline for 5 minutes before firing any anomalies
+- Detect statistical anomalies when activity exceeds baseline mean + 1 standard deviation
 - Implement 30-second cooldown between detections per broadcaster using Flink state
-- On anomaly detection, call Twitch Clips API to create clip using user OAuth tokens
-- Token validation at startup:
-  - Verify token file exists and contains required fields (access_token, refresh_token)
-  - Validate token with Twitch API before processing begins
-  - Log token status (valid/expired/missing) with masked values for debugging
-  - Fail fast with clear error message if tokens are invalid or missing
-- Smart retry logic for transient errors only:
-  - Retryable: 408 (timeout), 429 (rate limit), 500, 502, 503, 504 (server errors)
-  - Non-retryable: 400, 401, 403, 404 (client errors) - fail immediately
-  - 401 triggers token refresh before marking as non-retryable
-  - Max 3 attempts with delays: 0s, 3s, 6s
+- On anomaly detection, call Twitch Clips API within 10 seconds (clip is useless after that window)
+- Token validation at startup with fail-fast behavior if tokens are invalid or missing
+- Smart retry logic for transient errors only
 - Wait for clip processing and retrieve metadata (15 sec after successful creation)
 - Store clip information directly in Postgres
 - Expose Flink metrics for monitoring (messages processed, anomalies detected, clips created)
@@ -112,12 +102,12 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 ## Functional Requirements
 
 - System must monitor at least top 5 most popular streamers at any time
-- Anomaly detection must use minimum 5 minutes of historical data before triggering
-- Clips must capture moments within 5 seconds of anomaly detection
+- Anomaly detection must build baseline for 5 minutes before firing any anomalies
+- Clip API must be called within 10 seconds of anomaly detection (clip is useless after that)
 - API must support time-range queries with ISO 8601 timestamps
 - All services must expose `/health` endpoint for liveness checks
 - Frontend must load clips from past 7 days on initial page load
-- System must handle graceful shutdown without message loss
+- System must handle graceful shutdown (at-least-once delivery via Kafka is sufficient)
 
 ## Data Models
 
@@ -126,7 +116,7 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 **Table: `streamers`**
 ```sql
 CREATE TABLE streamers (
-    streamer_id BIGINT PRIMARY KEY,
+    broadcaster_id BIGINT PRIMARY KEY,
     streamer_login VARCHAR(255) NOT NULL,
     allows_clipping BOOLEAN DEFAULT TRUE,
     first_seen_at TIMESTAMP DEFAULT NOW(),
