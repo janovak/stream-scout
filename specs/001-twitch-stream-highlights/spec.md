@@ -22,11 +22,11 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 - Filter out command messages (starting with !) to avoid false positives
 - Use sliding windows (5-second buckets) to track message frequency per broadcaster
 - Build baseline for 5 minutes before firing any anomalies
-- Detect statistical anomalies when activity exceeds baseline mean + 1 standard deviation
+- Detect statistical anomalies when activity exceeds baseline mean + 3 standard deviation
 - Implement 30-second cooldown between detections per broadcaster using Flink state
-- On anomaly detection, call Twitch Clips API within 10 seconds (clip is useless after that window)
+- On anomaly detection, wait 10 seconds then call Twitch Clips API (centers the moment in the clip)
+- Smart retry logic for transient errors (retries at 2s and 4s after initial attempt)
 - Token validation at startup with fail-fast behavior if tokens are invalid or missing
-- Smart retry logic for transient errors only
 - Wait for clip processing and retrieve metadata (15 sec after successful creation)
 - Store clip information directly in Postgres
 - Expose Flink metrics for monitoring (messages processed, anomalies detected, clips created)
@@ -103,7 +103,7 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 
 - System must monitor at least top 5 most popular streamers at any time
 - Anomaly detection must build baseline for 5 minutes before firing any anomalies
-- Clip API must be called within 10 seconds of anomaly detection (clip is useless after that)
+- Clip API must be called 10 seconds after anomaly detection to center the moment in the clip
 - API must support time-range queries with ISO 8601 timestamps
 - All services must expose `/health` endpoint for liveness checks
 - Frontend must load clips from past 7 days on initial page load
