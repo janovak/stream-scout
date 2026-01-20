@@ -44,10 +44,11 @@
 - [X] Implement keyBy(broadcaster_id) for partitioned processing
 - [X] Implement sliding window (5-second window, 1-second slide)
 - [X] Implement window aggregation function (count messages per window)
-- [X] Implement anomaly detection logic (mean + 1 std dev baseline comparison)
+- [X] Implement anomaly detection logic (mean + 3 std dev baseline comparison)
 - [X] Implement process function for stateful cooldown tracking (30 seconds)
 - [X] Implement Twitch API clip creation with async HTTP requests
-- [X] Implement retry logic within 10-second window (3 attempts: 0s, 3s, 6s delays)
+- [X] Wait 10 seconds after anomaly detection before first clip attempt (centers moment in clip)
+- [X] Implement retry logic within 5-second window (3 attempts: 0s, 2s, 4s delays)
 - [X] Implement JDBC sink for writing clips to Postgres
 - [X] Add custom Flink metrics (anomalies_detected, clips_created, etc.)
 - [X] Configure Flink Prometheus reporter
@@ -148,7 +149,7 @@
 - Graceful shutdown handling
 - Connection pooling for database efficiency
 - Structured logging (JSON format)
-- Retry logic with timing constraints (10-second window for clip creation)
+- Retry logic with timing constraints (10s delay + 5-second retry window for clip creation)
 - Clean service boundaries with cohesive responsibilities
 
 **Scalability**:

@@ -91,13 +91,14 @@
      - Filter command messages (starting with !)
      - Window messages by broadcaster_id using sliding windows (5-second buckets)
      - Calculate message rate statistics (mean, standard deviation)
-     - Detect anomalies (recent activity > baseline + 1 std dev)
+     - Detect anomalies (recent activity > baseline + 3 std dev)
      - Track 30-second cooldown per broadcaster in Flink state
-     - Call Twitch Clips API to create clip on anomaly using user OAuth tokens
+     - Wait 10 seconds after anomaly detection, then call Twitch Clips API (centers moment in clip)
      - Smart retry logic (only retry transient errors):
        - Retryable: 408, 429, 500, 502, 503, 504
        - Non-retryable: 400, 401, 403, 404 (fail immediately)
        - 401 triggers automatic token refresh before failing
+       - Retry delays: 0s, 2s, 4s (3 attempts within 5-second window)
      - Write clip metadata to Postgres clips table
    - **External Dependencies**:
      - Kafka (consumer)

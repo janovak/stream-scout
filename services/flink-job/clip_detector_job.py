@@ -51,10 +51,11 @@ RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 # Anomaly detection parameters
 WINDOW_SIZE_SECONDS = 5
 BASELINE_WINDOW_SECONDS = 300
-STD_DEV_THRESHOLD = 1.0
+STD_DEV_THRESHOLD = 3.0
 COOLDOWN_SECONDS = 30
 MAX_RETRY_ATTEMPTS = 3
-RETRY_DELAYS = [0, 3, 6]  # seconds
+RETRY_DELAYS = [0, 2, 4]  # seconds (within 5-second retry window)
+CLIP_DELAY_SECONDS = 10  # Wait before first clip attempt to center moment in clip
 
 # Command message regex
 COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
@@ -604,6 +605,10 @@ class ClipCreator(ProcessFunction):
             logger.info(f"=== CLIP CREATION START for broadcaster {broadcaster_id} ===")
             logger.info(f"Anomaly details: count={anomaly.get('message_count')}, "
                        f"mean={anomaly.get('baseline_mean', 0):.2f}, std={anomaly.get('baseline_std', 0):.2f}")
+
+            # Wait before first clip attempt to center the moment in the clip
+            logger.info(f"Waiting {CLIP_DELAY_SECONDS}s before clip creation to center moment in clip...")
+            time.sleep(CLIP_DELAY_SECONDS)
 
             # Try to create clip with smart retries (only retry transient errors)
             clip_id = None
