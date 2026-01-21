@@ -18,7 +18,7 @@ As a user browsing clips, I want to filter clips by how significant the chat act
 **Acceptance Scenarios**:
 
 1. **Given** I am on the clips page with clips loaded, **When** I select "3+ standard deviations" from the anomaly filter, **Then** only clips where the chat activity was 3 or more standard deviations above the mean are displayed.
-2. **Given** I have filtered clips to "5+ standard deviations", **When** I change the filter to "5+ standard deviations", **Then** the clip list updates to show fewer clips only including those with higher anomaly scores.
+2. **Given** I have filtered clips to "5+ standard deviations", **When** I change the filter to "7+ standard deviations", **Then** the clip list updates to show fewer clips only including those with higher anomaly scores.
 3. **Given** I select an anomaly threshold, **When** no clips match that threshold, **Then** I see a clear message indicating no clips match the current filter.
 4. **Given** I have applied an anomaly filter, **When** I scroll to load more clips, **Then** newly loaded clips also respect the current filter setting.
 
