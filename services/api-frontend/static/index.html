@@ -15,6 +15,16 @@
     </header>
 
     <main class="container">
+        <div class="filter-bar">
+            <div class="filter-group">
+                <label for="intensity-filter">Intensity:</label>
+                <select id="intensity-filter" onchange="onFilterChange()">
+                    <!-- Options populated by JavaScript -->
+                </select>
+            </div>
+            <div id="clip-count" class="clip-count"></div>
+        </div>
+
         <div id="loading" class="loading">
             <div class="spinner"></div>
             <p>Loading clips...</p>
@@ -25,21 +35,10 @@
         </div>
 
         <div id="no-clips" class="no-clips hidden">
-            <p>No clips found in the last 7 days.</p>
+            <p>No clips match the selected intensity filter.</p>
         </div>
 
         <div id="clips-grid" class="clips-grid"></div>
-
-        <div id="clip-modal" class="modal hidden">
-            <div class="modal-content">
-                <button class="modal-close" onclick="closeModal()">&times;</button>
-                <div id="clip-player"></div>
-                <div class="clip-info">
-                    <h3 id="clip-streamer"></h3>
-                    <p id="clip-time"></p>
-                </div>
-            </div>
-        </div>
     </main>
 
     <footer>

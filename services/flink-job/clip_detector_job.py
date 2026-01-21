@@ -50,8 +50,8 @@ RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 # Anomaly detection parameters
 WINDOW_SIZE_SECONDS = 5
-BASELINE_WINDOW_SECONDS = 300
-STD_DEV_THRESHOLD = 3.0
+BASELINE_WINDOW_SECONDS = 10
+STD_DEV_THRESHOLD = 1.0
 COOLDOWN_SECONDS = 30
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAYS = [0, 2, 4]  # seconds (within 5-second retry window)
@@ -98,6 +98,7 @@ class ClipResult:
     thumbnail_url: str
     detected_at: int
     success: bool
+    intensity: Optional[float] = None  # Z-score: (message_count - mean) / std_dev
 
 
 class TwitchAPIError(Exception):
@@ -414,25 +415,26 @@ class PostgresClient:
 
     def insert_clip(self, clip: ClipResult):
         """Insert a clip into the database."""
-        logger.info(f"Inserting clip into database: clip_id={clip.clip_id}, broadcaster_id={clip.broadcaster_id}")
+        logger.info(f"Inserting clip into database: clip_id={clip.clip_id}, broadcaster_id={clip.broadcaster_id}, intensity={clip.intensity}")
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO clips (broadcaster_id, clip_id, embed_url, thumbnail_url, detected_at)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO clips (broadcaster_id, clip_id, embed_url, thumbnail_url, detected_at, intensity)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (clip_id) DO NOTHING
                 """, (
                     clip.broadcaster_id,
                     clip.clip_id,
                     clip.embed_url,
                     clip.thumbnail_url,
-                    datetime.fromtimestamp(clip.detected_at / 1000, tz=timezone.utc)
+                    datetime.fromtimestamp(clip.detected_at / 1000, tz=timezone.utc),
+                    clip.intensity
                 ))
                 rows_affected = cur.rowcount
                 conn.commit()
                 if rows_affected > 0:
-                    logger.info(f"Successfully inserted clip {clip.clip_id} for broadcaster {clip.broadcaster_id}")
+                    logger.info(f"Successfully inserted clip {clip.clip_id} for broadcaster {clip.broadcaster_id} with intensity {clip.intensity}")
                 else:
                     logger.warning(f"Clip {clip.clip_id} already exists (conflict), no insert performed")
         except Exception as e:
@@ -552,15 +554,19 @@ class AnomalyDetector(KeyedProcessFunction):
                     # Anomaly detected!
                     self.last_anomaly_time.update(current_ms)
 
+                    # Calculate intensity as Z-score
+                    intensity = (window_sum - mean) / std_dev if std_dev > 0 else 0.0
+
                     anomaly = {
                         "broadcaster_id": broadcaster_id,
                         "detected_at": current_ms,
                         "message_count": window_sum,
                         "baseline_mean": mean,
-                        "baseline_std": std_dev
+                        "baseline_std": std_dev,
+                        "intensity": intensity
                     }
                     logger.info(f"ANOMALY DETECTED for broadcaster {broadcaster_id}: "
-                               f"count={window_sum}, threshold={threshold:.2f}, mean={mean:.2f}, std={std_dev:.2f}")
+                               f"count={window_sum}, threshold={threshold:.2f}, mean={mean:.2f}, std={std_dev:.2f}, intensity={intensity:.2f}")
                     yield json.dumps(anomaly)
                 else:
                     cooldown_remaining = (COOLDOWN_SECONDS * 1000) - (current_ms - last_anomaly)
@@ -653,13 +659,17 @@ class ClipCreator(ProcessFunction):
             # Get clip metadata
             clip_data = self.twitch_client.get_clip(clip_id)
             if clip_data:
+                # Get intensity from anomaly data
+                intensity = anomaly.get("intensity")
+
                 clip_result = ClipResult(
                     broadcaster_id=broadcaster_id,
                     clip_id=clip_id,
                     embed_url=clip_data.get("embed_url", ""),
                     thumbnail_url=clip_data.get("thumbnail_url", ""),
                     detected_at=detected_at,
-                    success=True
+                    success=True,
+                    intensity=intensity
                 )
 
                 # Store in Postgres

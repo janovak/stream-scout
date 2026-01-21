@@ -26,8 +26,8 @@
 
 **Purpose**: No new project setup needed - modifying existing codebase
 
-- [ ] T001 Review existing code structure and verify all target files exist
-- [ ] T002 Create feature branch backup point with `git tag pre-002-clips-anomaly`
+- [x] T001 Review existing code structure and verify all target files exist (Note: Flink job is clip_detector_job.py not flink_job.py)
+- [x] T002 Create feature branch backup point with `git tag pre-002-clips-anomaly`
 
 ---
 
@@ -37,13 +37,13 @@
 
 **⚠️ CRITICAL**: User stories cannot be fully tested until clips have intensity values
 
-- [ ] T003 Add intensity column to clips table in infrastructure/postgres/init.sql
-- [ ] T004 Run database migration: `ALTER TABLE clips ADD COLUMN intensity FLOAT;`
-- [ ] T005 Create index for filtered queries: `CREATE INDEX idx_clips_intensity_detected ON clips (intensity, detected_at DESC);`
-- [ ] T006 Update ClipResult dataclass to include intensity field in services/flink-job/flink_job.py
-- [ ] T007 Calculate intensity Z-score in AnomalyDetector.process_element() in services/flink-job/flink_job.py
-- [ ] T008 Update insert_clip() to store intensity value in services/flink-job/flink_job.py
-- [ ] T009 Redeploy Flink job and verify new clips have intensity values
+- [x] T003 Add intensity column to clips table in infrastructure/postgres/init.sql
+- [ ] T004 Run database migration: `ALTER TABLE clips ADD COLUMN intensity FLOAT;` (MANUAL: run when DB available)
+- [ ] T005 Create index for filtered queries: `CREATE INDEX idx_clips_intensity_detected ON clips (intensity, detected_at DESC);` (MANUAL: run when DB available)
+- [x] T006 Update ClipResult dataclass to include intensity field in services/flink-job/clip_detector_job.py
+- [x] T007 Calculate intensity Z-score in AnomalyDetector.process_element() in services/flink-job/clip_detector_job.py
+- [x] T008 Update insert_clip() to store intensity value in services/flink-job/clip_detector_job.py
+- [ ] T009 Redeploy Flink job and verify new clips have intensity values (MANUAL: requires deployment)
 
 **Checkpoint**: New clips now have intensity values stored - frontend work can begin
 
@@ -57,17 +57,17 @@
 
 ### Implementation for User Story 1
 
-- [ ] T010 [P] [US1] Add INTENSITY_LEVELS constant with threshold-label mapping in services/api-frontend/static/app.js
-- [ ] T011 [P] [US1] Update GET /v1.0/clip endpoint to accept min_intensity query parameter in services/api-frontend/api_frontend_service.py
-- [ ] T012 [US1] Update SQL query to filter by intensity >= min_intensity in services/api-frontend/api_frontend_service.py
-- [ ] T013 [US1] Add intensity field to clip response JSON in services/api-frontend/api_frontend_service.py
-- [ ] T014 [US1] Create filter dropdown UI component in services/api-frontend/static/index.html
-- [ ] T015 [US1] Implement filter change handler that reloads clips with selected threshold in services/api-frontend/static/app.js (Note: JS state persists filter until page refresh, satisfying FR-003)
-- [ ] T016 [US1] Display total count of matching clips in UI in services/api-frontend/static/app.js
-- [ ] T017 [US1] Add intensity label badge to each clip card in services/api-frontend/static/app.js
-- [ ] T018 [US1] Handle empty results with "no clips match" message in services/api-frontend/static/app.js
-- [ ] T019 [US1] Set default filter to "Getting Good" (5+) on page load in services/api-frontend/static/app.js
-- [ ] T020 [US1] Style filter dropdown and count display in services/api-frontend/static/styles.css
+- [x] T010 [P] [US1] Add INTENSITY_LEVELS constant with threshold-label mapping in services/api-frontend/static/app.js
+- [x] T011 [P] [US1] Update GET /v1.0/clip endpoint to accept min_intensity query parameter in services/api-frontend/api_frontend_service.py
+- [x] T012 [US1] Update SQL query to filter by intensity >= min_intensity in services/api-frontend/api_frontend_service.py
+- [x] T013 [US1] Add intensity field to clip response JSON in services/api-frontend/api_frontend_service.py
+- [x] T014 [US1] Create filter dropdown UI component in services/api-frontend/static/index.html
+- [x] T015 [US1] Implement filter change handler that reloads clips with selected threshold in services/api-frontend/static/app.js (Note: JS state persists filter until page refresh, satisfying FR-003)
+- [x] T016 [US1] Display total count of matching clips in UI in services/api-frontend/static/app.js
+- [x] T017 [US1] Add intensity label badge to each clip card in services/api-frontend/static/app.js
+- [x] T018 [US1] Handle empty results with "no clips match" message in services/api-frontend/static/app.js
+- [x] T019 [US1] Set default filter to "Getting Good" (5+) on page load in services/api-frontend/static/app.js
+- [x] T020 [US1] Style filter dropdown and count display in services/api-frontend/static/styles.css
 
 **Checkpoint**: Filter functionality complete - users can select intensity threshold and see filtered clips
 
@@ -81,14 +81,14 @@
 
 ### Implementation for User Story 2
 
-- [ ] T021 [US2] Remove modal open logic from clip click handler in services/api-frontend/static/app.js
-- [ ] T022 [US2] Implement inline iframe player that replaces thumbnail on click in services/api-frontend/static/app.js (Note: Twitch embed provides native playback controls per FR-008; clips continue playing when scrolled out of view per spec edge case)
-- [ ] T023 [US2] Add allow="autoplay" attribute to iframe for browser autoplay permission in services/api-frontend/static/app.js
-- [ ] T024 [US2] Track currently playing clip ID in state variable in services/api-frontend/static/app.js
-- [ ] T025 [US2] Stop previous clip (remove iframe) when new clip is clicked in services/api-frontend/static/app.js
-- [ ] T026 [US2] Add play icon overlay on hover for clip cards in services/api-frontend/static/app.js
-- [ ] T027 [US2] Style inline player container with proper aspect ratio in services/api-frontend/static/styles.css
-- [ ] T028 [US2] Remove modal HTML and CSS from codebase in services/api-frontend/static/index.html and styles.css
+- [x] T021 [US2] Remove modal open logic from clip click handler in services/api-frontend/static/app.js
+- [x] T022 [US2] Implement inline iframe player that replaces thumbnail on click in services/api-frontend/static/app.js (Note: Twitch embed provides native playback controls per FR-008; clips continue playing when scrolled out of view per spec edge case)
+- [x] T023 [US2] Add allow="autoplay" attribute to iframe for browser autoplay permission in services/api-frontend/static/app.js
+- [x] T024 [US2] Track currently playing clip ID in state variable in services/api-frontend/static/app.js
+- [x] T025 [US2] Stop previous clip (remove iframe) when new clip is clicked in services/api-frontend/static/app.js
+- [x] T026 [US2] Add play icon overlay on hover for clip cards in services/api-frontend/static/app.js
+- [x] T027 [US2] Style inline player container with proper aspect ratio in services/api-frontend/static/styles.css
+- [x] T028 [US2] Remove modal HTML and CSS from codebase in services/api-frontend/static/index.html and styles.css
 
 **Checkpoint**: Inline playback complete - single-click plays clips in grid
 
@@ -102,17 +102,17 @@
 
 ### Implementation for User Story 3
 
-- [ ] T029 [US3] Add offset parameter to GET /v1.0/clip endpoint in services/api-frontend/api_frontend_service.py
-- [ ] T030 [US3] Add total_count query (COUNT with same filter) to API response in services/api-frontend/api_frontend_service.py
-- [ ] T031 [US3] Add has_more boolean to API response based on offset + count < total in services/api-frontend/api_frontend_service.py
-- [ ] T032 [US3] Remove 7-day time window constraint from default query in services/api-frontend/api_frontend_service.py
-- [ ] T033 [US3] Track offset and hasMore state variables in frontend in services/api-frontend/static/app.js
-- [ ] T034 [US3] Implement scroll event listener with debounce (detect near-bottom) in services/api-frontend/static/app.js
-- [ ] T035 [US3] Implement loadMoreClips() that fetches next page and appends to grid in services/api-frontend/static/app.js
-- [ ] T036 [US3] Add loading spinner at bottom during fetch in services/api-frontend/static/app.js
-- [ ] T037 [US3] Display "No more clips" message when hasMore is false in services/api-frontend/static/app.js
-- [ ] T038 [US3] Reset offset to 0 and clear clips when filter changes in services/api-frontend/static/app.js
-- [ ] T039 [US3] Style loading spinner and end-of-list message in services/api-frontend/static/styles.css
+- [x] T029 [US3] Add offset parameter to GET /v1.0/clip endpoint in services/api-frontend/api_frontend_service.py
+- [x] T030 [US3] Add total_count query (COUNT with same filter) to API response in services/api-frontend/api_frontend_service.py
+- [x] T031 [US3] Add has_more boolean to API response based on offset + count < total in services/api-frontend/api_frontend_service.py
+- [x] T032 [US3] Remove 7-day time window constraint from default query in services/api-frontend/api_frontend_service.py
+- [x] T033 [US3] Track offset and hasMore state variables in frontend in services/api-frontend/static/app.js
+- [x] T034 [US3] Implement scroll event listener with debounce (detect near-bottom) in services/api-frontend/static/app.js
+- [x] T035 [US3] Implement loadMoreClips() that fetches next page and appends to grid in services/api-frontend/static/app.js
+- [x] T036 [US3] Add loading spinner at bottom during fetch in services/api-frontend/static/app.js
+- [x] T037 [US3] Display "No more clips" message when hasMore is false in services/api-frontend/static/app.js
+- [x] T038 [US3] Reset offset to 0 and clear clips when filter changes in services/api-frontend/static/app.js
+- [x] T039 [US3] Style loading spinner and end-of-list message in services/api-frontend/static/styles.css
 
 **Checkpoint**: Infinite scroll complete - clips load continuously as user scrolls
 
@@ -126,14 +126,14 @@
 
 ### Implementation for User Story 4
 
-- [ ] T040 [P] [US4] Update page header and layout structure in services/api-frontend/static/index.html
-- [ ] T041 [P] [US4] Implement skeleton placeholder cards for initial load in services/api-frontend/static/app.js
-- [ ] T042 [US4] Add CSS custom properties for consistent spacing and colors in services/api-frontend/static/styles.css
-- [ ] T043 [US4] Update clip card styling with shadows, rounded corners, hover effects in services/api-frontend/static/styles.css
-- [ ] T044 [US4] Improve typography hierarchy (headings, metadata, labels) in services/api-frontend/static/styles.css
-- [ ] T045 [US4] Add smooth transitions for filter changes and clip loading in services/api-frontend/static/styles.css
-- [ ] T046 [US4] Ensure responsive grid works from 320px to 2560px width in services/api-frontend/static/styles.css
-- [ ] T047 [US4] Style filter controls to be prominent and accessible in services/api-frontend/static/styles.css
+- [x] T040 [P] [US4] Update page header and layout structure in services/api-frontend/static/index.html
+- [x] T041 [P] [US4] Implement skeleton placeholder cards for initial load in services/api-frontend/static/app.js
+- [x] T042 [US4] Add CSS custom properties for consistent spacing and colors in services/api-frontend/static/styles.css
+- [x] T043 [US4] Update clip card styling with shadows, rounded corners, hover effects in services/api-frontend/static/styles.css
+- [x] T044 [US4] Improve typography hierarchy (headings, metadata, labels) in services/api-frontend/static/styles.css
+- [x] T045 [US4] Add smooth transitions for filter changes and clip loading in services/api-frontend/static/styles.css
+- [x] T046 [US4] Ensure responsive grid works from 320px to 2560px width in services/api-frontend/static/styles.css
+- [x] T047 [US4] Style filter controls to be prominent and accessible in services/api-frontend/static/styles.css
 
 **Checkpoint**: Modern UI complete - page looks polished and professional
 
@@ -143,11 +143,11 @@
 
 **Purpose**: Handle edge cases and finalize implementation
 
-- [ ] T048 Handle clips with NULL intensity (show "score unavailable" badge) in services/api-frontend/static/app.js
-- [ ] T049 Add error handling for failed API requests with retry option in services/api-frontend/static/app.js
-- [ ] T050 Handle clip video load errors with error state on card in services/api-frontend/static/app.js
-- [ ] T051 Add error response handling for invalid query params in services/api-frontend/api_frontend_service.py
-- [ ] T052 Verify all acceptance scenarios from spec.md pass manually, including performance goals: initial load <2s (SC-003), filter response <1s (SC-002), infinite scroll preloads before reaching bottom (SC-004)
+- [x] T048 Handle clips with NULL intensity (show "score unavailable" badge) in services/api-frontend/static/app.js
+- [x] T049 Add error handling for failed API requests with retry option in services/api-frontend/static/app.js
+- [x] T050 Handle clip video load errors with error state on card in services/api-frontend/static/app.js (Note: Thumbnail errors handled via onerror; iframe errors not detectable due to Twitch embed limitations)
+- [x] T051 Add error response handling for invalid query params in services/api-frontend/api_frontend_service.py
+- [ ] T052 Verify all acceptance scenarios from spec.md pass manually, including performance goals: initial load <2s (SC-003), filter response <1s (SC-002), infinite scroll preloads before reaching bottom (SC-004) (MANUAL: requires running application)
 - [ ] T053 Update quickstart.md with any changes to setup or testing steps
 
 ---
