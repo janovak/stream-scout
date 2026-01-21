@@ -192,6 +192,7 @@ services:
       - LOG_LEVEL=INFO
     volumes:
       - ./secrets:/app/secrets:rw
+      - ./services/stream-monitoring/stream_monitoring_service.py:/app/stream_monitoring_service.py:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -215,6 +216,9 @@ services:
       - POSTGRES_URL=postgresql://twitch:twitch_password@postgres:5432/twitch
       - HTTP_PORT=5000
       - LOG_LEVEL=INFO
+    volumes:
+      - ./services/api-frontend/static:/app/static:ro
+      - ./services/api-frontend/api_frontend_service.py:/app/api_frontend_service.py:ro
     depends_on:
       postgres:
         condition: service_healthy
