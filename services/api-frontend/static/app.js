@@ -50,7 +50,7 @@ function initializeFilter() {
     // Populate filter dropdown with intensity levels
     intensityFilterEl.innerHTML = INTENSITY_LEVELS.map(level =>
         `<option value="${level.threshold}" ${level.threshold === selectedThreshold ? 'selected' : ''}>
-            ${level.label} (${level.threshold}+ σ)
+            ${level.label}
         </option>`
     ).join('');
 }
@@ -74,7 +74,7 @@ async function loadClips() {
     }
 
     try {
-        const url = `${API_BASE}/clip?min_intensity=${selectedThreshold}&limit=24&offset=${offset}`;
+        const url = `${API_BASE}/clip?min_intensity=${selectedThreshold}&limit=5&offset=${offset}`;
         const response = await fetch(url);
 
         if (!response.ok) {
@@ -109,8 +109,10 @@ async function loadClips() {
 
 function updateClipCount() {
     const level = INTENSITY_LEVELS.find(l => l.threshold === selectedThreshold);
-    const levelName = level ? level.label : `${selectedThreshold}+ σ`;
-    clipCountEl.textContent = `${totalCount} clip${totalCount !== 1 ? 's' : ''} at "${levelName}" or higher`;
+    const levelName = level ? level.label : selectedThreshold;
+    const isHighest = level && level.threshold === INTENSITY_LEVELS[INTENSITY_LEVELS.length - 1].threshold;
+    const suffix = isHighest ? '' : ' or higher';
+    clipCountEl.textContent = `${totalCount} clip${totalCount !== 1 ? 's' : ''} at ${levelName}${suffix}`;
 }
 
 function showLoading() {
@@ -118,7 +120,7 @@ function showLoading() {
     errorEl.classList.add('hidden');
     noClipsEl.classList.add('hidden');
     // Show skeleton loading cards
-    clipsGridEl.innerHTML = generateSkeletonCards(12);
+    clipsGridEl.innerHTML = generateSkeletonCards(5);
 }
 
 function generateSkeletonCards(count) {
@@ -169,8 +171,8 @@ function renderClips() {
     clipsGridEl.innerHTML = clips.map((clip, index) => {
         const intensityInfo = getIntensityLabel(clip.intensity);
         const intensityDisplay = clip.intensity !== null
-            ? `${intensityInfo.label} (${clip.intensity.toFixed(1)}σ)`
-            : 'Score unavailable';
+            ? intensityInfo.label
+            : 'Unknown';
         const isPlaying = playingClipId === clip.clip_id;
 
         return `
@@ -183,11 +185,10 @@ function renderClips() {
                                 allow="autoplay; encrypted-media"></iframe>
                     </div>
                 ` : `
-                    <img src="${escapeHtml(clip.thumbnail_url)}"
-                         alt="Clip from ${escapeHtml(clip.streamer_login || 'Unknown')}"
-                         onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 9%22><rect fill=%22%231f1f23%22 width=%2216%22 height=%229%22/></svg>'">
-                    <div class="play-overlay">
-                        <div class="play-icon"></div>
+                    <div class="inline-player">
+                        <iframe src="${escapeHtml(clip.embed_url)}&parent=${window.location.hostname}"
+                                allowfullscreen
+                                allow="autoplay; encrypted-media"></iframe>
                     </div>
                 `}
             </div>
@@ -222,8 +223,8 @@ function openClip(index) {
     const thumbnailContainer = clipCard.querySelector('.clip-thumbnail');
     if (!thumbnailContainer) return;
 
-    // Create Twitch embed player with autoplay
-    const embedUrl = clip.embed_url + '&parent=' + window.location.hostname + '&autoplay=true';
+    // Create Twitch embed player (no autoplay - let user click Twitch's play button)
+    const embedUrl = clip.embed_url + '&parent=' + window.location.hostname;
     thumbnailContainer.innerHTML = `
         <div class="inline-player">
             <iframe src="${escapeHtml(embedUrl)}"
@@ -335,7 +336,7 @@ async function loadClipsAppend() {
     isLoading = true;
 
     try {
-        const url = `${API_BASE}/clip?min_intensity=${selectedThreshold}&limit=24&offset=${offset}`;
+        const url = `${API_BASE}/clip?min_intensity=${selectedThreshold}&limit=5&offset=${offset}`;
         const response = await fetch(url);
 
         if (!response.ok) {
@@ -373,17 +374,16 @@ function appendClipsToGrid(newClips) {
         const index = startIndex + i;
         const intensityInfo = getIntensityLabel(clip.intensity);
         const intensityDisplay = clip.intensity !== null
-            ? `${intensityInfo.label} (${clip.intensity.toFixed(1)}σ)`
-            : 'Score unavailable';
+            ? intensityInfo.label
+            : 'Unknown';
 
         return `
-        <div class="clip-card" data-clip-id="${escapeHtml(clip.clip_id)}" onclick="openClip(${index})">
+        <div class="clip-card" data-clip-id="${escapeHtml(clip.clip_id)}">
             <div class="clip-thumbnail">
-                <img src="${escapeHtml(clip.thumbnail_url)}"
-                     alt="Clip from ${escapeHtml(clip.streamer_login || 'Unknown')}"
-                     onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 9%22><rect fill=%22%231f1f23%22 width=%2216%22 height=%229%22/></svg>'">
-                <div class="play-overlay">
-                    <div class="play-icon"></div>
+                <div class="inline-player">
+                    <iframe src="${escapeHtml(clip.embed_url)}&parent=${window.location.hostname}"
+                            allowfullscreen
+                            allow="autoplay; encrypted-media"></iframe>
                 </div>
             </div>
             <div class="clip-meta">
