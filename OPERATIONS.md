@@ -52,10 +52,10 @@ docker-compose up -d
 
 You should see output like:
 ```
-[+] Running 13/13
+[+] Running 12/12
  ⠿ Container streamscout-postgres         Started
  ⠿ Container streamscout-redis            Started
- ⠿ Container streamscout-zookeeper        Started
+ ⠿ Container streamscout-kafka            Started
  ...
 ```
 
@@ -215,7 +215,7 @@ PONG
 
 **When to restart:** Kafka connection errors, messages not flowing.
 
-**Step 1: Restart Kafka (this also requires Zookeeper to be running)**
+**Step 1: Restart Kafka**
 ```bash
 docker-compose restart kafka
 ```
@@ -491,7 +491,6 @@ Replace `<service-name>` with one of:
 - `postgres`
 - `redis`
 - `kafka`
-- `zookeeper`
 - `stream-monitoring`
 - `flink-jobmanager`
 - `flink-taskmanager`
@@ -500,6 +499,7 @@ Replace `<service-name>` with one of:
 - `grafana`
 - `loki`
 - `promtail`
+- `node-exporter`
 
 ### View last 50 lines of logs
 ```bash

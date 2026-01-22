@@ -20,7 +20,7 @@ docker-compose up -d
 
 This starts:
 - PostgreSQL (port 5432)
-- Kafka + Zookeeper
+- Kafka (KRaft mode, no Zookeeper)
 - Redis
 - Flink cluster
 - All microservices
