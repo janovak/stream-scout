@@ -127,7 +127,7 @@ services:
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
     volumes:
-      - ./secrets:/opt/flink/secrets:ro
+      - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
     depends_on:
       postgres:
@@ -161,7 +161,7 @@ services:
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
     volumes:
-      - ./secrets:/opt/flink/secrets:ro
+      - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
     depends_on:
       - flink-jobmanager
@@ -228,6 +228,22 @@ services:
   # =============================================================================
   # Monitoring & Observability
   # =============================================================================
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: streamscout-node-exporter
+    ports:
+      - "9101:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+    networks:
+      - streamscout
 
   prometheus:
     image: prom/prometheus:v2.47.0
