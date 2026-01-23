@@ -12,6 +12,9 @@ Add anomaly intensity filtering to the clips browser, enabling users to filter c
 - Modify Flink job to calculate and store intensity values
 - Add pagination and intensity filtering to clips API
 - Rewrite frontend for inline playback, filtering UI, and infinite scroll
+- Add Prometheus metrics for anomaly detection and clip creation
+- Add Grafana dashboard panels for clip/anomaly monitoring
+- Configure Alertmanager with Discord webhook notifications
 
 ## Technical Context
 
@@ -35,8 +38,8 @@ Add anomaly intensity filtering to the clips browser, enabling users to filter c
 | Postgres for persistent storage | PASS | Adding intensity column to existing clips table |
 | PyFlink for stream processing | PASS | Modifying existing Flink job to store intensity |
 | Twitch API integration | PASS | Using existing Twitch embed for inline playback |
-| Prometheus metrics | PASS | No new metrics required for this feature |
-| Grafana/Loki observability | PASS | Existing logging sufficient |
+| Prometheus metrics | PASS | Added custom metrics for anomaly detection and clip creation |
+| Grafana/Loki observability | PASS | Added dashboard panels for anomaly/clip metrics; Alertmanager with Discord notifications |
 | No data loss in pipeline | PASS | Intensity calculation is additive, not replacing |
 | Health check endpoints | PASS | No new services being added |
 | Centralized logging | PASS | Using existing Promtail → Loki |

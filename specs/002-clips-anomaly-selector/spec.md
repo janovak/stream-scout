@@ -155,3 +155,44 @@ As a user visiting the clips page, I want a clean, contemporary interface, so th
 - "Modern UI" means: consistent spacing, clear typography hierarchy, subtle shadows/borders for depth, smooth transitions, and contemporary color palette consistent with the existing application.
 - Clips continue to be sourced from Twitch and use Twitch's embed player for inline playback.
 - The existing clip scrolling bar layout (horizontal grid) is preserved and enhanced rather than replaced.
+
+## Observability
+
+This feature adds clip-specific metrics, dashboard panels, and alerts. For generic infrastructure observability (Prometheus scrape targets, Alertmanager setup, base dashboard panels), see [001-twitch-stream-highlights/spec.md](../001-twitch-stream-highlights/spec.md#observability).
+
+### Prometheus Metrics
+
+The Flink clip detector job exposes the following custom Prometheus metrics on port 9250 (scraped by the `clip-detector` job):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `anomalies_detected_total` | Counter | `broadcaster_id` | Total anomalies detected per broadcaster |
+| `clips_created_success_total` | Counter | `broadcaster_id` | Total clips created successfully per broadcaster |
+| `clips_created_failed_total` | Counter | `broadcaster_id`, `reason` | Total clip creation failures (reasons: `api_error`, `max_retries`, `metadata_fetch`, `unknown`) |
+| `clip_creation_duration_seconds` | Gauge | `broadcaster_id` | Time taken to create the most recent clip per broadcaster |
+
+### Grafana Dashboard
+
+Added to the StreamScout Overview dashboard (`configs/grafana/dashboards/streamscout-overview.json`):
+
+- **Anomaly Detection & Clips**: Time series showing anomalies detected, clips created, and clip failures (5-minute windows)
+
+### Alerts
+
+Feature-specific alert rules added to `configs/prometheus/alert_rules.yml`:
+
+| Alert | Condition | Severity | Description |
+|-------|-----------|----------|-------------|
+| `ClipDetectorMetricsDown` | down for 5m | warning | Clip detector metrics endpoint unreachable |
+| `ClipCreationFailureSpike` | > 30% failure rate over 1h | warning | High clip failure rate |
+| `AnomalyDetectionStalled` | no anomalies in 24h with active streams | warning | Detection may be broken |
+| `NoClipsCreated` | no clips in 24h despite anomalies | warning | Twitch API or token issue |
+
+### Logging
+
+Key log events for this feature:
+
+- `ANOMALY DETECTED for broadcaster {id}`: Includes count, threshold, mean, std, intensity
+- `CLIP CREATION START for broadcaster {id}`: Beginning of clip creation flow
+- `CLIP CREATION COMPLETE for broadcaster {id}`: Success with clip_id and duration
+- `CLIP CREATION FAILED for broadcaster {id}`: Failure with error details

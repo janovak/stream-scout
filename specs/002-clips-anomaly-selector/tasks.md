@@ -152,6 +152,39 @@
 
 ---
 
+## Phase 8: Observability
+
+**Purpose**: Add metrics, dashboard panels, and alerts for clip detection monitoring
+
+### Prometheus Metrics
+
+- [x] T054 [P] Add prometheus-client dependency to services/flink-job/requirements.txt
+- [x] T055 [P] Add METRICS_PORT environment variable to flink-taskmanager in docker-compose.yml
+- [x] T056 Add lazy-initialized Prometheus metrics (_init_metrics function) in services/flink-job/clip_detector_job.py
+- [x] T057 Increment anomalies_detected_total counter in AnomalyDetector.process_element() in services/flink-job/clip_detector_job.py
+- [x] T058 Increment clips_created_success_total/clips_created_failed_total counters in ClipCreator.process_element() in services/flink-job/clip_detector_job.py
+- [x] T059 Record clip_creation_duration_seconds gauge in ClipCreator.process_element() in services/flink-job/clip_detector_job.py
+- [x] T060 Add clip-detector scrape job to configs/prometheus.yml
+
+### Grafana Dashboard
+
+- [x] T061 Add "Anomaly Detection & Clips" time series panel to configs/grafana/dashboards/streamscout-overview.json
+
+### Alerting
+
+- [x] T062 Add ClipDetectorMetricsDown alert rule to configs/prometheus/alert_rules.yml
+- [x] T063 Add ClipCreationFailureSpike alert rule to configs/prometheus/alert_rules.yml
+- [x] T064 Add AnomalyDetectionStalled alert rule to configs/prometheus/alert_rules.yml
+- [x] T065 Add NoClipsCreated alert rule to configs/prometheus/alert_rules.yml
+- [x] T066 Add Alertmanager service to docker-compose.yml
+- [x] T067 Create configs/alertmanager.yml with Discord webhook configuration
+- [x] T068 Update prometheus depends_on to include alertmanager in docker-compose.yml
+- [x] T069 Mount alert_rules.yml in prometheus service in docker-compose.yml
+
+**Checkpoint**: Clip detection metrics visible in Grafana, alerts firing to Discord
+
+---
+
 ## Dependencies & Execution Order
 
 ### Phase Dependencies
@@ -163,6 +196,7 @@
   - US3 depends on US1 (filter reset behavior)
   - US4 can proceed in parallel with US1/US2/US3
 - **Phase 7 (Polish)**: Depends on all user stories complete
+- **Phase 8 (Observability)**: Independent - can proceed in parallel with user stories
 
 ### User Story Dependencies
 
