@@ -137,6 +137,8 @@ services:
       dockerfile: Dockerfile
     container_name: streamscout-flink-taskmanager
     command: taskmanager
+    ports:
+      - "9250:9250"
     environment:
       - |
         FLINK_PROPERTIES=
@@ -154,6 +156,7 @@ services:
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+      - METRICS_PORT=9250
     volumes:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
