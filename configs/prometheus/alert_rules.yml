@@ -1,0 +1,108 @@
+groups:
+  - name: infrastructure
+    rules:
+      # Kafka consumer lag alert
+      - alert: KafkaConsumerLagHigh
+        expr: kafka_consumer_group_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is high"
+          description: "Consumer group {{ $labels.consumer_group }} has lag of {{ $value }} on topic {{ $labels.topic }}"
+
+      # Flink TaskManager down
+      - alert: FlinkTaskManagerDown
+        expr: up{job="flink-taskmanager"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Flink TaskManager is down"
+          description: "Flink TaskManager has been unreachable for more than 2 minutes"
+
+      # Flink JobManager down
+      - alert: FlinkJobManagerDown
+        expr: up{job="flink-jobmanager"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Flink JobManager is down"
+          description: "Flink JobManager has been unreachable for more than 2 minutes"
+
+      # High memory usage
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage is {{ $value | printf \"%.1f\" }}% (threshold: 85%)"
+
+      # Stream monitoring service down
+      - alert: StreamMonitoringDown
+        expr: up{job="stream-monitoring"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Stream monitoring service is down"
+          description: "Stream monitoring service has been unreachable for more than 2 minutes"
+
+  - name: application
+    rules:
+      # No chat messages being processed when streams are active
+      - alert: NoChatMessagesProcessed
+        expr: rate(chat_messages_total[5m]) == 0 and active_stream_count > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No chat messages being processed"
+          description: "No chat messages processed in the last 5 minutes despite {{ $value }} active streams"
+
+      # Clip creation failure spike
+      - alert: ClipCreationFailureSpike
+        expr: |
+          (
+            sum(increase(clips_created_failed_total[1h])) /
+            (sum(increase(clips_created_success_total[1h])) + sum(increase(clips_created_failed_total[1h])) + 0.001)
+          ) > 0.3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High clip creation failure rate"
+          description: "Clip creation failure rate is {{ $value | printf \"%.1f\" }}% in the last hour (threshold: 30%)"
+
+      # Anomaly detection stalled
+      - alert: AnomalyDetectionStalled
+        expr: increase(anomalies_detected_total[24h]) == 0 and active_stream_count > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No anomalies detected in 24 hours"
+          description: "No anomalies have been detected in the last 24 hours despite active streams"
+
+      # No clips created in 24 hours
+      - alert: NoClipsCreated
+        expr: increase(clips_created_success_total[24h]) == 0 and increase(anomalies_detected_total[24h]) > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No clips created in 24 hours"
+          description: "No clips have been created in the last 24 hours despite anomalies being detected. Check Twitch API or token status."
+
+      # Clip detector metrics endpoint down
+      - alert: ClipDetectorMetricsDown
+        expr: up{job="clip-detector"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Clip detector metrics endpoint is down"
+          description: "Clip detector Prometheus metrics endpoint has been unreachable for more than 5 minutes"

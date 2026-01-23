@@ -249,11 +249,28 @@ services:
       - "9090:9090"
     volumes:
       - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./configs/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--web.enable-lifecycle'
+    depends_on:
+      - alertmanager
+    networks:
+      - streamscout
+
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: streamscout-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./configs/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
     networks:
       - streamscout
 
@@ -308,5 +325,6 @@ volumes:
   redis_data:
   kafka_data:
   prometheus_data:
+  alertmanager_data:
   loki_data:
   grafana_data:
