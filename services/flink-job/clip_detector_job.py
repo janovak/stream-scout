@@ -12,12 +12,14 @@ import os
 import re
 import statistics
 import time
+import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Iterator, Optional, Tuple
 
 import requests
+from prometheus_client import Counter, Gauge, start_http_server
 from pyflink.common import Row, Types, WatermarkStrategy
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.time import Duration
@@ -50,8 +52,8 @@ RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 # Anomaly detection parameters
 WINDOW_SIZE_SECONDS = 5
-BASELINE_WINDOW_SECONDS = 300
-STD_DEV_THRESHOLD = 3.0
+BASELINE_WINDOW_SECONDS = 10
+STD_DEV_THRESHOLD = 1.0
 COOLDOWN_SECONDS = 30
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAYS = [0, 2, 4]  # seconds (within 5-second retry window)
@@ -66,6 +68,63 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("clip_detector")
+
+# Prometheus metrics - lazily initialized to avoid pickling issues
+METRICS_PORT = int(os.getenv("METRICS_PORT", "9250"))
+
+# Global metrics registry (initialized lazily in TaskManager)
+# Note: We can't use a threading.Lock here because it can't be pickled by Flink
+_metrics_initialized = False
+_anomalies_detected_total = None
+_clips_created_success_total = None
+_clips_created_failed_total = None
+_clip_creation_duration_seconds = None
+
+
+def _init_metrics():
+    """Initialize Prometheus metrics (called once per TaskManager)."""
+    global _metrics_initialized, _anomalies_detected_total, _clips_created_success_total
+    global _clips_created_failed_total, _clip_creation_duration_seconds
+
+    if _metrics_initialized:
+        return
+
+    from prometheus_client import REGISTRY
+
+    # Helper to get or create a metric
+    def get_or_create_counter(name, desc, labels):
+        for collector in list(REGISTRY._names_to_collectors.values()):
+            if hasattr(collector, '_name') and collector._name == name.replace('_total', ''):
+                return collector
+        return Counter(name, desc, labels)
+
+    def get_or_create_gauge(name, desc, labels):
+        for collector in list(REGISTRY._names_to_collectors.values()):
+            if hasattr(collector, '_name') and collector._name == name:
+                return collector
+        return Gauge(name, desc, labels)
+
+    try:
+        _anomalies_detected_total = get_or_create_counter("anomalies_detected_total", "Total anomalies detected", ["broadcaster_id"])
+        _clips_created_success_total = get_or_create_counter("clips_created_success_total", "Total clips created successfully", ["broadcaster_id"])
+        _clips_created_failed_total = get_or_create_counter("clips_created_failed_total", "Total clip creation failures", ["broadcaster_id", "reason"])
+        _clip_creation_duration_seconds = get_or_create_gauge("clip_creation_duration_seconds", "Time taken to create last clip", ["broadcaster_id"])
+
+        # Start metrics server (will fail silently if already running)
+        try:
+            start_http_server(METRICS_PORT)
+            logger.info(f"Prometheus metrics server started on port {METRICS_PORT}")
+        except OSError as e:
+            if "Address already in use" in str(e):
+                logger.debug(f"Metrics server already running on port {METRICS_PORT}")
+            else:
+                logger.warning(f"Metrics server error: {e}")
+
+        logger.info("Prometheus metrics initialized")
+    except Exception as e:
+        logger.warning(f"Error initializing metrics: {e}")
+
+    _metrics_initialized = True
 
 
 @dataclass
@@ -98,6 +157,7 @@ class ClipResult:
     thumbnail_url: str
     detected_at: int
     success: bool
+    intensity: Optional[float] = None  # Z-score: (message_count - mean) / std_dev
 
 
 class TwitchAPIError(Exception):
@@ -414,25 +474,26 @@ class PostgresClient:
 
     def insert_clip(self, clip: ClipResult):
         """Insert a clip into the database."""
-        logger.info(f"Inserting clip into database: clip_id={clip.clip_id}, broadcaster_id={clip.broadcaster_id}")
+        logger.info(f"Inserting clip into database: clip_id={clip.clip_id}, broadcaster_id={clip.broadcaster_id}, intensity={clip.intensity}")
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO clips (broadcaster_id, clip_id, embed_url, thumbnail_url, detected_at)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO clips (broadcaster_id, clip_id, embed_url, thumbnail_url, detected_at, intensity)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (clip_id) DO NOTHING
                 """, (
                     clip.broadcaster_id,
                     clip.clip_id,
                     clip.embed_url,
                     clip.thumbnail_url,
-                    datetime.fromtimestamp(clip.detected_at / 1000, tz=timezone.utc)
+                    datetime.fromtimestamp(clip.detected_at / 1000, tz=timezone.utc),
+                    clip.intensity
                 ))
                 rows_affected = cur.rowcount
                 conn.commit()
                 if rows_affected > 0:
-                    logger.info(f"Successfully inserted clip {clip.clip_id} for broadcaster {clip.broadcaster_id}")
+                    logger.info(f"Successfully inserted clip {clip.clip_id} for broadcaster {clip.broadcaster_id} with intensity {clip.intensity}")
                 else:
                     logger.warning(f"Clip {clip.clip_id} already exists (conflict), no insert performed")
         except Exception as e:
@@ -552,15 +613,22 @@ class AnomalyDetector(KeyedProcessFunction):
                     # Anomaly detected!
                     self.last_anomaly_time.update(current_ms)
 
+                    # Calculate intensity as Z-score
+                    intensity = (window_sum - mean) / std_dev if std_dev > 0 else 0.0
+
                     anomaly = {
                         "broadcaster_id": broadcaster_id,
                         "detected_at": current_ms,
                         "message_count": window_sum,
                         "baseline_mean": mean,
-                        "baseline_std": std_dev
+                        "baseline_std": std_dev,
+                        "intensity": intensity
                     }
                     logger.info(f"ANOMALY DETECTED for broadcaster {broadcaster_id}: "
-                               f"count={window_sum}, threshold={threshold:.2f}, mean={mean:.2f}, std={std_dev:.2f}")
+                               f"count={window_sum}, threshold={threshold:.2f}, mean={mean:.2f}, std={std_dev:.2f}, intensity={intensity:.2f}")
+                    _init_metrics()
+                    if _anomalies_detected_total:
+                        _anomalies_detected_total.labels(broadcaster_id=str(broadcaster_id)).inc()
                     yield json.dumps(anomaly)
                 else:
                     cooldown_remaining = (COOLDOWN_SECONDS * 1000) - (current_ms - last_anomaly)
@@ -601,6 +669,7 @@ class ClipCreator(ProcessFunction):
             anomaly = json.loads(value)
             broadcaster_id = anomaly["broadcaster_id"]
             detected_at = anomaly["detected_at"]
+            start_time = time.time()
 
             logger.info(f"=== CLIP CREATION START for broadcaster {broadcaster_id} ===")
             logger.info(f"Anomaly details: count={anomaly.get('message_count')}, "
@@ -639,10 +708,16 @@ class ClipCreator(ProcessFunction):
                     break
 
             if not clip_id:
+                _init_metrics()
                 if last_error:
                     logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id}: {last_error}")
+                    reason = "api_error" if isinstance(last_error, TwitchAPIError) else "unknown"
+                    if _clips_created_failed_total:
+                        _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason=reason).inc()
                 else:
                     logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id} after {MAX_RETRY_ATTEMPTS} attempts")
+                    if _clips_created_failed_total:
+                        _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason="max_retries").inc()
                 return
 
             # Wait for clip processing
@@ -653,20 +728,32 @@ class ClipCreator(ProcessFunction):
             # Get clip metadata
             clip_data = self.twitch_client.get_clip(clip_id)
             if clip_data:
+                # Get intensity from anomaly data
+                intensity = anomaly.get("intensity")
+
                 clip_result = ClipResult(
                     broadcaster_id=broadcaster_id,
                     clip_id=clip_id,
                     embed_url=clip_data.get("embed_url", ""),
                     thumbnail_url=clip_data.get("thumbnail_url", ""),
                     detected_at=detected_at,
-                    success=True
+                    success=True,
+                    intensity=intensity
                 )
 
                 # Store in Postgres
                 logger.info(f"Storing clip {clip_id} in database...")
                 self.postgres_client.insert_clip(clip_result)
 
-                logger.info(f"=== CLIP CREATION COMPLETE for broadcaster {broadcaster_id}: clip_id={clip_id} ===")
+                # Record success metrics
+                duration = time.time() - start_time
+                _init_metrics()
+                if _clips_created_success_total:
+                    _clips_created_success_total.labels(broadcaster_id=str(broadcaster_id)).inc()
+                if _clip_creation_duration_seconds:
+                    _clip_creation_duration_seconds.labels(broadcaster_id=str(broadcaster_id)).set(duration)
+
+                logger.info(f"=== CLIP CREATION COMPLETE for broadcaster {broadcaster_id}: clip_id={clip_id} (took {duration:.1f}s) ===")
                 yield json.dumps({
                     "broadcaster_id": broadcaster_id,
                     "clip_id": clip_id,
@@ -675,6 +762,9 @@ class ClipCreator(ProcessFunction):
                 })
             else:
                 logger.error(f"CLIP METADATA RETRIEVAL FAILED for clip_id={clip_id}")
+                _init_metrics()
+                if _clips_created_failed_total:
+                    _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason="metadata_fetch").inc()
 
         except Exception as e:
             logger.error(f"CLIP CREATION ERROR for value={value[:200]}: {e}", exc_info=True)

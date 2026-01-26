@@ -39,36 +39,30 @@ services:
     networks:
       - streamscout
 
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    container_name: streamscout-zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    volumes:
-      - zookeeper_data:/var/lib/zookeeper/data
-      - zookeeper_log:/var/lib/zookeeper/log
-    networks:
-      - streamscout
-
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: streamscout-kafka
-    depends_on:
-      - zookeeper
     ports:
       - "9092:9092"
       - "29092:29092"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # KRaft mode (no Zookeeper)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Cluster settings
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # KRaft cluster ID (generated once, keep stable)
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
@@ -127,7 +121,7 @@ services:
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
     volumes:
-      - ./secrets:/opt/flink/secrets:ro
+      - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
     depends_on:
       postgres:
@@ -143,6 +137,8 @@ services:
       dockerfile: Dockerfile
     container_name: streamscout-flink-taskmanager
     command: taskmanager
+    ports:
+      - "9250:9250"
     environment:
       - |
         FLINK_PROPERTIES=
@@ -160,8 +156,9 @@ services:
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+      - METRICS_PORT=9250
     volumes:
-      - ./secrets:/opt/flink/secrets:ro
+      - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
     depends_on:
       - flink-jobmanager
@@ -192,6 +189,7 @@ services:
       - LOG_LEVEL=INFO
     volumes:
       - ./secrets:/app/secrets:rw
+      - ./services/stream-monitoring/stream_monitoring_service.py:/app/stream_monitoring_service.py:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -215,6 +213,9 @@ services:
       - POSTGRES_URL=postgresql://twitch:twitch_password@postgres:5432/twitch
       - HTTP_PORT=5000
       - LOG_LEVEL=INFO
+    volumes:
+      - ./services/api-frontend/static:/app/static:ro
+      - ./services/api-frontend/api_frontend_service.py:/app/api_frontend_service.py:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -225,6 +226,22 @@ services:
   # Monitoring & Observability
   # =============================================================================
 
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: streamscout-node-exporter
+    ports:
+      - "9101:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+    networks:
+      - streamscout
+
   prometheus:
     image: prom/prometheus:v2.47.0
     container_name: streamscout-prometheus
@@ -232,11 +249,28 @@ services:
       - "9090:9090"
     volumes:
       - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./configs/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--web.enable-lifecycle'
+    depends_on:
+      - alertmanager
+    networks:
+      - streamscout
+
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: streamscout-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./configs/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
     networks:
       - streamscout
 
@@ -289,9 +323,8 @@ networks:
 volumes:
   postgres_data:
   redis_data:
-  zookeeper_data:
-  zookeeper_log:
   kafka_data:
   prometheus_data:
+  alertmanager_data:
   loki_data:
   grafana_data:

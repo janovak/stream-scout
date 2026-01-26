@@ -20,12 +20,14 @@ CREATE TABLE clips (
     embed_url TEXT NOT NULL,
     thumbnail_url TEXT NOT NULL,
     detected_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT NOW()
+    created_at TIMESTAMP DEFAULT NOW(),
+    intensity FLOAT  -- Standard deviations above mean (Z-score), nullable for legacy clips
 );
 
 CREATE INDEX idx_clips_detected_at ON clips(detected_at DESC);
 CREATE INDEX idx_clips_broadcaster_id ON clips(broadcaster_id);
 CREATE INDEX idx_clips_created_at ON clips(created_at DESC);
+CREATE INDEX idx_clips_intensity_detected ON clips(intensity, detected_at DESC);  -- For filtered queries
 
 -- Add foreign key relationship (optional, as streamers may be transient)
 -- ALTER TABLE clips ADD CONSTRAINT fk_clips_broadcaster

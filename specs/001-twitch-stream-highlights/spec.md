@@ -50,6 +50,7 @@ A distributed system that monitors popular Twitch streams, detects moments of hi
 - Flink metrics reporter configured for Prometheus integration
 - Centralized logging via Promtail to Grafana Loki
 - Grafana dashboards for operational visibility (services + Flink job)
+- Alertmanager with Discord webhook notifications for critical alerts
 
 **5. Twitch OAuth Authentication (Headless)**
 - Support headless/server deployment without interactive browser authentication at runtime
@@ -179,3 +180,52 @@ Note: We no longer store individual chat messages in Postgres. They are only use
 - The Flink job must be manually submitted after the cluster starts
 - Submit command: `docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d`
 - The job requires ~5 minutes to build baseline data before detecting anomalies
+
+## Observability
+
+### Grafana Dashboard
+
+The StreamScout Overview dashboard (`configs/grafana/dashboards/streamscout-overview.json`) includes panels for:
+
+- **Active Streams**: Current number of monitored streams (stat panel)
+- **Chat Message Rate**: Messages per second across all streams (stat panel)
+- **Chat Message Rate Over Time**: Time series of message throughput
+- **Flink Processing Rate**: Records in/out for the Flink job
+
+### Prometheus Scrape Targets
+
+Configured in `configs/prometheus.yml`:
+
+| Job Name | Target | Description |
+|----------|--------|-------------|
+| `prometheus` | `localhost:9090` | Prometheus self-monitoring |
+| `stream-monitoring` | `stream-monitoring:9100` | Stream monitoring service metrics |
+| `flink-jobmanager` | `flink-jobmanager:9249` | Flink JobManager metrics |
+| `flink-taskmanager` | `flink-taskmanager:9249` | Flink TaskManager metrics |
+| `node` | `node-exporter:9100` | Host system metrics |
+
+### Infrastructure Alerts
+
+Prometheus Alertmanager is configured with Discord webhook notifications. Generic infrastructure alert rules are defined in `configs/prometheus/alert_rules.yml`:
+
+| Alert | Condition | Severity | Description |
+|-------|-----------|----------|-------------|
+| `KafkaConsumerLagHigh` | lag > 10,000 for 5m | warning | Consumer group falling behind |
+| `FlinkTaskManagerDown` | down for 2m | critical | TaskManager unreachable |
+| `FlinkJobManagerDown` | down for 2m | critical | JobManager unreachable |
+| `HighMemoryUsage` | > 85% for 5m | warning | Node memory threshold exceeded |
+| `StreamMonitoringDown` | down for 2m | critical | Stream monitoring service unreachable |
+| `NoChatMessagesProcessed` | rate = 0 for 5m with active streams | warning | Pipeline may be stalled |
+
+### Alertmanager Configuration
+
+Alertmanager (`configs/alertmanager.yml`) routes alerts to Discord:
+
+- **Group wait**: 30s (10s for critical alerts)
+- **Group interval**: 5m
+- **Repeat interval**: 4h (1h for critical alerts)
+- **Notification channel**: Discord webhook
+
+### Logging
+
+All services emit structured logs to stdout, collected by Promtail and stored in Loki. Query logs via Grafana's Explore view with LogQL.

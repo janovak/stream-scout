@@ -1,0 +1,168 @@
+openapi: 3.0.3
+info:
+  title: Stream Scout Clips API
+  description: API for retrieving clips with intensity filtering and pagination
+  version: 1.1.0
+
+servers:
+  - url: http://localhost:5000
+    description: Local development
+
+paths:
+  /v1.0/clip:
+    get:
+      summary: Get clips with filtering and pagination
+      description: |
+        Retrieve clips filtered by intensity threshold with pagination support.
+        Returns clips ordered by detected_at descending (newest first).
+      parameters:
+        - name: min_intensity
+          in: query
+          description: Minimum intensity threshold (standard deviations)
+          required: false
+          schema:
+            type: number
+            format: float
+            default: 5.0
+            minimum: 0
+            example: 5.0
+        - name: limit
+          in: query
+          description: Maximum number of clips to return
+          required: false
+          schema:
+            type: integer
+            default: 24
+            minimum: 1
+            maximum: 100
+            example: 24
+        - name: offset
+          in: query
+          description: Number of clips to skip (for pagination)
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+            example: 0
+      responses:
+        '200':
+          description: Successful response with clips
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipsResponse'
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    Clip:
+      type: object
+      required:
+        - id
+        - broadcaster_id
+        - clip_id
+        - embed_url
+        - thumbnail_url
+        - detected_at
+        - streamer_login
+      properties:
+        id:
+          type: integer
+          description: Internal clip ID
+          example: 42
+        broadcaster_id:
+          type: integer
+          format: int64
+          description: Twitch broadcaster ID
+          example: 123456789
+        clip_id:
+          type: string
+          description: Twitch clip ID
+          example: "AwkwardHelplessSalamanderSwiftRage"
+        embed_url:
+          type: string
+          format: uri
+          description: Twitch embed URL for the clip
+          example: "https://clips.twitch.tv/embed?clip=AwkwardHelplessSalamanderSwiftRage"
+        thumbnail_url:
+          type: string
+          format: uri
+          description: Clip thumbnail image URL
+          example: "https://clips-media-assets2.twitch.tv/..."
+        detected_at:
+          type: string
+          format: date-time
+          description: When the anomaly was detected
+          example: "2026-01-20T15:30:00+00:00"
+        created_at:
+          type: string
+          format: date-time
+          description: When the clip record was created
+          example: "2026-01-20T15:30:05+00:00"
+        streamer_login:
+          type: string
+          description: Twitch streamer username
+          example: "popular_streamer"
+        intensity:
+          type: number
+          format: float
+          nullable: true
+          description: |
+            Anomaly intensity as standard deviations above mean.
+            Null for clips created before intensity tracking.
+          example: 7.5
+
+    ClipsResponse:
+      type: object
+      required:
+        - clips
+        - count
+        - total_count
+        - has_more
+        - query
+      properties:
+        clips:
+          type: array
+          items:
+            $ref: '#/components/schemas/Clip'
+        count:
+          type: integer
+          description: Number of clips in this response
+          example: 24
+        total_count:
+          type: integer
+          description: Total clips matching the filter
+          example: 156
+        has_more:
+          type: boolean
+          description: Whether more clips are available
+          example: true
+        query:
+          type: object
+          description: Echo of query parameters used
+          properties:
+            min_intensity:
+              type: number
+              example: 5.0
+            limit:
+              type: integer
+              example: 24
+            offset:
+              type: integer
+              example: 0
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: "Invalid min_intensity value"
