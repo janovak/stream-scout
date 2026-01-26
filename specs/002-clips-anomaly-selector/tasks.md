@@ -185,6 +185,34 @@
 
 ---
 
+## Phase 9: Performance — Thumbnail-first Rendering & Prefetching
+
+**Purpose**: Eliminate unnecessary Twitch embed iframes on page load and add speculative prefetching for near-instant infinite scroll
+
+### Thumbnail-first Rendering
+
+- [x] T070 Fix renderClips() to show thumbnail images with play overlay instead of Twitch embed iframes for non-playing clips in services/api-frontend/static/app.js
+- [x] T071 Fix appendClipsToGrid() to show thumbnail images with play overlay instead of iframes, and add missing onclick handler in services/api-frontend/static/app.js
+
+### API Data Prefetching
+
+- [x] T072 Add prefetch state variables (prefetchedData, prefetchPromise) in services/api-frontend/static/app.js
+- [x] T073 Implement prefetchNextPage() that fetches next page in background after each successful load in services/api-frontend/static/app.js
+- [x] T074 Implement consumePrefetchedData() for instant rendering when scrolling triggers loadMoreClips() in services/api-frontend/static/app.js
+- [x] T075 Discard prefetched data on filter change in onFilterChange() in services/api-frontend/static/app.js
+
+### Thumbnail Image Preloading
+
+- [x] T076 Implement preloadThumbnails() that creates Image objects to cache thumbnails for prefetched clips in services/api-frontend/static/app.js
+
+### Batch Size
+
+- [x] T077 Increase frontend batch size from 5 to 24 (matching API DEFAULT_CLIP_LIMIT) in loadClips() and loadClipsAppend() in services/api-frontend/static/app.js
+
+**Checkpoint**: Page loads with lightweight thumbnails instead of iframes; scrolling triggers near-instant rendering from prefetched data
+
+---
+
 ## Dependencies & Execution Order
 
 ### Phase Dependencies
@@ -197,6 +225,7 @@
   - US4 can proceed in parallel with US1/US2/US3
 - **Phase 7 (Polish)**: Depends on all user stories complete
 - **Phase 8 (Observability)**: Independent - can proceed in parallel with user stories
+- **Phase 9 (Performance)**: Depends on US2 (inline playback) and US3 (infinite scroll)
 
 ### User Story Dependencies
 

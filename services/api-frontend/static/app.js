@@ -20,6 +20,10 @@ let hasMore = false;
 let isLoading = false;
 let playingClipId = null;
 
+// Prefetch state
+let prefetchedData = null;
+let prefetchPromise = null;
+
 // DOM Elements
 const loadingEl = document.getElementById('loading');
 const errorEl = document.getElementById('error');
@@ -61,6 +65,8 @@ function onFilterChange() {
     stopCurrentClip(); // Stop any playing clip
     clips = []; // Clear existing clips
     playingClipId = null; // Reset playing state
+    prefetchedData = null; // Discard prefetched data
+    prefetchPromise = null;
     hideBottomLoader(); // Remove any loading indicator
     loadClips();
 }
@@ -74,7 +80,7 @@ async function loadClips() {
     }
 
     try {
-        const url = `${API_BASE}/clip?min_intensity=${selectedThreshold}&limit=5&offset=${offset}`;
+        const url = `${API_BASE}/clip?min_intensity=${selectedThreshold}&limit=24&offset=${offset}`;
         const response = await fetch(url);
 
         if (!response.ok) {
@@ -99,6 +105,11 @@ async function loadClips() {
         } else {
             renderClips();
         }
+
+        // Prefetch next page in background
+        if (hasMore) {
+            prefetchNextPage(clips.length);
+        }
     } catch (error) {
         console.error('Failed to load clips:', error);
         showError();
@@ -120,7 +131,7 @@ function showLoading() {
     errorEl.classList.add('hidden');
     noClipsEl.classList.add('hidden');
     // Show skeleton loading cards
-    clipsGridEl.innerHTML = generateSkeletonCards(5);
+    clipsGridEl.innerHTML = generateSkeletonCards(12);
 }
 
 function generateSkeletonCards(count) {
@@ -185,10 +196,11 @@ function renderClips() {
                                 allow="autoplay; encrypted-media"></iframe>
                     </div>
                 ` : `
-                    <div class="inline-player">
-                        <iframe src="${escapeHtml(clip.embed_url)}&parent=${window.location.hostname}"
-                                allowfullscreen
-                                allow="autoplay; encrypted-media"></iframe>
+                    <img src="${escapeHtml(clip.thumbnail_url)}"
+                         alt="Clip from ${escapeHtml(clip.streamer_login || 'Unknown')}"
+                         onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 9%22><rect fill=%22%231f1f23%22 width=%2216%22 height=%229%22/></svg>'">
+                    <div class="play-overlay">
+                        <div class="play-icon"></div>
                     </div>
                 `}
             </div>
@@ -295,6 +307,40 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
+// Prefetch Functions
+function prefetchNextPage(nextOffset) {
+    const threshold = selectedThreshold; // Capture current filter
+    const url = `${API_BASE}/clip?min_intensity=${threshold}&limit=24&offset=${nextOffset}`;
+
+    prefetchedData = null;
+    prefetchPromise = fetch(url)
+        .then(response => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response.json();
+        })
+        .then(data => {
+            // Only store if filter hasn't changed since prefetch started
+            if (selectedThreshold === threshold) {
+                prefetchedData = data;
+                // Preload thumbnail images into browser cache
+                preloadThumbnails(data.clips || []);
+            }
+        })
+        .catch(err => {
+            console.warn('Prefetch failed (will fetch on demand):', err);
+            prefetchedData = null;
+        });
+}
+
+function preloadThumbnails(clipList) {
+    clipList.forEach(clip => {
+        if (clip.thumbnail_url) {
+            const img = new Image();
+            img.src = clip.thumbnail_url;
+        }
+    });
+}
+
 // Infinite Scroll Functions
 function initializeInfiniteScroll() {
     window.addEventListener('scroll', handleScroll);
@@ -324,6 +370,12 @@ function loadMoreClips() {
     // Update offset for next page
     offset = clips.length;
 
+    // Check if we have prefetched data ready
+    if (prefetchedData) {
+        consumePrefetchedData();
+        return;
+    }
+
     // Show loading indicator at bottom
     showBottomLoader();
 
@@ -331,12 +383,31 @@ function loadMoreClips() {
     loadClipsAppend();
 }
 
+function consumePrefetchedData() {
+    const data = prefetchedData;
+    prefetchedData = null;
+    prefetchPromise = null;
+
+    const newClips = data.clips || [];
+    clips = [...clips, ...newClips];
+    totalCount = data.total_count || 0;
+    hasMore = data.has_more || false;
+
+    updateClipCount();
+    appendClipsToGrid(newClips);
+
+    // Prefetch next page
+    if (hasMore) {
+        prefetchNextPage(clips.length);
+    }
+}
+
 async function loadClipsAppend() {
     if (isLoading) return;
     isLoading = true;
 
     try {
-        const url = `${API_BASE}/clip?min_intensity=${selectedThreshold}&limit=5&offset=${offset}`;
+        const url = `${API_BASE}/clip?min_intensity=${selectedThreshold}&limit=24&offset=${offset}`;
         const response = await fetch(url);
 
         if (!response.ok) {
@@ -359,6 +430,11 @@ async function loadClipsAppend() {
         // Update or remove bottom loader
         hideBottomLoader();
 
+        // Prefetch next page in background
+        if (hasMore) {
+            prefetchNextPage(clips.length);
+        }
+
     } catch (error) {
         console.error('Failed to load more clips:', error);
         hideBottomLoader();
@@ -378,12 +454,13 @@ function appendClipsToGrid(newClips) {
             : 'Unknown';
 
         return `
-        <div class="clip-card" data-clip-id="${escapeHtml(clip.clip_id)}">
+        <div class="clip-card" data-clip-id="${escapeHtml(clip.clip_id)}" onclick="openClip(${index})">
             <div class="clip-thumbnail">
-                <div class="inline-player">
-                    <iframe src="${escapeHtml(clip.embed_url)}&parent=${window.location.hostname}"
-                            allowfullscreen
-                            allow="autoplay; encrypted-media"></iframe>
+                <img src="${escapeHtml(clip.thumbnail_url)}"
+                     alt="Clip from ${escapeHtml(clip.streamer_login || 'Unknown')}"
+                     onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 9%22><rect fill=%22%231f1f23%22 width=%2216%22 height=%229%22/></svg>'">
+                <div class="play-overlay">
+                    <div class="play-icon"></div>
                 </div>
             </div>
             <div class="clip-meta">

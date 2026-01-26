@@ -106,6 +106,7 @@ As a user visiting the clips page, I want a clean, contemporary interface, so th
 
 **Inline Playback**
 - **FR-005**: System MUST play video clips inline within the scrolling grid when clicked.
+- **FR-005a**: System MUST render clip cards with thumbnail images by default; Twitch embed iframes MUST only load when a user clicks a clip to play it.
 - **FR-006**: System MUST NOT open a separate modal, pane, or overlay for clip playback.
 - **FR-007**: System MUST stop any currently playing clip when a new clip is clicked.
 - **FR-008**: System MUST display playback controls (play/pause, mute/unmute, progress) on the inline player.
@@ -114,6 +115,9 @@ As a user visiting the clips page, I want a clean, contemporary interface, so th
 **Infinite Scrolling**
 - **FR-010**: System MUST load an initial batch of the most recent clips when the page loads (default: 24 clips).
 - **FR-011**: System MUST automatically load additional clips when the user scrolls near the bottom of the current list.
+- **FR-011a**: System MUST prefetch the next page of clip data in the background immediately after each page loads, so scrolling triggers near-instant rendering from cached data.
+- **FR-011b**: System MUST preload thumbnail images for prefetched clips so they render immediately when appended to the grid.
+- **FR-011c**: System MUST discard prefetched data when the intensity filter changes.
 - **FR-012**: System MUST NOT use the previous 7-day time window as the primary loading constraint.
 - **FR-013**: System MUST display a loading indicator while fetching additional clips.
 - **FR-014**: System MUST indicate when all available clips have been loaded.

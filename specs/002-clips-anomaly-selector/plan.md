@@ -12,6 +12,7 @@ Add anomaly intensity filtering to the clips browser, enabling users to filter c
 - Modify Flink job to calculate and store intensity values
 - Add pagination and intensity filtering to clips API
 - Rewrite frontend for inline playback, filtering UI, and infinite scroll
+- Add thumbnail-first rendering with lazy iframe loading, API data prefetching, and thumbnail preloading for performance
 - Add Prometheus metrics for anomaly detection and clip creation
 - Add Grafana dashboard panels for clip/anomaly monitoring
 - Configure Alertmanager with Discord webhook notifications
