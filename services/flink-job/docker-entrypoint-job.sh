@@ -17,7 +17,7 @@ until curl -s http://localhost:8081/overview > /dev/null 2>&1; do
 done
 echo "JobManager is ready!"
 
-# Submit the PyFlink job
+# Submit the PyFlink job automatically
 echo "Submitting PyFlink job..."
 flink run -py /opt/flink/usrlib/clip_detector_job.py -d
 

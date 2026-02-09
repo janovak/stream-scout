@@ -1,0 +1,159 @@
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: streamscout-kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+      - "9093:9093"
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092,EXTERNAL://100.106.110.127:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic chat-messages --partitions 20 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic stream-lifecycle --partitions 5 --replication-factor 1
+      echo 'Topics created successfully'
+      "
+
+  stream-monitoring:
+    build:
+      context: ./services/stream-monitoring
+      dockerfile: Dockerfile
+    container_name: streamscout-stream-monitoring
+    environment:
+      - KAFKA_BROKER_URL=kafka:29092
+      - POSTGRES_URL=postgresql://twitch:twitch_password@100.112.97.111:5432/twitch
+      - REDIS_URL=redis://100.112.97.111:6379
+      - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
+      - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+      - TWITCH_TOKEN_FILE=/app/secrets/twitch_user_tokens.json
+      - PROMETHEUS_PORT=9100
+      - HEALTH_CHECK_PORT=8080
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./secrets:/app/secrets:rw
+      - ./services/stream-monitoring/stream_monitoring_service.py:/app/stream_monitoring_service.py:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  flink-jobmanager:
+    build:
+      context: ./services/flink-job
+      dockerfile: Dockerfile
+    container_name: streamscout-flink-jobmanager
+    command: /opt/flink/docker-entrypoint-job.sh
+    ports:
+      - "8081:8081"
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 1536m
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - POSTGRES_HOST=100.112.97.111
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=twitch
+      - POSTGRES_USER=twitch
+      - POSTGRES_PASSWORD=twitch_password
+      - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
+      - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+      - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+    volumes:
+      - ./secrets:/opt/flink/secrets:rw
+      - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  flink-taskmanager:
+    build:
+      context: ./services/flink-job
+      dockerfile: Dockerfile
+    container_name: streamscout-flink-taskmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.memory.process.size: 1536m
+        taskmanager.numberOfTaskSlots: 4
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - POSTGRES_HOST=100.112.97.111
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=twitch
+      - POSTGRES_USER=twitch
+      - POSTGRES_PASSWORD=twitch_password
+      - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
+      - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+      - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+    volumes:
+      - ./secrets:/opt/flink/secrets:rw
+      - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
+    depends_on:
+      - flink-jobmanager
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: streamscout-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus-processing.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: streamscout-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+    restart: unless-stopped
+
+volumes:
+  kafka_data:
+  prometheus_data:
+  grafana_data:
