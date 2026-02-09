@@ -26,7 +26,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DEFAULT_CLIP_LIMIT = 24
 MAX_CLIP_LIMIT = 100
-DEFAULT_MIN_INTENSITY = 5.0  # "Getting Good" threshold
+DEFAULT_MIN_INTENSITY = 9.0  # "Getting Good" threshold
 
 # Logging setup
 logger = logging.getLogger("api_frontend")

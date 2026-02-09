@@ -4,16 +4,16 @@ const API_BASE = '/v1.0';
 
 // Intensity levels configuration (FR-001a: stored as frontend constant)
 const INTENSITY_LEVELS = [
-    { threshold: 3, label: "Warming Up" },
-    { threshold: 5, label: "Getting Good" },
-    { threshold: 7, label: "Popping Off" },
-    { threshold: 9, label: "Unhinged" },
-    { threshold: 11, label: "Legendary" }
+    { threshold: 7, label: "Warming Up" },
+    { threshold: 9, label: "Getting Good" },
+    { threshold: 11, label: "Popping Off" },
+    { threshold: 13, label: "Unhinged" },
+    { threshold: 15, label: "Legendary" }
 ];
 
 // State
 let clips = [];
-let selectedThreshold = 5; // Default: "Getting Good" (FR-002b)
+let selectedThreshold = 9; // Default: "Getting Good" (FR-002b)
 let totalCount = 0;
 let offset = 0;
 let hasMore = false;
