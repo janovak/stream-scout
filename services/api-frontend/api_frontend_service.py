@@ -26,7 +26,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DEFAULT_CLIP_LIMIT = 24
 MAX_CLIP_LIMIT = 100
-DEFAULT_MIN_INTENSITY = 5.0  # "Getting Good" threshold
+DEFAULT_MIN_INTENSITY = 9.0  # "Unhinged" threshold
 
 # Logging setup
 logger = logging.getLogger("api_frontend")
@@ -130,7 +130,7 @@ def get_clips():
     Query clips with intensity filtering and pagination.
 
     Query Parameters:
-    - min_intensity: Minimum intensity threshold (default: 5.0 "Getting Good")
+    - min_intensity: Minimum intensity threshold (default: 9.0 "Unhinged")
     - limit: Maximum number of clips to return (default: 24, max: 100)
     - offset: Number of clips to skip for pagination (default: 0)
     """
@@ -203,8 +203,8 @@ def get_clips():
                 "clip_id": row[2],
                 "embed_url": row[3],
                 "thumbnail_url": row[4],
-                "detected_at": row[5].isoformat() if row[5] else None,
-                "created_at": row[6].isoformat() if row[6] else None,
+                "detected_at": row[5].replace(tzinfo=timezone.utc).isoformat() if row[5] else None,
+                "created_at": row[6].replace(tzinfo=timezone.utc).isoformat() if row[6] else None,
                 "intensity": row[7],
                 "streamer_login": row[8]
             })
