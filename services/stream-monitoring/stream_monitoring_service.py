@@ -15,7 +15,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import psycopg2
 import psycopg2.pool
@@ -218,20 +218,38 @@ class StreamMonitoringService:
                 if len(streams) >= LEAVE_THRESHOLD:
                     break
 
+            # Broadcasters we've already learned don't allow clip creation (via a
+            # 403 from the clip-detector job) -- no point spending a chat
+            # connection on a streamer we can never successfully clip.
+            disabled_ids = self._get_clipping_disabled_ids([int(s.user_id) for s in streams])
+
             # Track streamers by rank for hysteresis logic
             top_join_streamers = set()  # Streamers in top JOIN_THRESHOLD (eligible to join)
             top_leave_streamers = set()  # Streamers in top LEAVE_THRESHOLD (not yet eligible to leave)
+            disabled_logins = set()  # Streamers with clipping disabled, joined or not
 
             for rank, stream in enumerate(streams, 1):
                 broadcaster_login = stream.user_login.lower()
                 broadcaster_id = int(stream.user_id)
                 self.broadcaster_ids[broadcaster_login] = broadcaster_id
 
-                # Track which threshold each streamer is in
-                if rank <= JOIN_THRESHOLD:
-                    top_join_streamers.add(broadcaster_login)
-                if rank <= LEAVE_THRESHOLD:
-                    top_leave_streamers.add(broadcaster_login)
+                # Track which threshold each streamer is in. Streamers with clipping
+                # disabled are left out of both sets: they'll never become join-eligible,
+                # and if already joined, dropping them from top_leave_streamers makes
+                # _manage_chat_connections leave immediately instead of waiting for
+                # them to fall out of the rank window.
+                if broadcaster_id not in disabled_ids:
+                    if rank <= JOIN_THRESHOLD:
+                        top_join_streamers.add(broadcaster_login)
+                    if rank <= LEAVE_THRESHOLD:
+                        top_leave_streamers.add(broadcaster_login)
+                else:
+                    disabled_logins.add(broadcaster_login)
+                    if broadcaster_login in self.joined_channels:
+                        logger.info("Streamer has clipping disabled, will leave chat", extra={
+                            "broadcaster_login": broadcaster_login,
+                            "broadcaster_id": broadcaster_id
+                        })
 
                 # Update Redis with TTL
                 redis_key = f"streamer:online:{broadcaster_login}"
@@ -266,25 +284,29 @@ class StreamMonitoringService:
             active_stream_count.set(len(self.joined_channels))
 
             # Manage chat connections with hysteresis
-            await self._manage_chat_connections(top_join_streamers, top_leave_streamers)
+            await self._manage_chat_connections(top_join_streamers, top_leave_streamers, disabled_logins)
 
         except Exception as e:
             logger.error("Error polling streams", extra={"error": str(e)})
             twitch_api_errors_total.labels(error_type="poll_streams").inc()
 
-    async def _manage_chat_connections(self, join_eligible: Set[str], leave_eligible: Set[str]):
+    async def _manage_chat_connections(self, join_eligible: Set[str], leave_eligible: Set[str],
+                                        disabled_logins: Optional[Set[str]] = None):
         """
         Manage chat room connections with hysteresis.
 
         Args:
             join_eligible: Streamers in top JOIN_THRESHOLD (should join if not already joined)
             leave_eligible: Streamers in top LEAVE_THRESHOLD (should NOT leave yet)
+            disabled_logins: Streamers known to have clipping disabled (for leave-reason logging)
 
         Hysteresis logic:
         - Join chat when streamer enters top 5 (JOIN_THRESHOLD)
         - Leave chat only when streamer drops out of top 10 (LEAVE_THRESHOLD)
         - This prevents thrashing and preserves Flink baseline data
         """
+        disabled_logins = disabled_logins or set()
+
         # Join channels for streamers who entered top JOIN_THRESHOLD
         channels_to_join = join_eligible - self.joined_channels
 
@@ -316,14 +338,15 @@ class StreamMonitoringService:
             except Exception as e:
                 logger.error("Failed to join chat room", extra={"channel": channel, "error": str(e)})
 
-        # Leave channels (dropped out of top LEAVE_THRESHOLD)
+        # Leave channels (dropped out of top LEAVE_THRESHOLD, or clipping disabled)
         for channel in channels_to_leave:
             try:
                 await self.chat.leave_room(channel)
                 self.joined_channels.discard(channel)
+                reason = "clipping disabled" if channel in disabled_logins else f"exited top {LEAVE_THRESHOLD}"
                 logger.info("Left chat room", extra={
                     "channel": channel,
-                    "reason": f"exited top {LEAVE_THRESHOLD}"
+                    "reason": reason
                 })
             except Exception as e:
                 logger.error("Failed to leave chat room", extra={"channel": channel, "error": str(e)})
@@ -436,6 +459,26 @@ class StreamMonitoringService:
             })
             if conn:
                 conn.rollback()
+        finally:
+            if conn:
+                self.db_pool.putconn(conn)
+
+    def _get_clipping_disabled_ids(self, streamer_ids: List[int]) -> Set[int]:
+        """Return the subset of streamer_ids known to have clip creation disabled."""
+        if not streamer_ids:
+            return set()
+        conn = None
+        try:
+            conn = self.db_pool.getconn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT streamer_id FROM streamers WHERE streamer_id = ANY(%s) AND allows_clipping = FALSE",
+                    (streamer_ids,)
+                )
+                return {row[0] for row in cur.fetchall()}
+        except Exception as e:
+            logger.error("Failed to query clipping-disabled streamers", extra={"error": str(e)})
+            return set()
         finally:
             if conn:
                 self.db_pool.putconn(conn)

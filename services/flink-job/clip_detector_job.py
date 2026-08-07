@@ -510,6 +510,25 @@ class PostgresClient:
             conn.rollback()
             raise
 
+    def mark_clipping_disabled(self, broadcaster_id: int):
+        """Record that a broadcaster does not allow clip creation.
+
+        stream-monitoring checks this flag before joining/staying in a
+        broadcaster's chat, so we stop spending a chat connection on
+        someone we can never successfully clip.
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE streamers SET allows_clipping = FALSE WHERE streamer_id = %s
+                """, (broadcaster_id,))
+                conn.commit()
+                logger.info(f"Marked broadcaster {broadcaster_id} as allows_clipping=FALSE")
+        except Exception as e:
+            logger.error(f"Failed to mark broadcaster {broadcaster_id} as clipping-disabled: {e}")
+            conn.rollback()
+
     def close(self):
         """Close the database connection."""
         if self._conn:
@@ -739,6 +758,13 @@ class ClipCreator(ProcessFunction):
                     reason = "api_error" if isinstance(last_error, TwitchAPIError) else "unknown"
                     if _clips_created_failed_total:
                         _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason=reason).inc()
+                    # Twitch returns 403 here specifically when the broadcaster hasn't
+                    # authorized clip creation on their channel -- that's permanent
+                    # until they change it, not something a retry or token refresh
+                    # fixes. Record it so stream-monitoring stops watching their chat.
+                    if isinstance(last_error, TwitchAPIError) and last_error.status_code == 403:
+                        logger.warning(f"Broadcaster {broadcaster_id} does not authorize clip creation; marking allows_clipping=FALSE")
+                        self.postgres_client.mark_clipping_disabled(broadcaster_id)
                 else:
                     logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id} after {MAX_RETRY_ATTEMPTS} attempts")
                     if _clips_created_failed_total:
