@@ -53,7 +53,7 @@ RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 # Anomaly detection parameters
 WINDOW_SIZE_SECONDS = 5
 BASELINE_WINDOW_SECONDS = 10
-STD_DEV_THRESHOLD = 1.0
+STD_DEV_THRESHOLD = 5.0
 COOLDOWN_SECONDS = 30
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAYS = [0, 2, 4]  # seconds (within 5-second retry window)
@@ -523,7 +523,7 @@ class CommandFilter(ProcessFunction):
 class AnomalyDetector(KeyedProcessFunction):
     """
     Detects anomalies in chat message frequency using sliding windows.
-    Uses mean + 3 standard deviations as threshold.
+    Uses mean + STD_DEV_THRESHOLD standard deviations as threshold.
     Implements 30-second cooldown between detections per broadcaster.
     """
 

@@ -26,7 +26,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DEFAULT_CLIP_LIMIT = 24
 MAX_CLIP_LIMIT = 100
-DEFAULT_MIN_INTENSITY = 5.0  # "Getting Good" threshold
+DEFAULT_MIN_INTENSITY = 9.0  # "Unhinged" threshold
 
 # Logging setup
 logger = logging.getLogger("api_frontend")
@@ -130,7 +130,7 @@ def get_clips():
     Query clips with intensity filtering and pagination.
 
     Query Parameters:
-    - min_intensity: Minimum intensity threshold (default: 5.0 "Getting Good")
+    - min_intensity: Minimum intensity threshold (default: 9.0 "Unhinged")
     - limit: Maximum number of clips to return (default: 24, max: 100)
     - offset: Number of clips to skip for pagination (default: 0)
     """

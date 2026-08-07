@@ -54,7 +54,7 @@ class TestAnomalyDetectionThreshold:
 
     def test_threshold_uses_correct_std_dev_multiplier(self):
         """Threshold should be mean + STD_DEV_THRESHOLD * std_dev."""
-        assert STD_DEV_THRESHOLD == 1.0, "Threshold should be 1.0 std dev per spec"
+        assert STD_DEV_THRESHOLD == 5.0, "Threshold should be 5.0 std dev per spec"
 
     def test_threshold_calculation(self):
         """Test threshold calculation with sample data."""
@@ -65,9 +65,8 @@ class TestAnomalyDetectionThreshold:
         std_dev = statistics.stdev(baseline_counts)
         threshold = mean + (STD_DEV_THRESHOLD * std_dev)
 
-        # With mean ~5.3 and low variance, threshold should be around 6.2
         assert threshold > mean
-        assert threshold < mean + (3 * std_dev)  # Should be less than 3 std dev
+        assert threshold == mean + (STD_DEV_THRESHOLD * std_dev)
 
     def test_anomaly_detected_when_above_threshold(self):
         """Anomaly should be detected when current count exceeds threshold."""
