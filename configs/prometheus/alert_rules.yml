@@ -54,8 +54,16 @@ groups:
   - name: application
     rules:
       # No chat messages being processed when streams are active
+      #
+      # sum() strips the broadcaster_id label from chat_messages_total, and
+      # `on()` (empty) makes the `and` a plain boolean match ignoring any
+      # remaining labels (active_stream_count still carries instance/job).
+      # Without both, this could never fire: Prometheus's `and` requires
+      # identical label sets on both sides by default. Verified via direct
+      # query against a real incident window where the condition was true for
+      # 2+ hours and the original (unfixed) version matched zero series.
       - alert: NoChatMessagesProcessed
-        expr: rate(chat_messages_total[5m]) == 0 and active_stream_count > 0
+        expr: sum(rate(chat_messages_total[5m])) == 0 and on() active_stream_count > 0
         for: 5m
         labels:
           severity: warning
