@@ -33,7 +33,7 @@ Open Docker Desktop from your Applications folder if it's not already running. W
 ### Step 3: Stop any existing containers (clean slate)
 
 ```bash
-docker-compose down
+docker compose down
 ```
 
 You should see output like:
@@ -47,7 +47,7 @@ You should see output like:
 ### Step 4: Start all infrastructure services
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 You should see output like:
@@ -62,7 +62,7 @@ You should see output like:
 ### Step 5: Wait for services to be healthy (about 30-60 seconds)
 
 ```bash
-docker-compose ps
+docker compose ps
 ```
 
 You should see all services with `running` status. If any show `starting`, wait and run the command again.
@@ -127,7 +127,7 @@ Use these commands to see if everything is running correctly.
 ### Check all container statuses
 
 ```bash
-docker-compose ps
+docker compose ps
 ```
 
 All services should show `running` status.
@@ -166,12 +166,12 @@ Use these sections when a specific component fails.
 
 **Step 1: Restart the container**
 ```bash
-docker-compose restart postgres
+docker compose restart postgres
 ```
 
 **Step 2: Wait for it to be healthy (about 10 seconds)**
 ```bash
-docker-compose ps postgres
+docker compose ps postgres
 ```
 
 Should show `running` status.
@@ -196,7 +196,7 @@ Should show:
 
 **Step 1: Restart the container**
 ```bash
-docker-compose restart redis
+docker compose restart redis
 ```
 
 **Step 2: Verify it's working**
@@ -217,12 +217,12 @@ PONG
 
 **Step 1: Restart Kafka**
 ```bash
-docker-compose restart kafka
+docker compose restart kafka
 ```
 
 **Step 2: Wait for it to be healthy (about 30 seconds)**
 ```bash
-docker-compose ps kafka
+docker compose ps kafka
 ```
 
 Should show `running` status.
@@ -240,8 +240,8 @@ stream-lifecycle
 
 **Step 4: After restarting Kafka, you MUST restart these services:**
 ```bash
-docker-compose restart stream-monitoring
-docker-compose restart flink-jobmanager flink-taskmanager
+docker compose restart stream-monitoring
+docker compose restart flink-jobmanager flink-taskmanager
 ```
 
 Then re-submit the Flink job (see "Restarting: Flink Job" below).
@@ -259,7 +259,7 @@ docker logs streamscout-stream-monitoring --tail 20
 
 **Step 2: Restart the container**
 ```bash
-docker-compose restart stream-monitoring
+docker compose restart stream-monitoring
 ```
 
 **Step 3: Watch the logs to verify it's working**
@@ -301,12 +301,12 @@ docker exec streamscout-flink-jobmanager flink cancel e56f5ff6db31864ccb2c90700f
 
 **Step 3: Restart both Flink containers**
 ```bash
-docker-compose restart flink-jobmanager flink-taskmanager
+docker compose restart flink-jobmanager flink-taskmanager
 ```
 
 **Step 4: Wait for containers to be ready (about 30 seconds)**
 ```bash
-docker-compose ps flink-jobmanager flink-taskmanager
+docker compose ps flink-jobmanager flink-taskmanager
 ```
 
 Both should show `running` status.
@@ -348,7 +348,7 @@ You should see token validation succeeded and Kafka consumer starting.
 
 **Step 1: Restart the container**
 ```bash
-docker-compose restart api-frontend
+docker compose restart api-frontend
 ```
 
 **Step 2: Verify it's working**
@@ -376,7 +376,7 @@ Should return clip data (or empty array if no clips yet).
 
 **Step 1: Restart the container**
 ```bash
-docker-compose restart prometheus
+docker compose restart prometheus
 ```
 
 **Step 2: Verify it's working**
@@ -391,7 +391,7 @@ Open http://localhost:9090 in your browser. You should see the Prometheus web in
 
 **Step 1: Restart the container**
 ```bash
-docker-compose restart grafana
+docker compose restart grafana
 ```
 
 **Step 2: Verify it's working**
@@ -406,7 +406,7 @@ Open http://localhost:3000 in your browser. Login with `admin` / `admin`.
 
 **Step 1: Restart both containers**
 ```bash
-docker-compose restart loki promtail
+docker compose restart loki promtail
 ```
 
 **Step 2: Verify Loki is working**
@@ -427,12 +427,12 @@ Use this when everything is broken and you want to start over.
 
 ### Step 1: Stop everything
 ```bash
-docker-compose down
+docker compose down
 ```
 
 ### Step 2: Start everything
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 ### Step 3: Wait 60 seconds for all services to initialize
@@ -442,7 +442,7 @@ sleep 60
 
 ### Step 4: Check all services are running
 ```bash
-docker-compose ps
+docker compose ps
 ```
 
 ### Step 5: Check Flink job is running
@@ -468,12 +468,12 @@ Use this when you want to stop the entire system.
 
 ### Stop all containers (preserves data)
 ```bash
-docker-compose down
+docker compose down
 ```
 
 ### Stop all containers AND delete all data (fresh start)
 ```bash
-docker-compose down -v
+docker compose down -v
 ```
 
 **WARNING:** The `-v` flag deletes all database data, clips, and metrics history. Only use this if you want to completely reset.
@@ -535,7 +535,7 @@ docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_de
 
 **Solution:** Restart both Flink containers:
 ```bash
-docker-compose restart flink-jobmanager flink-taskmanager
+docker compose restart flink-jobmanager flink-taskmanager
 ```
 
 Wait 30 seconds, then submit the job:
@@ -559,7 +559,7 @@ python seed_twitch_tokens.py
 
 Then restart Flink:
 ```bash
-docker-compose restart flink-jobmanager flink-taskmanager
+docker compose restart flink-jobmanager flink-taskmanager
 ```
 
 ---
@@ -578,7 +578,7 @@ python seed_twitch_tokens.py
 
 Then restart:
 ```bash
-docker-compose restart stream-monitoring
+docker compose restart stream-monitoring
 ```
 
 ---
@@ -620,7 +620,7 @@ docker-compose restart stream-monitoring
 
 2. **Database connection issue** - Restart API:
    ```bash
-   docker-compose restart api-frontend
+   docker compose restart api-frontend
    ```
 
 3. **Check if clips exist in database:**
@@ -645,10 +645,10 @@ docker-compose restart stream-monitoring
 
 | Action | Command |
 |--------|---------|
-| Start everything | `docker-compose up -d` |
-| Stop everything | `docker-compose down` |
-| Check status | `docker-compose ps` |
+| Start everything | `docker compose up -d` |
+| Stop everything | `docker compose down` |
+| Check status | `docker compose ps` |
 | Check Flink job | `docker exec streamscout-flink-jobmanager flink list` |
 | Submit Flink job | `docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d` |
 | View service logs | `docker logs streamscout-<service-name>` |
-| Restart a service | `docker-compose restart <service-name>` |
+| Restart a service | `docker compose restart <service-name>` |
