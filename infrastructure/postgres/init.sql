@@ -5,8 +5,8 @@ CREATE TABLE streamers (
     streamer_id BIGINT PRIMARY KEY,
     streamer_login VARCHAR(255) NOT NULL,
     allows_clipping BOOLEAN DEFAULT TRUE,
-    first_seen_at TIMESTAMP DEFAULT NOW(),
-    last_seen_at TIMESTAMP DEFAULT NOW()
+    first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX idx_streamers_last_seen ON streamers(last_seen_at);
@@ -19,8 +19,8 @@ CREATE TABLE clips (
     clip_id VARCHAR(255) NOT NULL UNIQUE,
     embed_url TEXT NOT NULL,
     thumbnail_url TEXT NOT NULL,
-    detected_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT NOW(),
+    detected_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     intensity FLOAT  -- Standard deviations above mean (Z-score), nullable for legacy clips
 );
 

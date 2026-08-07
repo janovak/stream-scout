@@ -203,8 +203,8 @@ def get_clips():
                 "clip_id": row[2],
                 "embed_url": row[3],
                 "thumbnail_url": row[4],
-                "detected_at": row[5].isoformat() if row[5] else None,
-                "created_at": row[6].isoformat() if row[6] else None,
+                "detected_at": row[5].replace(tzinfo=timezone.utc).isoformat() if row[5] else None,
+                "created_at": row[6].replace(tzinfo=timezone.utc).isoformat() if row[6] else None,
                 "intensity": row[7],
                 "streamer_login": row[8]
             })
