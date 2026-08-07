@@ -533,6 +533,18 @@ class AnomalyDetector(KeyedProcessFunction):
         self.baseline_stats = None  # ValueState: (mean, std_dev, sample_count)
 
     def open(self, runtime_context):
+        # Start the metrics server here so it comes up on the first chat
+        # message this worker processes, not the first anomaly (previously
+        # it only started inside the anomaly branch -> the /metrics endpoint
+        # stayed dark, tripping ClipDetectorMetricsDown, through any quiet
+        # stretch with no spikes -- much more likely now that
+        # STD_DEV_THRESHOLD is 5.0 instead of 1.0).
+        # Must be here, not at module scope: module-level start_http_server()
+        # runs on the jobmanager during job submission too, and pollutes the
+        # driver process with an unpicklable thread lock before cloudpickle
+        # ships AnomalyDetector() to the task managers (breaks submission
+        # entirely: "TypeError: cannot pickle '_thread.lock' object").
+        _init_metrics()
         self.message_counts = runtime_context.get_map_state(
             MapStateDescriptor("message_counts", Types.LONG(), Types.INT())
         )
