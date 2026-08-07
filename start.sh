@@ -10,11 +10,11 @@ echo ""
 
 # Stop any existing containers
 echo "[1/5] Stopping existing containers..."
-docker-compose down
+docker compose down
 
 echo ""
 echo "[2/5] Starting all services..."
-docker-compose up -d
+docker compose up -d
 
 echo ""
 echo "[3/5] Waiting 60 seconds for services to initialize..."
@@ -32,7 +32,7 @@ echo ""
 echo "=== Startup Complete ==="
 echo ""
 echo "Services running:"
-docker-compose ps --format "table {{.Name}}\t{{.Status}}"
+docker compose ps --format "table {{.Name}}\t{{.Status}}"
 echo ""
 echo "Flink job status:"
 docker exec streamscout-flink-jobmanager flink list

@@ -6,6 +6,9 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: streamscout-postgres
+    restart: unless-stopped
+    profiles:
+      - local-db
     environment:
       POSTGRES_DB: twitch
       POSTGRES_USER: twitch
@@ -26,6 +29,9 @@ services:
   redis:
     image: redis:7-alpine
     container_name: streamscout-redis
+    restart: unless-stopped
+    profiles:
+      - local-db
     command: redis-server --notify-keyspace-events Ex
     ports:
       - "6379:6379"
@@ -42,6 +48,7 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: streamscout-kafka
+    restart: unless-stopped
     ports:
       - "9092:9092"
       - "29092:29092"
@@ -100,6 +107,7 @@ services:
       context: ./services/flink-job
       dockerfile: Dockerfile
     container_name: streamscout-flink-jobmanager
+    restart: unless-stopped
     command: /opt/flink/docker-entrypoint-job.sh
     ports:
       - "8081:8081"
@@ -126,6 +134,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
       kafka:
         condition: service_healthy
     networks:
@@ -136,6 +145,7 @@ services:
       context: ./services/flink-job
       dockerfile: Dockerfile
     container_name: streamscout-flink-taskmanager
+    restart: unless-stopped
     command: taskmanager
     ports:
       - "9250:9250"
@@ -174,6 +184,7 @@ services:
       context: ./services/stream-monitoring
       dockerfile: Dockerfile
     container_name: streamscout-stream-monitoring
+    restart: unless-stopped
     ports:
       - "8080:8080"
       - "9100:9100"
@@ -193,8 +204,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
       redis:
         condition: service_healthy
+        required: false
       kafka:
         condition: service_healthy
       kafka-init:
@@ -207,6 +220,7 @@ services:
       context: ./services/api-frontend
       dockerfile: Dockerfile
     container_name: streamscout-api-frontend
+    restart: unless-stopped
     ports:
       - "5000:5000"
     environment:
@@ -219,6 +233,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
     networks:
       - streamscout
 
@@ -229,6 +244,7 @@ services:
   node-exporter:
     image: prom/node-exporter:latest
     container_name: streamscout-node-exporter
+    restart: unless-stopped
     ports:
       - "9101:9100"
     volumes:
@@ -245,6 +261,7 @@ services:
   prometheus:
     image: prom/prometheus:v2.47.0
     container_name: streamscout-prometheus
+    restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
@@ -263,6 +280,7 @@ services:
   alertmanager:
     image: prom/alertmanager:v0.26.0
     container_name: streamscout-alertmanager
+    restart: unless-stopped
     ports:
       - "9093:9093"
     volumes:
@@ -277,6 +295,7 @@ services:
   loki:
     image: grafana/loki:2.9.0
     container_name: streamscout-loki
+    restart: unless-stopped
     ports:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
@@ -288,6 +307,7 @@ services:
   promtail:
     image: grafana/promtail:2.9.0
     container_name: streamscout-promtail
+    restart: unless-stopped
     volumes:
       - ./configs/promtail-config.yml:/etc/promtail/config.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -300,6 +320,7 @@ services:
   grafana:
     image: grafana/grafana:10.2.0
     container_name: streamscout-grafana
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
