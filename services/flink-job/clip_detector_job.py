@@ -81,8 +81,16 @@ _clips_created_failed_total = None
 _clip_creation_duration_seconds = None
 
 
-def _init_metrics():
-    """Initialize Prometheus metrics (called once per TaskManager)."""
+def _init_metrics(subtask_index: int = 0):
+    """Initialize Prometheus metrics (called once per parallel subtask process).
+
+    Each parallel subtask runs in its own Python worker process, so each one
+    needs its own HTTP server. They can't all bind METRICS_PORT: only the
+    first subtask to call start_http_server() would win that race, and the
+    other subtasks' counters -- covering whichever broadcasters keyBy hashed
+    onto them -- would silently never be scraped. Binding METRICS_PORT +
+    subtask_index gives every subtask its own port instead.
+    """
     global _metrics_initialized, _anomalies_detected_total, _clips_created_success_total
     global _clips_created_failed_total, _clip_creation_duration_seconds
 
@@ -110,13 +118,14 @@ def _init_metrics():
         _clips_created_failed_total = get_or_create_counter("clips_created_failed_total", "Total clip creation failures", ["broadcaster_id", "reason"])
         _clip_creation_duration_seconds = get_or_create_gauge("clip_creation_duration_seconds", "Time taken to create last clip", ["broadcaster_id"])
 
-        # Start metrics server (will fail silently if already running)
+        # Start metrics server on a port unique to this subtask
+        port = METRICS_PORT + subtask_index
         try:
-            start_http_server(METRICS_PORT)
-            logger.info(f"Prometheus metrics server started on port {METRICS_PORT}")
+            start_http_server(port)
+            logger.info(f"Prometheus metrics server started on port {port} (subtask {subtask_index})")
         except OSError as e:
             if "Address already in use" in str(e):
-                logger.debug(f"Metrics server already running on port {METRICS_PORT}")
+                logger.warning(f"Metrics server already running on port {port} (subtask {subtask_index})")
             else:
                 logger.warning(f"Metrics server error: {e}")
 
@@ -501,6 +510,25 @@ class PostgresClient:
             conn.rollback()
             raise
 
+    def mark_clipping_disabled(self, broadcaster_id: int):
+        """Record that a broadcaster does not allow clip creation.
+
+        stream-monitoring checks this flag before joining/staying in a
+        broadcaster's chat, so we stop spending a chat connection on
+        someone we can never successfully clip.
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE streamers SET allows_clipping = FALSE WHERE streamer_id = %s
+                """, (broadcaster_id,))
+                conn.commit()
+                logger.info(f"Marked broadcaster {broadcaster_id} as allows_clipping=FALSE")
+        except Exception as e:
+            logger.error(f"Failed to mark broadcaster {broadcaster_id} as clipping-disabled: {e}")
+            conn.rollback()
+
     def close(self):
         """Close the database connection."""
         if self._conn:
@@ -531,8 +559,22 @@ class AnomalyDetector(KeyedProcessFunction):
         self.message_counts = None  # MapState: timestamp_bucket -> count
         self.last_anomaly_time = None  # ValueState: last anomaly timestamp
         self.baseline_stats = None  # ValueState: (mean, std_dev, sample_count)
+        self.subtask_index = 0
 
     def open(self, runtime_context):
+        # Start the metrics server here so it comes up on the first chat
+        # message this worker processes, not the first anomaly (previously
+        # it only started inside the anomaly branch -> the /metrics endpoint
+        # stayed dark, tripping ClipDetectorMetricsDown, through any quiet
+        # stretch with no spikes -- much more likely now that
+        # STD_DEV_THRESHOLD is 5.0 instead of 1.0).
+        # Must be here, not at module scope: module-level start_http_server()
+        # runs on the jobmanager during job submission too, and pollutes the
+        # driver process with an unpicklable thread lock before cloudpickle
+        # ships AnomalyDetector() to the task managers (breaks submission
+        # entirely: "TypeError: cannot pickle '_thread.lock' object").
+        self.subtask_index = runtime_context.get_index_of_this_subtask()
+        _init_metrics(self.subtask_index)
         self.message_counts = runtime_context.get_map_state(
             MapStateDescriptor("message_counts", Types.LONG(), Types.INT())
         )
@@ -626,7 +668,7 @@ class AnomalyDetector(KeyedProcessFunction):
                     }
                     logger.info(f"ANOMALY DETECTED for broadcaster {broadcaster_id}: "
                                f"count={window_sum}, threshold={threshold:.2f}, mean={mean:.2f}, std={std_dev:.2f}, intensity={intensity:.2f}")
-                    _init_metrics()
+                    _init_metrics(self.subtask_index)
                     if _anomalies_detected_total:
                         _anomalies_detected_total.labels(broadcaster_id=str(broadcaster_id)).inc()
                     yield json.dumps(anomaly)
@@ -650,8 +692,10 @@ class ClipCreator(ProcessFunction):
     def __init__(self):
         self.twitch_client = None
         self.postgres_client = None
+        self.subtask_index = 0
 
     def open(self, runtime_context):
+        self.subtask_index = runtime_context.get_index_of_this_subtask()
         self.twitch_client = TwitchAPIClient(
             TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_TOKEN_FILE
         )
@@ -708,12 +752,19 @@ class ClipCreator(ProcessFunction):
                     break
 
             if not clip_id:
-                _init_metrics()
+                _init_metrics(self.subtask_index)
                 if last_error:
                     logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id}: {last_error}")
                     reason = "api_error" if isinstance(last_error, TwitchAPIError) else "unknown"
                     if _clips_created_failed_total:
                         _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason=reason).inc()
+                    # Twitch returns 403 here specifically when the broadcaster hasn't
+                    # authorized clip creation on their channel -- that's permanent
+                    # until they change it, not something a retry or token refresh
+                    # fixes. Record it so stream-monitoring stops watching their chat.
+                    if isinstance(last_error, TwitchAPIError) and last_error.status_code == 403:
+                        logger.warning(f"Broadcaster {broadcaster_id} does not authorize clip creation; marking allows_clipping=FALSE")
+                        self.postgres_client.mark_clipping_disabled(broadcaster_id)
                 else:
                     logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id} after {MAX_RETRY_ATTEMPTS} attempts")
                     if _clips_created_failed_total:
@@ -747,7 +798,7 @@ class ClipCreator(ProcessFunction):
 
                 # Record success metrics
                 duration = time.time() - start_time
-                _init_metrics()
+                _init_metrics(self.subtask_index)
                 if _clips_created_success_total:
                     _clips_created_success_total.labels(broadcaster_id=str(broadcaster_id)).inc()
                 if _clip_creation_duration_seconds:
@@ -762,7 +813,7 @@ class ClipCreator(ProcessFunction):
                 })
             else:
                 logger.error(f"CLIP METADATA RETRIEVAL FAILED for clip_id={clip_id}")
-                _init_metrics()
+                _init_metrics(self.subtask_index)
                 if _clips_created_failed_total:
                     _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason="metadata_fetch").inc()
 
