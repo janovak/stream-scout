@@ -81,8 +81,16 @@ _clips_created_failed_total = None
 _clip_creation_duration_seconds = None
 
 
-def _init_metrics():
-    """Initialize Prometheus metrics (called once per TaskManager)."""
+def _init_metrics(subtask_index: int = 0):
+    """Initialize Prometheus metrics (called once per parallel subtask process).
+
+    Each parallel subtask runs in its own Python worker process, so each one
+    needs its own HTTP server. They can't all bind METRICS_PORT: only the
+    first subtask to call start_http_server() would win that race, and the
+    other subtasks' counters -- covering whichever broadcasters keyBy hashed
+    onto them -- would silently never be scraped. Binding METRICS_PORT +
+    subtask_index gives every subtask its own port instead.
+    """
     global _metrics_initialized, _anomalies_detected_total, _clips_created_success_total
     global _clips_created_failed_total, _clip_creation_duration_seconds
 
@@ -110,13 +118,14 @@ def _init_metrics():
         _clips_created_failed_total = get_or_create_counter("clips_created_failed_total", "Total clip creation failures", ["broadcaster_id", "reason"])
         _clip_creation_duration_seconds = get_or_create_gauge("clip_creation_duration_seconds", "Time taken to create last clip", ["broadcaster_id"])
 
-        # Start metrics server (will fail silently if already running)
+        # Start metrics server on a port unique to this subtask
+        port = METRICS_PORT + subtask_index
         try:
-            start_http_server(METRICS_PORT)
-            logger.info(f"Prometheus metrics server started on port {METRICS_PORT}")
+            start_http_server(port)
+            logger.info(f"Prometheus metrics server started on port {port} (subtask {subtask_index})")
         except OSError as e:
             if "Address already in use" in str(e):
-                logger.debug(f"Metrics server already running on port {METRICS_PORT}")
+                logger.warning(f"Metrics server already running on port {port} (subtask {subtask_index})")
             else:
                 logger.warning(f"Metrics server error: {e}")
 
@@ -531,6 +540,7 @@ class AnomalyDetector(KeyedProcessFunction):
         self.message_counts = None  # MapState: timestamp_bucket -> count
         self.last_anomaly_time = None  # ValueState: last anomaly timestamp
         self.baseline_stats = None  # ValueState: (mean, std_dev, sample_count)
+        self.subtask_index = 0
 
     def open(self, runtime_context):
         # Start the metrics server here so it comes up on the first chat
@@ -544,7 +554,8 @@ class AnomalyDetector(KeyedProcessFunction):
         # driver process with an unpicklable thread lock before cloudpickle
         # ships AnomalyDetector() to the task managers (breaks submission
         # entirely: "TypeError: cannot pickle '_thread.lock' object").
-        _init_metrics()
+        self.subtask_index = runtime_context.get_index_of_this_subtask()
+        _init_metrics(self.subtask_index)
         self.message_counts = runtime_context.get_map_state(
             MapStateDescriptor("message_counts", Types.LONG(), Types.INT())
         )
@@ -638,7 +649,7 @@ class AnomalyDetector(KeyedProcessFunction):
                     }
                     logger.info(f"ANOMALY DETECTED for broadcaster {broadcaster_id}: "
                                f"count={window_sum}, threshold={threshold:.2f}, mean={mean:.2f}, std={std_dev:.2f}, intensity={intensity:.2f}")
-                    _init_metrics()
+                    _init_metrics(self.subtask_index)
                     if _anomalies_detected_total:
                         _anomalies_detected_total.labels(broadcaster_id=str(broadcaster_id)).inc()
                     yield json.dumps(anomaly)
@@ -662,8 +673,10 @@ class ClipCreator(ProcessFunction):
     def __init__(self):
         self.twitch_client = None
         self.postgres_client = None
+        self.subtask_index = 0
 
     def open(self, runtime_context):
+        self.subtask_index = runtime_context.get_index_of_this_subtask()
         self.twitch_client = TwitchAPIClient(
             TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_TOKEN_FILE
         )
@@ -720,7 +733,7 @@ class ClipCreator(ProcessFunction):
                     break
 
             if not clip_id:
-                _init_metrics()
+                _init_metrics(self.subtask_index)
                 if last_error:
                     logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id}: {last_error}")
                     reason = "api_error" if isinstance(last_error, TwitchAPIError) else "unknown"
@@ -759,7 +772,7 @@ class ClipCreator(ProcessFunction):
 
                 # Record success metrics
                 duration = time.time() - start_time
-                _init_metrics()
+                _init_metrics(self.subtask_index)
                 if _clips_created_success_total:
                     _clips_created_success_total.labels(broadcaster_id=str(broadcaster_id)).inc()
                 if _clip_creation_duration_seconds:
@@ -774,7 +787,7 @@ class ClipCreator(ProcessFunction):
                 })
             else:
                 logger.error(f"CLIP METADATA RETRIEVAL FAILED for clip_id={clip_id}")
-                _init_metrics()
+                _init_metrics(self.subtask_index)
                 if _clips_created_failed_total:
                     _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason="metadata_fetch").inc()
 

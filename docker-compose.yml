@@ -148,7 +148,12 @@ services:
     restart: unless-stopped
     command: taskmanager
     ports:
+      # 9250-9253: one clip-detector metrics port per parallel subtask
+      # (must span taskmanager.numberOfTaskSlots below, one port each)
       - "9250:9250"
+      - "9251:9251"
+      - "9252:9252"
+      - "9253:9253"
     environment:
       - |
         FLINK_PROPERTIES=

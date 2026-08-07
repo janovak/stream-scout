@@ -29,8 +29,15 @@ scrape_configs:
       - targets: ['flink-taskmanager:9249']
 
   - job_name: 'clip-detector'
+    # One target per parallel subtask (FLINK_PARALLELISM / taskmanager.numberOfTaskSlots):
+    # each subtask binds its own metrics port at 9250 + subtask_index, since they can't
+    # all share one HTTP server across separate worker processes.
     static_configs:
-      - targets: ['flink-taskmanager:9250']
+      - targets:
+          - 'flink-taskmanager:9250'
+          - 'flink-taskmanager:9251'
+          - 'flink-taskmanager:9252'
+          - 'flink-taskmanager:9253'
 
   - job_name: 'node'
     static_configs:
