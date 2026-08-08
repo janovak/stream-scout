@@ -45,8 +45,15 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 # Join chat when streamer enters top JOIN_THRESHOLD
 # Leave chat only when streamer exits top LEAVE_THRESHOLD
 # This preserves Flink baseline data during rank fluctuations
-JOIN_THRESHOLD = 5   # Join chat rooms for top 5 streamers
-LEAVE_THRESHOLD = 10  # Only leave when streamer drops out of top 10
+JOIN_THRESHOLD = 15   # Join chat rooms for top 15 streamers
+LEAVE_THRESHOLD = 30  # Only leave when streamer drops out of top 30
+
+# Extra raw streams (by viewer rank) to fetch beyond LEAVE_THRESHOLD so that
+# streamers with clipping disabled don't eat a rank slot a real candidate
+# could use -- some of Twitch's consistently highest-viewed streamers
+# (e.g. kaicenat, ishowspeed) have clipping disabled, so without padding
+# they'd permanently shrink the real candidate pool below LEAVE_THRESHOLD.
+CLIPPING_DISABLED_FETCH_BUFFER = 20
 
 REDIS_STREAMER_TTL = 180  # 3 minutes TTL for streamer online status
 POLL_INTERVAL_SECONDS = 120  # Poll every 2 minutes
@@ -211,45 +218,57 @@ class StreamMonitoringService:
         try:
             logger.info("Polling for top streams")
 
-            # Get top LEAVE_THRESHOLD streams (we need to know who's in top 10 for hysteresis)
-            streams = []
-            async for stream in self.twitch.get_streams(first=LEAVE_THRESHOLD):
-                streams.append(stream)
-                if len(streams) >= LEAVE_THRESHOLD:
+            # Fetch more than LEAVE_THRESHOLD raw streams (by viewer rank) and filter
+            # out streamers with clipping disabled *before* assigning rank -- so a
+            # disabled streamer near the top can't eat a rank slot it can never use.
+            # See CLIPPING_DISABLED_FETCH_BUFFER above for why padding is needed.
+            fetch_count = min(LEAVE_THRESHOLD + CLIPPING_DISABLED_FETCH_BUFFER, 100)
+            raw_streams = []
+            async for stream in self.twitch.get_streams(first=fetch_count):
+                raw_streams.append(stream)
+                if len(raw_streams) >= fetch_count:
                     break
 
             # Broadcasters we've already learned don't allow clip creation (via a
             # 403 from the clip-detector job) -- no point spending a chat
             # connection on a streamer we can never successfully clip.
-            disabled_ids = self._get_clipping_disabled_ids([int(s.user_id) for s in streams])
+            disabled_ids = self._get_clipping_disabled_ids([int(s.user_id) for s in raw_streams])
+            disabled_logins = {s.user_login.lower() for s in raw_streams if int(s.user_id) in disabled_ids}
+
+            # Rank only among clip-eligible streams, so JOIN_THRESHOLD/LEAVE_THRESHOLD
+            # reflect real candidates rather than raw Twitch viewer position.
+            streams = [s for s in raw_streams if int(s.user_id) not in disabled_ids][:LEAVE_THRESHOLD]
+
+            if len(streams) < LEAVE_THRESHOLD:
+                logger.warning(
+                    "Fewer than LEAVE_THRESHOLD clip-allowed streams found even after padding fetch",
+                    extra={
+                        "eligible_found": len(streams),
+                        "leave_threshold": LEAVE_THRESHOLD,
+                        "fetch_count": fetch_count,
+                        "raw_streams_found": len(raw_streams)
+                    }
+                )
+
+            for login in disabled_logins:
+                if login in self.joined_channels:
+                    logger.info("Streamer has clipping disabled, will leave chat", extra={
+                        "broadcaster_login": login
+                    })
 
             # Track streamers by rank for hysteresis logic
             top_join_streamers = set()  # Streamers in top JOIN_THRESHOLD (eligible to join)
             top_leave_streamers = set()  # Streamers in top LEAVE_THRESHOLD (not yet eligible to leave)
-            disabled_logins = set()  # Streamers with clipping disabled, joined or not
 
             for rank, stream in enumerate(streams, 1):
                 broadcaster_login = stream.user_login.lower()
                 broadcaster_id = int(stream.user_id)
                 self.broadcaster_ids[broadcaster_login] = broadcaster_id
 
-                # Track which threshold each streamer is in. Streamers with clipping
-                # disabled are left out of both sets: they'll never become join-eligible,
-                # and if already joined, dropping them from top_leave_streamers makes
-                # _manage_chat_connections leave immediately instead of waiting for
-                # them to fall out of the rank window.
-                if broadcaster_id not in disabled_ids:
-                    if rank <= JOIN_THRESHOLD:
-                        top_join_streamers.add(broadcaster_login)
-                    if rank <= LEAVE_THRESHOLD:
-                        top_leave_streamers.add(broadcaster_login)
-                else:
-                    disabled_logins.add(broadcaster_login)
-                    if broadcaster_login in self.joined_channels:
-                        logger.info("Streamer has clipping disabled, will leave chat", extra={
-                            "broadcaster_login": broadcaster_login,
-                            "broadcaster_id": broadcaster_id
-                        })
+                if rank <= JOIN_THRESHOLD:
+                    top_join_streamers.add(broadcaster_login)
+                if rank <= LEAVE_THRESHOLD:
+                    top_leave_streamers.add(broadcaster_login)
 
                 # Update Redis with TTL
                 redis_key = f"streamer:online:{broadcaster_login}"
@@ -301,8 +320,8 @@ class StreamMonitoringService:
             disabled_logins: Streamers known to have clipping disabled (for leave-reason logging)
 
         Hysteresis logic:
-        - Join chat when streamer enters top 5 (JOIN_THRESHOLD)
-        - Leave chat only when streamer drops out of top 10 (LEAVE_THRESHOLD)
+        - Join chat when streamer enters top JOIN_THRESHOLD
+        - Leave chat only when streamer drops out of top LEAVE_THRESHOLD
         - This prevents thrashing and preserves Flink baseline data
         """
         disabled_logins = disabled_logins or set()
