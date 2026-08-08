@@ -59,6 +59,21 @@ MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAYS = [0, 2, 4]  # seconds (within 5-second retry window)
 CLIP_DELAY_SECONDS = 10  # Wait before first clip attempt to center moment in clip
 
+# Twitch's own docs (dev.twitch.tv/docs/api/clips/) only say clip creation is
+# async and to "assume it failed" if Get Clips hasn't returned the clip after
+# 15 seconds -- no recommended poll interval or attempt count, and no stated
+# guarantee of a minimum or maximum processing time either way. A single
+# check at the 15s mark (the old behavior) missed ~15% of real clips per our
+# own metrics, so we retry with real backoff instead of waiting once and
+# giving up: delays increase each attempt (t=5, 15, 30, 50) so we don't keep
+# hammering Twitch while a clip is still processing, well past their
+# documented 15s threshold, based on that observed failure rate rather than
+# anything the docs promise. This doesn't delay when the clip itself becomes
+# ready on Twitch's side -- it only affects how long we keep checking before
+# giving up on a slow one.
+GET_CLIP_MAX_ATTEMPTS = 4
+GET_CLIP_RETRY_DELAYS = [5, 10, 15, 20]  # seconds before each attempt (t=5,15,30,50)
+
 # Command message regex
 COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
 
@@ -432,7 +447,9 @@ class TwitchAPIClient:
                     logger.info(f"Clip metadata retrieved: embed_url={data['data'][0].get('embed_url', 'N/A')[:50]}...")
                     return data["data"][0]
                 else:
-                    logger.warning(f"Get clip returned 200 but no data for clip_id={clip_id}")
+                    # Expected while Twitch is still processing the clip -- the
+                    # caller retries; this alone isn't a failure.
+                    logger.info(f"Get clip returned 200 but no data yet for clip_id={clip_id}")
             elif response.status_code == 401:
                 # Token expired - refresh and retry
                 logger.warning("Got 401 on get_clip, attempting token refresh...")
@@ -771,13 +788,22 @@ class ClipCreator(ProcessFunction):
                         _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason="max_retries").inc()
                 return
 
-            # Wait for clip processing
-            logger.info(f"Waiting 15s for Twitch to process clip {clip_id}...")
-            time.sleep(15)
-            logger.info(f"Wait complete, fetching clip metadata for {clip_id}")
+            # Poll for clip metadata -- Twitch's clip processing is async and
+            # doesn't always finish by the time a single check would land, so
+            # retry a few times instead of waiting once and giving up.
+            clip_data = None
+            for attempt, delay in enumerate(GET_CLIP_RETRY_DELAYS):
+                logger.info(f"Waiting {delay}s before clip metadata attempt {attempt + 1}/{GET_CLIP_MAX_ATTEMPTS} for {clip_id}...")
+                time.sleep(delay)
+                clip_data = self.twitch_client.get_clip(clip_id)
+                if clip_data:
+                    logger.info(f"Clip metadata retrieved on attempt {attempt + 1}: clip_id={clip_id}")
+                    break
+                # Not ready yet is expected mid-retry, not a problem -- only the
+                # exhaustion after the final attempt (logged below, once the loop
+                # ends without a break) is an actual failure.
+                logger.info(f"Clip metadata attempt {attempt + 1}/{GET_CLIP_MAX_ATTEMPTS} found nothing yet for {clip_id}")
 
-            # Get clip metadata
-            clip_data = self.twitch_client.get_clip(clip_id)
             if clip_data:
                 # Get intensity from anomaly data
                 intensity = anomaly.get("intensity")
@@ -812,7 +838,7 @@ class ClipCreator(ProcessFunction):
                     "thumbnail_url": clip_result.thumbnail_url
                 })
             else:
-                logger.error(f"CLIP METADATA RETRIEVAL FAILED for clip_id={clip_id}")
+                logger.error(f"CLIP METADATA RETRIEVAL FAILED for clip_id={clip_id} after {GET_CLIP_MAX_ATTEMPTS} attempts")
                 _init_metrics(self.subtask_index)
                 if _clips_created_failed_total:
                     _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason="metadata_fetch").inc()
