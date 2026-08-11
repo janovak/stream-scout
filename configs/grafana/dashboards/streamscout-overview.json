@@ -369,17 +369,17 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(anomalies_detected_total[5m]))",
+          "expr": "round(sum(increase(anomalies_detected_total[5m])))",
           "legendFormat": "Anomalies (5m)",
           "refId": "A"
         },
         {
-          "expr": "sum(increase(clips_created_success_total[5m]))",
+          "expr": "round(sum(increase(clips_created_success_total[5m])))",
           "legendFormat": "Clips Created (5m)",
           "refId": "B"
         },
         {
-          "expr": "sum(increase(clips_created_failed_total[5m]))",
+          "expr": "round(sum(increase(clips_created_failed_total[5m])))",
           "legendFormat": "Clips Failed (5m)",
           "refId": "C"
         }
