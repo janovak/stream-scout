@@ -65,14 +65,15 @@ CLIP_DELAY_SECONDS = 10  # Wait before first clip attempt to center moment in cl
 # guarantee of a minimum or maximum processing time either way. A single
 # check at the 15s mark (the old behavior) missed ~15% of real clips per our
 # own metrics, so we retry with real backoff instead of waiting once and
-# giving up: delays increase each attempt (t=5, 15, 30, 50) so we don't keep
-# hammering Twitch while a clip is still processing, well past their
-# documented 15s threshold, based on that observed failure rate rather than
-# anything the docs promise. This doesn't delay when the clip itself becomes
-# ready on Twitch's side -- it only affects how long we keep checking before
-# giving up on a slow one.
+# giving up. Tried pushing this much further out (t=5,60,360,1260) to see if
+# the small residual failure rate (~1-1.5% even with the original schedule)
+# was just slow clips needing more time -- it wasn't: zero recoveries on the
+# added attempts 3/4 across everything we watched, same failure rate as
+# before, just taking up to 21 minutes to find out instead of 50 seconds.
+# Settled on a modest bump over the original instead: same 4 attempts, same
+# shape, just a longer last step (t=5,15,30,60 vs the original t=5,15,30,50).
 GET_CLIP_MAX_ATTEMPTS = 4
-GET_CLIP_RETRY_DELAYS = [5, 10, 15, 20]  # seconds before each attempt (t=5,15,30,50)
+GET_CLIP_RETRY_DELAYS = [5, 10, 15, 30]  # seconds before each attempt (t=5,15,30,60)
 
 # Command message regex
 COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
@@ -206,6 +207,10 @@ class TwitchAPIClient:
         self.token_file = token_file
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
+        # Guards refresh + token-file writes: with clip creation now running
+        # on background threads, two clips hitting a 401 at once could
+        # otherwise both refresh concurrently and tear the token file.
+        self._refresh_lock = threading.Lock()
         self._load_tokens()
         if validate_on_init:
             self._validate_and_refresh_if_needed()
@@ -323,29 +328,30 @@ class TwitchAPIClient:
 
     def _refresh_access_token(self):
         """Refresh the access token using the refresh token."""
-        logger.info("Refreshing user access token...")
-        try:
-            response = requests.post(
-                "https://id.twitch.tv/oauth2/token",
-                data={
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "grant_type": "refresh_token",
-                    "refresh_token": self.refresh_token
-                },
-                timeout=30
-            )
-            if response.status_code != 200:
-                logger.error(f"Token refresh failed: status={response.status_code}, body={response.text}")
-                response.raise_for_status()
-            data = response.json()
-            self.access_token = data["access_token"]
-            self.refresh_token = data.get("refresh_token", self.refresh_token)
-            logger.info(f"Token refreshed successfully, expires in {data.get('expires_in', 'unknown')}s")
-            self._save_tokens()
-        except Exception as e:
-            logger.error(f"Token refresh exception: {e}")
-            raise
+        with self._refresh_lock:
+            logger.info("Refreshing user access token...")
+            try:
+                response = requests.post(
+                    "https://id.twitch.tv/oauth2/token",
+                    data={
+                        "client_id": self.client_id,
+                        "client_secret": self.client_secret,
+                        "grant_type": "refresh_token",
+                        "refresh_token": self.refresh_token
+                    },
+                    timeout=30
+                )
+                if response.status_code != 200:
+                    logger.error(f"Token refresh failed: status={response.status_code}, body={response.text}")
+                    response.raise_for_status()
+                data = response.json()
+                self.access_token = data["access_token"]
+                self.refresh_token = data.get("refresh_token", self.refresh_token)
+                logger.info(f"Token refreshed successfully, expires in {data.get('expires_in', 'unknown')}s")
+                self._save_tokens()
+            except Exception as e:
+                logger.error(f"Token refresh exception: {e}")
+                raise
 
     def _is_retryable_status(self, status_code: int) -> bool:
         """Check if a status code indicates a retryable error."""
@@ -720,6 +726,12 @@ class ClipCreator(ProcessFunction):
             POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB,
             POSTGRES_USER, POSTGRES_PASSWORD
         )
+        # The single Postgres connection and the lazily-initialized Prometheus
+        # metrics can't handle concurrent use from multiple clip threads --
+        # these serialize just the quick DB write / first-init check, not the
+        # long sleeps around them.
+        self._postgres_lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
 
     def close(self):
         if self.postgres_client:
@@ -730,6 +742,27 @@ class ClipCreator(ProcessFunction):
             anomaly = json.loads(value)
             broadcaster_id = anomaly["broadcaster_id"]
             detected_at = anomaly["detected_at"]
+        except Exception as e:
+            logger.error(f"CLIP CREATION ERROR for value={value[:200]}: {e}", exc_info=True)
+            return iter(())
+
+        # The full flow below can sleep for the better part of half an hour
+        # (CLIP_DELAY_SECONDS + retry delays + GET_CLIP_RETRY_DELAYS) waiting
+        # on Twitch. Running it inline on process_element would block this
+        # subtask's task thread for that whole time -- starving every other
+        # broadcaster keyed onto the same subtask, and even a second anomaly
+        # for this same broadcaster, until it finished. Run it on its own
+        # thread instead so it only ever holds up itself.
+        threading.Thread(
+            target=self._create_and_poll_clip,
+            args=(anomaly, broadcaster_id, detected_at),
+            name=f"clip-creator-{broadcaster_id}-{detected_at}",
+            daemon=True,
+        ).start()
+        return iter(())
+
+    def _create_and_poll_clip(self, anomaly: dict, broadcaster_id, detected_at) -> None:
+        try:
             start_time = time.time()
 
             logger.info(f"=== CLIP CREATION START for broadcaster {broadcaster_id} ===")
@@ -769,7 +802,8 @@ class ClipCreator(ProcessFunction):
                     break
 
             if not clip_id:
-                _init_metrics(self.subtask_index)
+                with self._metrics_lock:
+                    _init_metrics(self.subtask_index)
                 if last_error:
                     logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id}: {last_error}")
                     reason = "api_error" if isinstance(last_error, TwitchAPIError) else "unknown"
@@ -781,7 +815,8 @@ class ClipCreator(ProcessFunction):
                     # fixes. Record it so stream-monitoring stops watching their chat.
                     if isinstance(last_error, TwitchAPIError) and last_error.status_code == 403:
                         logger.warning(f"Broadcaster {broadcaster_id} does not authorize clip creation; marking allows_clipping=FALSE")
-                        self.postgres_client.mark_clipping_disabled(broadcaster_id)
+                        with self._postgres_lock:
+                            self.postgres_client.mark_clipping_disabled(broadcaster_id)
                 else:
                     logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id} after {MAX_RETRY_ATTEMPTS} attempts")
                     if _clips_created_failed_total:
@@ -820,31 +855,31 @@ class ClipCreator(ProcessFunction):
 
                 # Store in Postgres
                 logger.info(f"Storing clip {clip_id} in database...")
-                self.postgres_client.insert_clip(clip_result)
+                with self._postgres_lock:
+                    self.postgres_client.insert_clip(clip_result)
 
                 # Record success metrics
                 duration = time.time() - start_time
-                _init_metrics(self.subtask_index)
+                with self._metrics_lock:
+                    _init_metrics(self.subtask_index)
                 if _clips_created_success_total:
                     _clips_created_success_total.labels(broadcaster_id=str(broadcaster_id)).inc()
                 if _clip_creation_duration_seconds:
                     _clip_creation_duration_seconds.labels(broadcaster_id=str(broadcaster_id)).set(duration)
 
+                # Nothing downstream consumes ClipCreator's old yielded output
+                # besides clips.print() (a debug echo) -- this log line is the
+                # durable record, alongside the Postgres row and metrics above.
                 logger.info(f"=== CLIP CREATION COMPLETE for broadcaster {broadcaster_id}: clip_id={clip_id} (took {duration:.1f}s) ===")
-                yield json.dumps({
-                    "broadcaster_id": broadcaster_id,
-                    "clip_id": clip_id,
-                    "embed_url": clip_result.embed_url,
-                    "thumbnail_url": clip_result.thumbnail_url
-                })
             else:
                 logger.error(f"CLIP METADATA RETRIEVAL FAILED for clip_id={clip_id} after {GET_CLIP_MAX_ATTEMPTS} attempts")
-                _init_metrics(self.subtask_index)
+                with self._metrics_lock:
+                    _init_metrics(self.subtask_index)
                 if _clips_created_failed_total:
                     _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason="metadata_fetch").inc()
 
         except Exception as e:
-            logger.error(f"CLIP CREATION ERROR for value={value[:200]}: {e}", exc_info=True)
+            logger.error(f"CLIP CREATION ERROR for broadcaster {broadcaster_id}: {e}", exc_info=True)
 
 
 def validate_tokens_at_startup():
