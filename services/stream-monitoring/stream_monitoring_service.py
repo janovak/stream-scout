@@ -336,7 +336,11 @@ class StreamMonitoringService:
         # Initialize chat if needed
         if channels_to_join and not self.chat:
             try:
-                self.chat = await Chat(self.twitch)
+                # Default no_message_reset_time is 10 minutes -- far too long a
+                # blind spot for a dead connection given we track 15-30 channels
+                # that together produce many messages/sec; 30s gives huge margin
+                # over any observed lull while catching a dead socket fast.
+                self.chat = await Chat(self.twitch, no_message_reset_time=0.5)
                 self.chat.register_event(ChatEvent.READY, self._on_chat_ready)
                 self.chat.register_event(ChatEvent.MESSAGE, self._on_chat_message)
                 self.chat.start()
