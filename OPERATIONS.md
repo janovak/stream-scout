@@ -1,651 +1,282 @@
 # Stream Scout Operations Guide
 
-This guide covers how to start, stop, and restart all components of the Stream Scout system.
+This guide covers the full restart procedure, per-service restart steps, and troubleshooting. For the short version, see `QUICKSTART.md`.
 
 ## Prerequisites
 
-Before starting, make sure you have:
-
-1. **Docker Desktop** installed and running (check for the whale icon in your menu bar)
-2. **Environment variables** set up in a `.env` file in the project root:
+1. **Docker** installed and running. Check with `docker info`.
+2. **Environment variables** in a `.env` file in the project root:
    ```
    TWITCH_CLIENT_ID=your_client_id_here
    TWITCH_CLIENT_SECRET=your_client_secret_here
    ```
-3. **Twitch tokens** seeded in `./secrets/twitch_user_tokens.json` (run `python seed_twitch_tokens.py` if missing)
+3. **Twitch tokens** in `./secrets/twitch_user_tokens.json`. Run `python seed_twitch_tokens.py` if this file is missing.
 
 ---
 
-## Part 1: Starting Everything Fresh
+## Important: Postgres and Redis are remote
 
-Use this when starting the system for the first time or after a complete shutdown.
+Postgres and Redis do **not** run on this machine. They run on the Tailscale host `streamer-summaries-api` (100.112.97.111). `docker-compose.override.yml` points `api-frontend`, `stream-monitoring`, and both Flink containers at that host.
 
-### Step 1: Navigate to the project directory
+The `postgres` and `redis` services in `docker-compose.yml` exist but stay off. They sit behind the `local-db` compose profile, so `docker compose up -d` does not start them.
 
+This machine also runs two unrelated standalone containers named `postgres16` and `redis`. **Stream Scout does not use them.** Do not restart them or query them for Stream Scout data — they belong to a different project.
+
+To check the remote database from this machine, do not run `psql` or `redis-cli` directly against a local container. Instead, check through the app:
 ```bash
-cd /Users/john/Projects/stream-scout
+curl http://localhost:5000/health
+docker logs streamscout-api-frontend --tail 20
 ```
+A working `/v1.0/clip` response or a "Database connection pool initialized" log line confirms the remote database is reachable. To restart Postgres or Redis, you need access to the `streamer-summaries-api` host — this guide does not cover that host.
 
-### Step 2: Make sure Docker Desktop is running
+---
 
-Open Docker Desktop from your Applications folder if it's not already running. Wait until the whale icon in your menu bar stops animating.
+## Part 1: Full restart
 
-### Step 3: Stop any existing containers (clean slate)
-
+The normal way to restart is the script:
 ```bash
-docker compose down
+cd ~/stream-scout
+./start.sh
 ```
+This runs `docker compose down`, then `up -d`, waits 60 seconds, submits the Flink job, and waits 15 seconds. It takes about 80 seconds in total.
 
-You should see output like:
-```
-[+] Running 12/12
- ⠿ Container streamscout-grafana          Removed
- ⠿ Container streamscout-promtail         Removed
- ...
-```
-
-### Step 4: Start all infrastructure services
-
-```bash
-docker compose up -d
-```
-
-You should see output like:
-```
-[+] Running 12/12
- ⠿ Container streamscout-postgres         Started
- ⠿ Container streamscout-redis            Started
- ⠿ Container streamscout-kafka            Started
- ...
-```
-
-### Step 5: Wait for services to be healthy (about 30-60 seconds)
-
-```bash
-docker compose ps
-```
-
-You should see all services with `running` status. If any show `starting`, wait and run the command again.
-
-### Step 6: Verify the Flink job is running
-
+**After it finishes, check for a duplicate Flink job:**
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
-
-You should see:
+If two "Clip Detector Job" entries appear, cancel the older one:
+```bash
+docker exec streamscout-flink-jobmanager flink cancel <older-job-id>
 ```
------------------- Running/Restarting Jobs -------------------
-xx.xx.xxxx xx:xx:xx : xxxxxxxx : Clip Detector Job (RUNNING)
---------------------------------------------------------------
+The script does not check for a job recovered from checkpoint before it submits a new one. This produces two jobs that both read the same Kafka topic.
+
+**If `start.sh` is not available**, run the same steps manually:
+```bash
+docker compose down
+docker compose up -d
+sleep 60
+docker exec streamscout-flink-jobmanager flink list
 ```
-
-**If you see "No running jobs"**, the job needs to be submitted manually:
-
+If the output shows "No running jobs", submit the job:
 ```bash
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d
 ```
 
-Wait about 10 seconds, then verify again:
-
-```bash
-docker exec streamscout-flink-jobmanager flink list
-```
-
-### Step 7: Verify all services are working
-
-**Check the API is responding:**
+**Then verify:**
 ```bash
 curl http://localhost:5000/health
 ```
-
-You should see:
-```json
-{"status":"healthy"}
-```
-
-**Check the Flink Web UI:**
-Open http://localhost:8081 in your browser. You should see the Flink dashboard with 1 running job.
-
-**Check Grafana:**
-Open http://localhost:3000 in your browser. Login with username `admin` and password `admin`.
-
-### Step 8: Monitor the logs to see clips being created
-
-```bash
-docker logs -f streamscout-flink-taskmanager 2>&1 | grep -i "clip"
-```
-
-Press `Ctrl+C` to stop watching logs.
+Open http://localhost:8081 for the Flink dashboard, and http://localhost:3000 (`admin`/`admin`) for Grafana.
 
 ---
 
-## Part 2: Checking System Status
-
-Use these commands to see if everything is running correctly.
-
-### Check all container statuses
+## Part 2: Checking system status
 
 ```bash
 docker compose ps
 ```
-
-All services should show `running` status.
-
-### Check if Flink job is running
+All listed services should show `running`.
 
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
-
-Should show "Clip Detector Job (RUNNING)".
-
-### Check recent clips in the database
-
-```bash
-docker exec streamscout-postgres psql -U twitch -d twitch -c "SELECT clip_id, broadcaster_id, created_at FROM clips ORDER BY created_at DESC LIMIT 5;"
-```
-
-### Check API is returning clips
+Should show one "Clip Detector Job (RUNNING)" — not two.
 
 ```bash
 curl -s "http://localhost:5000/v1.0/clip?limit=5" | python3 -m json.tool
 ```
+Should return recent clips, or an empty array if none exist yet.
 
 ---
 
-## Part 3: Restarting Individual Components
+## Part 3: Restarting individual components
 
-Use these sections when a specific component fails.
+Use these steps when one component fails. Skip Postgres and Redis — see "Important" above.
 
----
+### Kafka
 
-### Restarting: Postgres (Database)
-
-**When to restart:** Database connection errors, queries timing out.
-
-**Step 1: Restart the container**
-```bash
-docker compose restart postgres
-```
-
-**Step 2: Wait for it to be healthy (about 10 seconds)**
-```bash
-docker compose ps postgres
-```
-
-Should show `running` status.
-
-**Step 3: Verify it's working**
-```bash
-docker exec streamscout-postgres psql -U twitch -d twitch -c "SELECT 1;"
-```
-
-Should show:
-```
- ?column?
-----------
-        1
-```
-
----
-
-### Restarting: Redis (Cache)
-
-**When to restart:** Redis connection errors in stream monitoring logs.
-
-**Step 1: Restart the container**
-```bash
-docker compose restart redis
-```
-
-**Step 2: Verify it's working**
-```bash
-docker exec streamscout-redis redis-cli ping
-```
-
-Should show:
-```
-PONG
-```
-
----
-
-### Restarting: Kafka (Message Queue)
-
-**When to restart:** Kafka connection errors, messages not flowing.
-
-**Step 1: Restart Kafka**
+**When:** connection errors, or messages not flowing.
 ```bash
 docker compose restart kafka
-```
-
-**Step 2: Wait for it to be healthy (about 30 seconds)**
-```bash
-docker compose ps kafka
-```
-
-Should show `running` status.
-
-**Step 3: Verify it's working**
-```bash
+sleep 30
 docker exec streamscout-kafka kafka-topics --bootstrap-server localhost:9092 --list
 ```
+Should list `chat-messages` and `stream-lifecycle`.
 
-Should show:
-```
-chat-messages
-stream-lifecycle
-```
-
-**Step 4: After restarting Kafka, you MUST restart these services:**
+**After a Kafka restart, also restart these** — they hold open connections to Kafka that do not reconnect on their own:
 ```bash
-docker compose restart stream-monitoring
-docker compose restart flink-jobmanager flink-taskmanager
+docker compose restart stream-monitoring flink-jobmanager flink-taskmanager
 ```
+Then resubmit the Flink job (see "Flink job" below).
 
-Then re-submit the Flink job (see "Restarting: Flink Job" below).
+### Stream monitoring service
 
----
-
-### Restarting: Stream Monitoring Service
-
-**When to restart:** Not joining chat rooms, Twitch API errors, websocket connection failures.
-
-**Step 1: Check current logs to see what's wrong**
+**When:** not joining chat rooms, Twitch API errors, or websocket failures.
 ```bash
 docker logs streamscout-stream-monitoring --tail 20
-```
-
-**Step 2: Restart the container**
-```bash
 docker compose restart stream-monitoring
+docker logs -f streamscout-stream-monitoring
 ```
+Expect to see: `Stream Monitoring Service started`, `Polling for top streams`, `Joined chat room`. Press `Ctrl+C` to stop following.
 
-**Step 3: Watch the logs to verify it's working**
-```bash
-docker logs -f streamscout-stream-monitoring 2>&1 | head -50
-```
+### Flink job (Clip Detector)
 
-You should see:
-```
-... "message": "Stream Monitoring Service started"
-... "message": "Polling for top streams"
-... "message": "Joined chat room", "channel": "...", "reason": "entered top 5"
-```
+**When:** no clips are appearing, the job shows FAILED, or TaskManager reports heartbeat timeouts.
 
-Press `Ctrl+C` to stop watching.
+1. Check the current job:
+   ```bash
+   docker exec streamscout-flink-jobmanager flink list
+   ```
+2. If a job is running but broken, cancel it:
+   ```bash
+   docker exec streamscout-flink-jobmanager flink cancel <JOB_ID>
+   ```
+3. Restart both Flink containers and wait 30 seconds:
+   ```bash
+   docker compose restart flink-jobmanager flink-taskmanager
+   sleep 30
+   ```
+4. Check whether a job auto-started. If not, submit one:
+   ```bash
+   docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d
+   ```
+5. Confirm it is running, then check that it is processing:
+   ```bash
+   docker exec streamscout-flink-jobmanager flink list
+   docker logs -f streamscout-flink-taskmanager 2>&1 | grep -iE "token|kafka|baseline"
+   ```
 
----
+### API and frontend service
 
-### Restarting: Flink Job (Clip Detector)
-
-**When to restart:** No clips being created, job shows as FAILED, TaskManager heartbeat timeouts.
-
-**Step 1: Check the current job status**
-```bash
-docker exec streamscout-flink-jobmanager flink list
-```
-
-**Step 2: If a job is running but broken, cancel it first**
-
-Get the job ID from the list output (it's the long string of letters and numbers), then:
-```bash
-docker exec streamscout-flink-jobmanager flink cancel <JOB_ID>
-```
-
-Replace `<JOB_ID>` with the actual ID, for example:
-```bash
-docker exec streamscout-flink-jobmanager flink cancel e56f5ff6db31864ccb2c90700f06b70f
-```
-
-**Step 3: Restart both Flink containers**
-```bash
-docker compose restart flink-jobmanager flink-taskmanager
-```
-
-**Step 4: Wait for containers to be ready (about 30 seconds)**
-```bash
-docker compose ps flink-jobmanager flink-taskmanager
-```
-
-Both should show `running` status.
-
-**Step 5: Check if the job auto-started**
-```bash
-docker exec streamscout-flink-jobmanager flink list
-```
-
-**Step 6: If no job is running, submit it manually**
-```bash
-docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d
-```
-
-You should see:
-```
-Job has been submitted with JobID xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-**Step 7: Verify the job is running**
-```bash
-docker exec streamscout-flink-jobmanager flink list
-```
-
-Should show "Clip Detector Job (RUNNING)".
-
-**Step 8: Watch TaskManager logs to verify it's processing**
-```bash
-docker logs -f streamscout-flink-taskmanager 2>&1 | grep -i -E "(token|kafka|baseline)" | head -20
-```
-
-You should see token validation succeeded and Kafka consumer starting.
-
----
-
-### Restarting: API & Frontend Service
-
-**When to restart:** API not responding, 500 errors, frontend not loading.
-
-**Step 1: Restart the container**
+**When:** the API does not respond, returns 500 errors, or the frontend does not load.
 ```bash
 docker compose restart api-frontend
-```
-
-**Step 2: Verify it's working**
-```bash
 curl http://localhost:5000/health
-```
-
-Should show:
-```json
-{"status":"healthy"}
-```
-
-**Step 3: Test the API endpoint**
-```bash
 curl -s "http://localhost:5000/v1.0/clip?limit=1" | python3 -m json.tool
 ```
 
-Should return clip data (or empty array if no clips yet).
+### Prometheus
 
----
-
-### Restarting: Prometheus (Metrics)
-
-**When to restart:** Metrics not showing in Grafana.
-
-**Step 1: Restart the container**
+**When:** metrics do not appear in Grafana.
 ```bash
 docker compose restart prometheus
 ```
+Check http://localhost:9090.
 
-**Step 2: Verify it's working**
+### Grafana
 
-Open http://localhost:9090 in your browser. You should see the Prometheus web interface.
-
----
-
-### Restarting: Grafana (Dashboards)
-
-**When to restart:** Dashboards not loading, login issues.
-
-**Step 1: Restart the container**
+**When:** dashboards do not load, or login fails.
 ```bash
 docker compose restart grafana
 ```
+Check http://localhost:3000 (`admin`/`admin`).
 
-**Step 2: Verify it's working**
+### Loki and Promtail
 
-Open http://localhost:3000 in your browser. Login with `admin` / `admin`.
-
----
-
-### Restarting: Loki & Promtail (Logs)
-
-**When to restart:** Logs not appearing in Grafana.
-
-**Step 1: Restart both containers**
+**When:** logs do not appear in Grafana.
 ```bash
 docker compose restart loki promtail
-```
-
-**Step 2: Verify Loki is working**
-```bash
 curl http://localhost:3100/ready
 ```
-
-Should show:
-```
-ready
-```
+Should print `ready`.
 
 ---
 
-## Part 4: Complete System Restart
+## Part 4: Complete shutdown
 
-Use this when everything is broken and you want to start over.
-
-### Step 1: Stop everything
+**Stop all containers, keep data:**
 ```bash
 docker compose down
 ```
 
-### Step 2: Start everything
-```bash
-docker compose up -d
-```
-
-### Step 3: Wait 60 seconds for all services to initialize
-```bash
-sleep 60
-```
-
-### Step 4: Check all services are running
-```bash
-docker compose ps
-```
-
-### Step 5: Check Flink job is running
-```bash
-docker exec streamscout-flink-jobmanager flink list
-```
-
-If no job is running:
-```bash
-docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d
-```
-
-### Step 6: Verify the system end-to-end
-```bash
-curl http://localhost:5000/health
-```
-
----
-
-## Part 5: Complete Shutdown
-
-Use this when you want to stop the entire system.
-
-### Stop all containers (preserves data)
-```bash
-docker compose down
-```
-
-### Stop all containers AND delete all data (fresh start)
+**Stop all containers and delete local data:**
 ```bash
 docker compose down -v
 ```
-
-**WARNING:** The `-v` flag deletes all database data, clips, and metrics history. Only use this if you want to completely reset.
+**Warning:** `-v` deletes local volumes — Kafka data, Prometheus/Grafana/Loki history. It does **not** touch clips or the database, because those live on the remote host, not in a local volume.
 
 ---
 
-## Part 6: Viewing Logs
+## Part 5: Viewing logs
 
-### View logs for a specific service
 ```bash
 docker logs streamscout-<service-name>
 ```
+Service names: `kafka`, `stream-monitoring`, `flink-jobmanager`, `flink-taskmanager`, `api-frontend`, `prometheus`, `grafana`, `loki`, `promtail`, `alertmanager`, `node-exporter`.
 
-Replace `<service-name>` with one of:
-- `postgres`
-- `redis`
-- `kafka`
-- `stream-monitoring`
-- `flink-jobmanager`
-- `flink-taskmanager`
-- `api-frontend`
-- `prometheus`
-- `grafana`
-- `loki`
-- `promtail`
-- `node-exporter`
-
-### View last 50 lines of logs
 ```bash
-docker logs streamscout-stream-monitoring --tail 50
-```
-
-### Follow logs in real-time (live view)
-```bash
-docker logs -f streamscout-stream-monitoring
-```
-
-Press `Ctrl+C` to stop following.
-
-### View logs with timestamps
-```bash
-docker logs -t streamscout-stream-monitoring --tail 20
+docker logs streamscout-stream-monitoring --tail 50   # last 50 lines
+docker logs -f streamscout-stream-monitoring           # follow live
+docker logs -t streamscout-stream-monitoring --tail 20 # with timestamps
 ```
 
 ---
 
-## Part 7: Common Problems and Solutions
+## Part 6: Common problems
 
-### Problem: "No running jobs" in Flink
-
-**Solution:** Submit the job manually:
+### "No running jobs" in Flink
+Submit the job:
 ```bash
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d
 ```
 
----
-
-### Problem: Flink job keeps failing with "heartbeat timeout"
-
-**Solution:** Restart both Flink containers:
+### Flink job fails with "heartbeat timeout"
 ```bash
 docker compose restart flink-jobmanager flink-taskmanager
-```
-
-Wait 30 seconds, then submit the job:
-```bash
+sleep 30
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d
 ```
 
----
-
-### Problem: "Token file not found" error in Flink logs
-
-**Solution:** Make sure the tokens file exists:
+### "Token file not found" in Flink logs
 ```bash
 ls -la ./secrets/twitch_user_tokens.json
 ```
-
-If it doesn't exist, generate tokens:
-```bash
-python seed_twitch_tokens.py
-```
-
-Then restart Flink:
+If missing, run `python seed_twitch_tokens.py`, then restart Flink:
 ```bash
 docker compose restart flink-jobmanager flink-taskmanager
 ```
 
----
-
-### Problem: Stream monitoring not joining any chat rooms
-
-**Solution:** Check if the service can reach Twitch:
+### Stream monitoring is not joining any chat rooms
 ```bash
 docker logs streamscout-stream-monitoring --tail 30
 ```
-
-If you see authentication errors, your Twitch tokens may have expired. Regenerate them:
+Authentication errors mean the Twitch tokens expired. Regenerate them:
 ```bash
 python seed_twitch_tokens.py
-```
-
-Then restart:
-```bash
 docker compose restart stream-monitoring
 ```
 
----
+### No clips after 5+ minutes
+Check each of these in order:
+1. Flink job running? `docker exec streamscout-flink-jobmanager flink list`
+2. Messages in Kafka? `docker exec streamscout-kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic chat-messages --max-messages 3 --timeout-ms 10000`
+3. Stream monitoring sending messages? `docker logs streamscout-stream-monitoring --tail 30`
+4. Baseline still building? The job needs 5 minutes of data before it detects anomalies: `docker logs streamscout-flink-taskmanager --tail 50 2>&1 | grep -i baseline`
 
-### Problem: No clips appearing even after 5+ minutes
+### "403 Forbidden — User not authorized to create clips"
+This is expected. Some streamers turn off clip creation. The system still creates clips for streamers who allow it.
 
-**Possible causes:**
-
-1. **Flink job not running** - Check with `docker exec streamscout-flink-jobmanager flink list`
-
-2. **No messages in Kafka** - Check with:
-   ```bash
-   docker exec streamscout-kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic chat-messages --max-messages 3 --timeout-ms 10000
-   ```
-
-3. **Stream monitoring not sending messages** - Check logs:
-   ```bash
-   docker logs streamscout-stream-monitoring --tail 30
-   ```
-
-4. **Baseline still building** - The Flink job needs 5 minutes of data before detecting anomalies. Check TaskManager logs:
-   ```bash
-   docker logs streamscout-flink-taskmanager --tail 50 2>&1 | grep -i baseline
-   ```
+### API returns an empty clips array
+1. No clips created yet — wait 5+ minutes after startup.
+2. Database connection issue — restart the API: `docker compose restart api-frontend`
+3. Check the remote database has clips — see "Important: Postgres and Redis are remote" above for how to check without a local `psql`.
 
 ---
 
-### Problem: "403 Forbidden - User not authorized to create clips"
-
-**This is normal!** Some streamers have disabled clip creation. The system will successfully create clips for streamers who allow it.
-
----
-
-### Problem: API returns empty clips array
-
-**Possible causes:**
-
-1. **No clips created yet** - Wait for anomalies to be detected (may take 5+ minutes after startup)
-
-2. **Database connection issue** - Restart API:
-   ```bash
-   docker compose restart api-frontend
-   ```
-
-3. **Check if clips exist in database:**
-   ```bash
-   docker exec streamscout-postgres psql -U twitch -d twitch -c "SELECT COUNT(*) FROM clips;"
-   ```
-
----
-
-## Quick Reference: Service URLs
+## Quick reference: URLs
 
 | Service | URL |
-|---------|-----|
+|---|---|
 | Frontend / API | http://localhost:5000 |
 | Flink Web UI | http://localhost:8081 |
 | Grafana | http://localhost:3000 |
 | Prometheus | http://localhost:9090 |
 
----
-
-## Quick Reference: Key Commands
+## Quick reference: commands
 
 | Action | Command |
-|--------|---------|
-| Start everything | `docker compose up -d` |
+|---|---|
+| Full restart | `./start.sh` |
 | Stop everything | `docker compose down` |
 | Check status | `docker compose ps` |
 | Check Flink job | `docker exec streamscout-flink-jobmanager flink list` |
