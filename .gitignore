@@ -67,3 +67,9 @@ htmlcov/
 *.temp
 tmp/
 temp/
+
+# Throwaway remediation plans (architecture review 2026-08-12)
+plans/
+
+# Agent-created git worktrees (full duplicate checkouts)
+.claude/worktrees/

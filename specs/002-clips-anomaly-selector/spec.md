@@ -92,15 +92,19 @@ As a user visiting the clips page, I want a clean, contemporary interface, so th
 - **FR-001**: System MUST display an anomaly threshold selector with labeled intensity levels:
   | Std Dev Threshold | Label |
   |-------------------|-------|
-  | 3+ | Warming Up |
-  | 5+ | Getting Good |
   | 7+ | Popping Off |
   | 9+ | Unhinged |
   | 11+ | Legendary |
 - **FR-001a**: The threshold-to-label mapping MUST be stored as a frontend constant (single JavaScript object) for easy modification.
+- **FR-001b**: The displayed levels are deliberately **not** derived from the detection floor
+  (`STD_DEV_THRESHOLD`, currently 5.0). The floor is a collection decision and is set lower on
+  purpose: a Twitch clip cannot be created retroactively, so clips are captured from 5.0 up to keep
+  the option of exposing a lower level later. Clips scoring between the floor and the lowest displayed
+  level are stored but not reachable through the UI. This is intended. The floor MUST never be set
+  *above* the lowest displayed level, which would leave that level permanently empty.
 - **FR-002**: System MUST filter displayed clips to only show those meeting or exceeding the selected anomaly threshold.
 - **FR-002a**: System MUST always have a threshold selected; "no filter" or "show all" is NOT a valid option.
-- **FR-002b**: System MUST default to "Getting Good" (5+ std dev) when a user first visits the page.
+- **FR-002b**: System MUST default to "Unhinged" (9+ std dev) when a user first visits the page.
 - **FR-003**: System MUST persist the selected filter during the browsing session (until page refresh).
 - **FR-004**: System MUST show the total count of clips matching the current filter.
 
@@ -130,7 +134,7 @@ As a user visiting the clips page, I want a clean, contemporary interface, so th
 ### Key Entities
 
 - **Clip**: Represents a captured stream moment. Key attributes: unique identifier, streamer information, thumbnail image, video source, intensity (standard deviations above mean), detection timestamp.
-- **Intensity**: A measure of how significant a chat activity spike was, expressed in standard deviations above the baseline mean. Stored as a float in the database and mapped to display labels (Warming Up, Getting Good, Popping Off, Unhinged, Legendary) in the frontend.
+- **Intensity**: A measure of how significant a chat activity spike was, expressed in standard deviations above the baseline mean. Stored as a float in the database and mapped to display labels (Popping Off, Unhinged, Legendary) in the frontend.
 - **Filter State**: The user's current anomaly threshold selection, used to determine which clips are displayed.
 
 ## Success Criteria *(mandatory)*
