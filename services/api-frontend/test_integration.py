@@ -32,6 +32,11 @@ def mock_db_pool():
     mock_pool.getconn.return_value = mock_conn
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    # get_clips always runs a COUNT(*) before the SELECT; leaving fetchone()
+    # unmocked returns a MagicMock, and comparing that against an int in the
+    # has_more calculation raises TypeError, which get_clips's bare except
+    # turns into a misleading 500.
+    mock_cursor.fetchone.return_value = (0,)
 
     return mock_pool, mock_conn, mock_cursor
 
@@ -74,35 +79,36 @@ class TestDatabaseQueryIntegration:
         with patch("api_frontend_service.get_db", return_value=mock_conn):
             client.get("/v1.0/clip?limit=25")
 
-        mock_cursor.execute.assert_called_once()
+        # get_clips runs a COUNT(*) then the paginated SELECT.
+        assert mock_cursor.execute.call_count == 2
 
-        # Verify query parameters
-        call_args = mock_cursor.execute.call_args
+        # Verify query parameters on the SELECT (the second call).
+        call_args = mock_cursor.execute.call_args_list[1]
         query = call_args[0][0]
         params = call_args[0][1]
 
         assert "LIMIT" in query
-        assert params[2] == 25  # limit parameter
+        assert params[1] == 25  # limit parameter
 
-    def test_time_range_query_parameters(self, client, mock_db_pool):
-        """Time range parameters should be passed to query."""
+    def test_query_parameters_have_correct_types(self, client, mock_db_pool):
+        """min_intensity/limit/offset parameters should be passed to query with correct types."""
         mock_pool, mock_conn, mock_cursor = mock_db_pool
         mock_cursor.fetchall.return_value = []
 
-        start = "2026-01-01T00:00:00Z"
-        end = "2026-01-10T00:00:00Z"
-
         with patch("api_frontend_service.get_db", return_value=mock_conn):
-            client.get(f"/v1.0/clip?start={start}&end={end}")
+            client.get("/v1.0/clip?min_intensity=8.5&limit=10&offset=5")
 
-        call_args = mock_cursor.execute.call_args
+        call_args = mock_cursor.execute.call_args_list[1]
         params = call_args[0][1]
 
-        # params should be (start_time, end_time, limit)
+        # params are (min_intensity, limit, offset)
         assert len(params) == 3
-        # Start and end should be datetime objects
-        assert isinstance(params[0], datetime)
-        assert isinstance(params[1], datetime)
+        assert isinstance(params[0], float)
+        assert params[0] == 8.5
+        assert isinstance(params[1], int)
+        assert params[1] == 10
+        assert isinstance(params[2], int)
+        assert params[2] == 5
 
     def test_query_returns_multiple_clips(self, client, mock_db_pool):
         """Query should handle multiple clip results."""
@@ -114,11 +120,11 @@ class TestDatabaseQueryIntegration:
 
         mock_cursor.fetchall.return_value = [
             (1, 111, "clip_a", "https://embed1.url", "https://thumb1.url",
-             detected_at, created_at, "ninja"),
+             detected_at, created_at, 9.1, "ninja"),
             (2, 222, "clip_b", "https://embed2.url", "https://thumb2.url",
-             detected_at, created_at, "shroud"),
+             detected_at, created_at, 9.2, "shroud"),
             (3, 333, "clip_c", "https://embed3.url", "https://thumb3.url",
-             detected_at, created_at, "pokimane"),
+             detected_at, created_at, 9.3, "pokimane"),
         ]
 
         with patch("api_frontend_service.get_db", return_value=mock_conn):
@@ -181,7 +187,7 @@ class TestStreamersJoinIntegration:
 
         mock_cursor.fetchall.return_value = [
             (1, 12345, "clip_abc", "https://embed.url", "https://thumb.url",
-             detected_at, created_at, "ninja"),
+             detected_at, created_at, 9.5, "ninja"),
         ]
 
         with patch("api_frontend_service.get_db", return_value=mock_conn):
@@ -201,7 +207,7 @@ class TestStreamersJoinIntegration:
         # Streamer login is None (no match in streamers table)
         mock_cursor.fetchall.return_value = [
             (1, 99999, "clip_xyz", "https://embed.url", "https://thumb.url",
-             detected_at, created_at, None),
+             detected_at, created_at, 9.5, None),
         ]
 
         with patch("api_frontend_service.get_db", return_value=mock_conn):
@@ -256,13 +262,13 @@ class TestPaginationIntegration:
         with patch("api_frontend_service.get_db", return_value=mock_conn):
             response = client.get("/v1.0/clip?limit=10")
 
-        call_args = mock_cursor.execute.call_args
+        call_args = mock_cursor.execute.call_args_list[1]
         params = call_args[0][1]
 
-        assert params[2] == 10  # limit parameter
+        assert params[1] == 10  # limit parameter
 
     def test_default_pagination_limit(self, client, mock_db_pool):
-        """Default limit should be 50."""
+        """Default limit should be 24."""
         mock_pool, mock_conn, mock_cursor = mock_db_pool
         mock_cursor.fetchall.return_value = []
 
@@ -270,14 +276,14 @@ class TestPaginationIntegration:
             response = client.get("/v1.0/clip")
 
         data = json.loads(response.data)
-        assert data["query"]["limit"] == 50
+        assert data["query"]["limit"] == 24
 
 
 class TestQueryOptimizationIntegration:
     """Integration tests for query optimization."""
 
-    def test_query_uses_index_on_detected_at(self, client, mock_db_pool):
-        """Query should filter on detected_at (indexed column)."""
+    def test_query_filters_on_intensity(self, client, mock_db_pool):
+        """Query should filter on intensity (the spec-002 relevance signal)."""
         mock_pool, mock_conn, mock_cursor = mock_db_pool
         mock_cursor.fetchall.return_value = []
 
@@ -287,9 +293,9 @@ class TestQueryOptimizationIntegration:
         call_args = mock_cursor.execute.call_args
         query = call_args[0][0]
 
-        # Query should use detected_at in WHERE clause
-        assert "detected_at >=" in query
-        assert "detected_at <=" in query
+        # Query should use intensity in WHERE clause
+        assert "intensity IS NOT NULL" in query
+        assert "intensity >=" in query
 
     def test_query_orders_by_detected_at_desc(self, client, mock_db_pool):
         """Query should order by detected_at DESC for recency."""
@@ -318,7 +324,7 @@ class TestDateTimeHandlingIntegration:
 
         mock_cursor.fetchall.return_value = [
             (1, 12345, "clip_abc", "https://embed.url", "https://thumb.url",
-             detected_at, created_at, "ninja"),
+             detected_at, created_at, 9.5, "ninja"),
         ]
 
         with patch("api_frontend_service.get_db", return_value=mock_conn):
@@ -334,7 +340,7 @@ class TestDateTimeHandlingIntegration:
         # Simulate null timestamps
         mock_cursor.fetchall.return_value = [
             (1, 12345, "clip_abc", "https://embed.url", "https://thumb.url",
-             None, None, "ninja"),
+             None, None, 9.5, "ninja"),
         ]
 
         with patch("api_frontend_service.get_db", return_value=mock_conn):

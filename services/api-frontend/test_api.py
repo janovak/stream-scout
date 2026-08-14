@@ -13,10 +13,8 @@ import pytest
 
 from api_frontend_service import (
     DEFAULT_CLIP_LIMIT,
-    DEFAULT_DAYS_BACK,
     MAX_CLIP_LIMIT,
     app,
-    parse_iso8601,
 )
 
 
@@ -35,47 +33,12 @@ def mock_db():
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    # get_clips always runs a COUNT(*) before the SELECT; leaving fetchone()
+    # unmocked returns a MagicMock, and comparing that against an int in the
+    # has_more calculation raises TypeError, which get_clips's bare except
+    # turns into a misleading 500.
+    mock_cursor.fetchone.return_value = (0,)
     return mock_conn, mock_cursor
-
-
-class TestParseISO8601:
-    """Tests for ISO 8601 datetime parsing."""
-
-    def test_parse_valid_iso8601_with_timezone(self):
-        """Parse datetime with timezone offset."""
-        result = parse_iso8601("2026-01-11T12:00:00+00:00")
-        assert result is not None
-        assert result.year == 2026
-        assert result.month == 1
-        assert result.day == 11
-        assert result.hour == 12
-
-    def test_parse_valid_iso8601_with_z_suffix(self):
-        """Parse datetime with Z suffix (UTC)."""
-        result = parse_iso8601("2026-01-11T12:00:00Z")
-        assert result is not None
-        assert result.tzinfo is not None
-
-    def test_parse_valid_iso8601_without_timezone(self):
-        """Parse datetime without timezone."""
-        result = parse_iso8601("2026-01-11T12:00:00")
-        assert result is not None
-        assert result.year == 2026
-
-    def test_parse_empty_string_returns_none(self):
-        """Empty string should return None."""
-        result = parse_iso8601("")
-        assert result is None
-
-    def test_parse_invalid_format_returns_none(self):
-        """Invalid format should return None."""
-        result = parse_iso8601("not-a-date")
-        assert result is None
-
-    def test_parse_none_returns_none(self):
-        """None input should return None."""
-        result = parse_iso8601(None)
-        assert result is None
 
 
 class TestHealthEndpoint:
@@ -112,7 +75,7 @@ class TestClipsEndpoint:
             (1, 12345, "clip_abc", "https://embed.url", "https://thumb.url",
              datetime(2026, 1, 10, 12, 0, 0, tzinfo=timezone.utc),
              datetime(2026, 1, 10, 12, 0, 1, tzinfo=timezone.utc),
-             "ninja"),
+             9.5, "ninja"),
         ]
 
         with patch("api_frontend_service.get_db", return_value=mock_conn):
@@ -169,48 +132,53 @@ class TestClipsEndpoint:
         data = json.loads(response.data)
         assert "error" in data
 
-    def test_get_clips_with_time_range(self, client, mock_db):
-        """Get clips with custom time range."""
+    def test_get_clips_with_min_intensity(self, client, mock_db):
+        """Get clips with custom min_intensity parameter."""
         mock_conn, mock_cursor = mock_db
         mock_cursor.fetchall.return_value = []
 
-        start = "2026-01-01T00:00:00Z"
-        end = "2026-01-10T23:59:59Z"
-
         with patch("api_frontend_service.get_db", return_value=mock_conn):
-            response = client.get(f"/v1.0/clip?start={start}&end={end}")
+            response = client.get("/v1.0/clip?min_intensity=9.5")
 
         assert response.status_code == 200
         data = json.loads(response.data)
-        assert "2026-01-01" in data["query"]["start"]
-        assert "2026-01-10" in data["query"]["end"]
+        assert data["query"]["min_intensity"] == 9.5
 
-    def test_get_clips_invalid_start_returns_400(self, client):
-        """Invalid start timestamp should return 400."""
-        response = client.get("/v1.0/clip?start=invalid-date")
-
-        assert response.status_code == 400
-        data = json.loads(response.data)
-        assert "Invalid start timestamp" in data["error"]
-
-    def test_get_clips_invalid_end_returns_400(self, client):
-        """Invalid end timestamp should return 400."""
-        response = client.get("/v1.0/clip?end=invalid-date")
+    def test_get_clips_invalid_min_intensity_returns_400(self, client):
+        """Non-numeric min_intensity should return 400."""
+        response = client.get("/v1.0/clip?min_intensity=abc")
 
         assert response.status_code == 400
         data = json.loads(response.data)
-        assert "Invalid end timestamp" in data["error"]
+        assert "Invalid min_intensity parameter" in data["error"]
 
-    def test_get_clips_start_after_end_returns_400(self, client):
-        """Start time after end time should return 400."""
-        start = "2026-01-10T00:00:00Z"
-        end = "2026-01-01T00:00:00Z"
-
-        response = client.get(f"/v1.0/clip?start={start}&end={end}")
+    def test_get_clips_negative_min_intensity_returns_400(self, client):
+        """Negative min_intensity should return 400."""
+        response = client.get("/v1.0/clip?min_intensity=-1")
 
         assert response.status_code == 400
         data = json.loads(response.data)
-        assert "Start time must be before end time" in data["error"]
+        assert "min_intensity must be non-negative" in data["error"]
+
+    def test_get_clips_with_offset(self, client, mock_db):
+        """Get clips with custom offset parameter."""
+        mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchall.return_value = []
+
+        with patch("api_frontend_service.get_db", return_value=mock_conn):
+            response = client.get("/v1.0/clip?offset=5")
+
+        assert response.status_code == 200
+        data = json.loads(response.data)
+        assert data["query"]["offset"] == 5
+
+    def test_get_clips_invalid_offset_returns_400(self, client):
+        """Non-numeric offset should return 400."""
+        response = client.get("/v1.0/clip?offset=abc")
+
+        assert response.status_code == 400
+        data = json.loads(response.data)
+        assert "Invalid offset parameter" in data["error"]
 
     def test_get_clips_db_error_returns_500(self, client):
         """Database error should return 500."""
@@ -228,7 +196,7 @@ class TestClipsEndpoint:
         created_at = datetime(2026, 1, 10, 12, 0, 1, tzinfo=timezone.utc)
         mock_cursor.fetchall.return_value = [
             (1, 12345, "clip_abc", "https://embed.url", "https://thumb.url",
-             detected_at, created_at, "ninja"),
+             detected_at, created_at, 9.5, "ninja"),
         ]
 
         with patch("api_frontend_service.get_db", return_value=mock_conn):
@@ -245,6 +213,7 @@ class TestClipsEndpoint:
         assert clip["thumbnail_url"] == "https://thumb.url"
         assert clip["detected_at"] is not None
         assert clip["created_at"] is not None
+        assert clip["intensity"] == 9.5
         assert clip["streamer_login"] == "ninja"
 
 
@@ -280,16 +249,12 @@ class TestConfiguration:
     """Tests for configuration values."""
 
     def test_default_clip_limit(self):
-        """Default clip limit should be 50."""
-        assert DEFAULT_CLIP_LIMIT == 50
+        """Default clip limit should be 24."""
+        assert DEFAULT_CLIP_LIMIT == 24
 
     def test_max_clip_limit(self):
         """Max clip limit should be 100."""
         assert MAX_CLIP_LIMIT == 100
-
-    def test_default_days_back(self):
-        """Default days back should be 7."""
-        assert DEFAULT_DAYS_BACK == 7
 
 
 class TestCORS:
@@ -308,44 +273,24 @@ class TestCORS:
         assert response.status_code == 200
 
 
-class TestRequestLogging:
-    """Tests for request logging decorator."""
-
-    def test_request_logging_captures_method(self, client, mock_db):
-        """Request logging should capture HTTP method."""
-        mock_conn, mock_cursor = mock_db
-        mock_cursor.fetchall.return_value = []
-
-        with patch("api_frontend_service.get_db", return_value=mock_conn):
-            with patch("api_frontend_service.logger") as mock_logger:
-                client.get("/v1.0/clip")
-
-                # Verify logger was called (implementation detail)
-                # The actual logging happens, we just verify endpoint works
-                assert True  # Test passes if no exception
-
-
 class TestDatabaseQueryOptimization:
     """Tests for database query structure."""
 
-    def test_query_uses_time_range_filter(self, client, mock_db):
-        """Query should filter by time range."""
+    def test_query_uses_intensity_filter(self, client, mock_db):
+        """Query should filter by intensity threshold."""
         mock_conn, mock_cursor = mock_db
         mock_cursor.fetchall.return_value = []
 
         with patch("api_frontend_service.get_db", return_value=mock_conn):
             client.get("/v1.0/clip")
 
-            # Verify execute was called
-            mock_cursor.execute.assert_called_once()
+            # get_clips runs a COUNT(*) then the paginated SELECT.
+            assert mock_cursor.execute.call_count == 2
 
-            # Get the query that was executed
-            call_args = mock_cursor.execute.call_args
-            query = call_args[0][0]
+            # The SELECT is the second call; verify its structure.
+            query = mock_cursor.execute.call_args_list[1][0][0]
 
-            # Verify query structure
-            assert "detected_at >=" in query
-            assert "detected_at <=" in query
+            assert "intensity >=" in query
             assert "ORDER BY" in query
             assert "LIMIT" in query
 
@@ -357,8 +302,7 @@ class TestDatabaseQueryOptimization:
         with patch("api_frontend_service.get_db", return_value=mock_conn):
             client.get("/v1.0/clip")
 
-            call_args = mock_cursor.execute.call_args
-            query = call_args[0][0]
+            query = mock_cursor.execute.call_args_list[1][0][0]
 
             assert "LEFT JOIN streamers" in query
             assert "streamer_login" in query
