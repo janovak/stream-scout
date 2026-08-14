@@ -23,9 +23,9 @@ paths:
           schema:
             type: number
             format: float
-            default: 5.0
+            default: 9.0
             minimum: 0
-            example: 5.0
+            example: 9.0
         - name: limit
           in: query
           description: Maximum number of clips to return
