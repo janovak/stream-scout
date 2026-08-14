@@ -18,8 +18,11 @@ done
 echo "JobManager is ready!"
 
 # Submit the PyFlink job
+# -pyFiles ships spike_detector.py to the SDK harness workers -- they don't
+# inherit sys.path from clip_detector_job.py's own directory, so without this
+# the job crashes at runtime with "ModuleNotFoundError: No module named 'spike_detector'".
 echo "Submitting PyFlink job..."
-flink run -py /opt/flink/usrlib/clip_detector_job.py -d
+flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py -d
 
 echo "Job submitted successfully!"
 

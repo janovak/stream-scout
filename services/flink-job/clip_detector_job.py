@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import statistics
 import time
 import threading
 from collections import deque
@@ -35,6 +34,8 @@ from pyflink.datastream.connectors.kafka import (
 )
 from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 
+from spike_detector import DetectorConfig, evaluate
+
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
@@ -50,11 +51,7 @@ FLINK_PARALLELISM = int(os.getenv("FLINK_PARALLELISM", "4"))
 # HTTP status codes that are retryable (transient errors)
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
-# Anomaly detection parameters
-WINDOW_SIZE_SECONDS = 5
-BASELINE_WINDOW_SECONDS = 10
-STD_DEV_THRESHOLD = 5.0
-COOLDOWN_SECONDS = 30
+# Clip creation retry parameters
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAYS = [0, 2, 4]  # seconds (within 5-second retry window)
 CLIP_DELAY_SECONDS = 10  # Wait before first clip attempt to center moment in clip
@@ -573,15 +570,14 @@ class CommandFilter(ProcessFunction):
 
 class AnomalyDetector(KeyedProcessFunction):
     """
-    Detects anomalies in chat message frequency using sliding windows.
-    Uses mean + STD_DEV_THRESHOLD standard deviations as threshold.
-    Implements 30-second cooldown between detections per broadcaster.
+    Adapter that feeds Flink's keyed MapState/ValueState into spike_detector.evaluate()
+    and applies the resulting Decision. See DetectorConfig for the tuning.
     """
 
     def __init__(self):
         self.message_counts = None  # MapState: timestamp_bucket -> count
         self.last_anomaly_time = None  # ValueState: last anomaly timestamp
-        self.baseline_stats = None  # ValueState: (mean, std_dev, sample_count)
+        self.config = None
         self.subtask_index = 0
 
     def open(self, runtime_context):
@@ -604,9 +600,7 @@ class AnomalyDetector(KeyedProcessFunction):
         self.last_anomaly_time = runtime_context.get_state(
             ValueStateDescriptor("last_anomaly_time", Types.LONG())
         )
-        self.baseline_stats = runtime_context.get_state(
-            ValueStateDescriptor("baseline_stats", Types.TUPLE([Types.FLOAT(), Types.FLOAT(), Types.INT()]))
-        )
+        self.config = DetectorConfig.from_env()
 
     def process_element(self, value, ctx: KeyedProcessFunction.Context) -> Iterator[str]:
         broadcaster_id = None
@@ -629,76 +623,34 @@ class AnomalyDetector(KeyedProcessFunction):
                 current_count = 0
             self.message_counts.put(bucket, current_count + 1)
 
-            # Clean up old buckets and calculate statistics
+            counts = {ts: self.message_counts.get(ts) for ts in self.message_counts.keys()}
             current_time = int(time.time())
-            baseline_start = current_time - BASELINE_WINDOW_SECONDS
-            window_start = current_time - WINDOW_SIZE_SECONDS
+            decision = evaluate(counts, current_time, self.last_anomaly_time.value(), self.config)
 
-            counts_baseline = []
-            counts_window = []
+            for expired_bucket in decision.expired_buckets:
+                self.message_counts.remove(expired_bucket)
 
-            # Iterate through all buckets
-            for ts_bucket in list(self.message_counts.keys()):
-                count = self.message_counts.get(ts_bucket)
-                if ts_bucket < baseline_start:
-                    # Remove old data
-                    self.message_counts.remove(ts_bucket)
-                elif ts_bucket >= baseline_start:
-                    counts_baseline.append(count)
-                    if ts_bucket >= window_start:
-                        counts_window.append(count)
-
-            # Need enough data for baseline (at least 5 minutes worth)
-            min_required = int(BASELINE_WINDOW_SECONDS * 0.8)
-            if len(counts_baseline) < min_required:
-                # Log periodically (every ~60 seconds worth of messages)
-                if len(counts_baseline) % 60 == 0 and len(counts_baseline) > 0:
-                    logger.debug(f"Broadcaster {broadcaster_id}: insufficient baseline data "
-                                f"({len(counts_baseline)}/{min_required} buckets)")
-                return
-
-            # Calculate baseline statistics
-            if len(counts_baseline) >= 2:
-                mean = statistics.mean(counts_baseline)
-                std_dev = statistics.stdev(counts_baseline)
-            else:
-                return
-
-            # Calculate current window activity
-            window_sum = sum(counts_window) if counts_window else 0
-
-            # Check for anomaly
-            threshold = mean + (STD_DEV_THRESHOLD * std_dev)
-            if window_sum > threshold and std_dev > 0:
-                # Check cooldown
-                last_anomaly = self.last_anomaly_time.value()
+            if decision.spike:
+                spike = decision.spike
                 current_ms = current_time * 1000
+                self.last_anomaly_time.update(current_ms)
 
-                if last_anomaly is None or (current_ms - last_anomaly) > (COOLDOWN_SECONDS * 1000):
-                    # Anomaly detected!
-                    self.last_anomaly_time.update(current_ms)
-
-                    # Calculate intensity as Z-score
-                    intensity = (window_sum - mean) / std_dev if std_dev > 0 else 0.0
-
-                    anomaly = {
-                        "broadcaster_id": broadcaster_id,
-                        "detected_at": current_ms,
-                        "message_count": window_sum,
-                        "baseline_mean": mean,
-                        "baseline_std": std_dev,
-                        "intensity": intensity
-                    }
-                    logger.info(f"ANOMALY DETECTED for broadcaster {broadcaster_id}: "
-                               f"count={window_sum}, threshold={threshold:.2f}, mean={mean:.2f}, std={std_dev:.2f}, intensity={intensity:.2f}")
-                    _init_metrics(self.subtask_index)
-                    if _anomalies_detected_total:
-                        _anomalies_detected_total.labels(broadcaster_id=str(broadcaster_id)).inc()
-                    yield json.dumps(anomaly)
-                else:
-                    cooldown_remaining = (COOLDOWN_SECONDS * 1000) - (current_ms - last_anomaly)
-                    logger.debug(f"Anomaly blocked by cooldown for broadcaster {broadcaster_id}: "
-                                f"count={window_sum}, cooldown_remaining={cooldown_remaining/1000:.1f}s")
+                anomaly = {
+                    "broadcaster_id": broadcaster_id,
+                    "detected_at": current_ms,
+                    "message_count": spike.message_count,
+                    "baseline_mean": spike.baseline_mean,
+                    "baseline_std": spike.baseline_std,
+                    "intensity": spike.intensity
+                }
+                threshold = spike.baseline_mean + (self.config.std_dev_threshold * spike.baseline_std)
+                logger.info(f"ANOMALY DETECTED for broadcaster {broadcaster_id}: "
+                           f"count={spike.message_count}, threshold={threshold:.2f}, mean={spike.baseline_mean:.2f}, "
+                           f"std={spike.baseline_std:.2f}, intensity={spike.intensity:.2f}")
+                _init_metrics(self.subtask_index)
+                if _anomalies_detected_total:
+                    _anomalies_detected_total.labels(broadcaster_id=str(broadcaster_id)).inc()
+                yield json.dumps(anomaly)
 
         except Exception as e:
             broadcaster_str = str(broadcaster_id) if broadcaster_id else "unknown"
@@ -920,6 +872,7 @@ def validate_tokens_at_startup():
 
 def main():
     """Main entry point for the Flink job."""
+    detector_config = DetectorConfig.from_env()
     logger.info("=" * 60)
     logger.info("Starting Clip Detector Job")
     logger.info("=" * 60)
@@ -927,10 +880,10 @@ def main():
     logger.info(f"  KAFKA_BOOTSTRAP_SERVERS: {KAFKA_BOOTSTRAP_SERVERS}")
     logger.info(f"  POSTGRES_HOST: {POSTGRES_HOST}")
     logger.info(f"  FLINK_PARALLELISM: {FLINK_PARALLELISM}")
-    logger.info(f"  WINDOW_SIZE_SECONDS: {WINDOW_SIZE_SECONDS}")
-    logger.info(f"  BASELINE_WINDOW_SECONDS: {BASELINE_WINDOW_SECONDS}")
-    logger.info(f"  STD_DEV_THRESHOLD: {STD_DEV_THRESHOLD}")
-    logger.info(f"  COOLDOWN_SECONDS: {COOLDOWN_SECONDS}")
+    logger.info(f"  DETECTION_WINDOW_SECONDS: {detector_config.window_seconds}")
+    logger.info(f"  DETECTION_BASELINE_SECONDS: {detector_config.baseline_seconds}")
+    logger.info(f"  DETECTION_STD_DEV_THRESHOLD: {detector_config.std_dev_threshold}")
+    logger.info(f"  DETECTION_COOLDOWN_SECONDS: {detector_config.cooldown_seconds}")
     logger.info(f"  TWITCH_CLIENT_ID: {'set' if TWITCH_CLIENT_ID else 'NOT SET'}")
     logger.info(f"  TWITCH_CLIENT_SECRET: {'set' if TWITCH_CLIENT_SECRET else 'NOT SET'}")
     logger.info(f"  TWITCH_TOKEN_FILE: {TWITCH_TOKEN_FILE}")

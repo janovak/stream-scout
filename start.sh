@@ -22,7 +22,7 @@ sleep 60
 
 echo ""
 echo "[4/5] Submitting Flink job..."
-docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d
+docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py -d
 
 echo ""
 echo "[5/5] Waiting 15 seconds for job to start..."
