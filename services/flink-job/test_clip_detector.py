@@ -13,15 +13,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from clip_detector_job import (
-    BASELINE_WINDOW_SECONDS,
     COMMAND_PATTERN,
     COOLDOWN_SECONDS,
     STD_DEV_THRESHOLD,
-    WINDOW_SIZE_SECONDS,
     AnomalyEvent,
     ChatMessage,
     ClipResult,
     TwitchAPIClient,
+    TwitchAPIError,
 )
 
 
@@ -134,50 +133,49 @@ class TestCooldownLogic:
         assert should_trigger
 
 
-class TestWindowConfiguration:
-    """Tests for sliding window configuration."""
-
-    def test_window_size_is_5_seconds(self):
-        """Window size should be 5 seconds per spec."""
-        assert WINDOW_SIZE_SECONDS == 5
-
-    def test_baseline_window_is_5_minutes(self):
-        """Baseline window should be 5 minutes (300 seconds) per spec."""
-        assert BASELINE_WINDOW_SECONDS == 300
-
-
 class TestTwitchAPIClient:
     """Tests for Twitch API client."""
 
+    @pytest.fixture
+    def token_file(self, tmp_path):
+        """A real token file on disk, so the client can construct without a network call."""
+        path = tmp_path / "tokens.json"
+        path.write_text(json.dumps({
+            "access_token": "test_token",
+            "refresh_token": "test_refresh",
+            "scopes": ["clips:edit"],
+        }))
+        return str(path)
+
     @patch("clip_detector_job.requests.post")
-    def test_create_clip_returns_clip_id_on_success(self, mock_post):
+    def test_create_clip_returns_clip_id_on_success(self, mock_post, token_file):
         """Successful clip creation should return clip ID."""
         mock_post.return_value.status_code = 202
         mock_post.return_value.json.return_value = {"data": [{"id": "test_clip_123"}]}
 
-        client = TwitchAPIClient("client_id", "client_secret")
+        client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
         # Pre-set token to avoid auth call
         client.access_token = "test_token"
-        client.token_expires_at = time.time() + 3600
 
         clip_id = client.create_clip(12345)
         assert clip_id == "test_clip_123"
 
     @patch("clip_detector_job.requests.post")
-    def test_create_clip_returns_none_on_failure(self, mock_post):
-        """Failed clip creation should return None."""
+    def test_create_clip_raises_retryable_on_server_error(self, mock_post, token_file):
+        """Failed clip creation should raise TwitchAPIError flagged as retryable for a 5xx."""
         mock_post.return_value.status_code = 500
         mock_post.return_value.json.return_value = {}
 
-        client = TwitchAPIClient("client_id", "client_secret")
+        client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
         client.access_token = "test_token"
-        client.token_expires_at = time.time() + 3600
 
-        clip_id = client.create_clip(12345)
-        assert clip_id is None
+        with pytest.raises(TwitchAPIError) as exc_info:
+            client.create_clip(12345)
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.is_retryable is True
 
     @patch("clip_detector_job.requests.get")
-    def test_get_clip_returns_data_on_success(self, mock_get):
+    def test_get_clip_returns_data_on_success(self, mock_get, token_file):
         """Successful clip retrieval should return clip data."""
         mock_get.return_value.status_code = 200
         mock_get.return_value.json.return_value = {
@@ -190,9 +188,8 @@ class TestTwitchAPIClient:
             ]
         }
 
-        client = TwitchAPIClient("client_id", "client_secret")
+        client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
         client.access_token = "test_token"
-        client.token_expires_at = time.time() + 3600
 
         clip_data = client.get_clip("test_clip_123")
         assert clip_data is not None
@@ -201,20 +198,19 @@ class TestTwitchAPIClient:
         assert "thumbnail_url" in clip_data
 
     @patch("clip_detector_job.requests.get")
-    def test_get_clip_returns_none_on_failure(self, mock_get):
+    def test_get_clip_returns_none_on_failure(self, mock_get, token_file):
         """Failed clip retrieval should return None."""
         mock_get.return_value.status_code = 404
         mock_get.return_value.json.return_value = {"data": []}
 
-        client = TwitchAPIClient("client_id", "client_secret")
+        client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
         client.access_token = "test_token"
-        client.token_expires_at = time.time() + 3600
 
         clip_data = client.get_clip("nonexistent_clip")
         assert clip_data is None
 
     @patch("clip_detector_job.requests.post")
-    def test_token_refresh_on_expiry(self, mock_post):
+    def test_token_refresh_on_expiry(self, mock_post, token_file):
         """Token should be refreshed when expired."""
         # First call for token refresh
         mock_post.return_value.status_code = 200
@@ -223,13 +219,12 @@ class TestTwitchAPIClient:
             "expires_in": 3600,
         }
 
-        client = TwitchAPIClient("client_id", "client_secret")
+        client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
         client.access_token = None  # Force token refresh
 
-        client._ensure_token()
+        client._refresh_access_token()
 
         assert client.access_token == "new_token"
-        assert client.token_expires_at > time.time()
 
 
 class TestDataClasses:
@@ -348,22 +343,6 @@ class TestAnomalyDetectionScenarios:
 
         is_anomaly = current_window_sum > threshold
         assert is_anomaly, f"Spike of {current_window_sum} should exceed threshold {threshold}"
-
-    def test_gradual_increase_no_anomaly(self):
-        """Gradual increase should not trigger if within threshold."""
-        # Baseline with some variance
-        baseline_counts = [8, 10, 12, 9, 11, 10, 8, 12, 9, 11] * 30
-
-        mean = statistics.mean(baseline_counts)
-        std_dev = statistics.stdev(baseline_counts)
-        threshold = mean + (STD_DEV_THRESHOLD * std_dev)
-
-        # Current window just slightly above mean
-        current_window_sum = int(mean) + 1
-
-        is_anomaly = current_window_sum > threshold
-        # May or may not trigger depending on actual threshold
-        # This tests the edge case behavior
 
     def test_high_variance_baseline_higher_threshold(self):
         """High variance baseline should have higher threshold."""

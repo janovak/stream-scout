@@ -21,6 +21,9 @@ COPY flink-conf.yaml /opt/flink/conf/flink-conf.yaml
 # Copy the PyFlink job
 COPY clip_detector_job.py /opt/flink/usrlib/
 
+# Copy the test suite so it can run in-container as a fallback to the host venv
+COPY test_clip_detector.py /opt/flink/usrlib/
+
 # Copy custom entrypoint for auto-submitting the job
 COPY docker-entrypoint-job.sh /opt/flink/
 RUN chmod +x /opt/flink/docker-entrypoint-job.sh
