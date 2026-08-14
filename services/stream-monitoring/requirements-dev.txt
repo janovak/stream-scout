@@ -1,4 +1,2 @@
 -r requirements.txt
 pytest>=8.2
-pytest-asyncio>=0.23
-pytest-mock==3.12.0

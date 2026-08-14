@@ -26,7 +26,7 @@ test-stream-monitoring: services/stream-monitoring/.venv/.installed
 test-flink-job: services/flink-job/.venv/.installed
 	cd services/flink-job && .venv/bin/python -m pytest
 
-services/%/.venv/.installed: services/%/requirements-dev.txt
+services/%/.venv/.installed: services/%/requirements-dev.txt services/%/requirements.txt
 	rm -rf services/$*/.venv
 	cd services/$* && $(PY) -m venv .venv
 	cd services/$* && .venv/bin/pip install --upgrade pip -q
