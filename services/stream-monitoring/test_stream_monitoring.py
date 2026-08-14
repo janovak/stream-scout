@@ -6,7 +6,6 @@ Tests token management, message processing, and service components.
 """
 
 import json
-import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -185,32 +184,6 @@ class TestMessagePayload:
         assert isinstance(event["broadcaster_login"], str)
         assert isinstance(event["rank"], int)
         assert isinstance(event["timestamp"], int)
-
-
-class TestServiceConfiguration:
-    """Tests for service configuration values."""
-
-    def test_default_configuration_values(self):
-        """Default configuration should have expected values."""
-        # These match the values defined in stream_monitoring_service.py
-        TOP_STREAMERS_COUNT = 5
-        REDIS_STREAMER_TTL = 180  # 3 minutes
-        POLL_INTERVAL_SECONDS = 120  # 2 minutes
-
-        assert TOP_STREAMERS_COUNT == 5
-        assert REDIS_STREAMER_TTL == 180
-        assert POLL_INTERVAL_SECONDS == 120
-
-    def test_environment_variable_configuration(self, monkeypatch):
-        """Configuration should be overridable via environment variables."""
-        monkeypatch.setenv("KAFKA_BROKER_URL", "custom-kafka:9092")
-        monkeypatch.setenv("POSTGRES_URL", "postgresql://custom:pass@host/db")
-        monkeypatch.setenv("REDIS_URL", "redis://custom-redis:6379")
-
-        # Verify environment variables are set correctly
-        assert os.getenv("KAFKA_BROKER_URL") == "custom-kafka:9092"
-        assert os.getenv("POSTGRES_URL") == "postgresql://custom:pass@host/db"
-        assert os.getenv("REDIS_URL") == "redis://custom-redis:6379"
 
 
 class TestKafkaDelivery:
