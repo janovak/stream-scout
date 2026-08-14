@@ -414,7 +414,8 @@ class StreamMonitoringService:
             # Build message payload
             message_payload = {
                 "broadcaster_id": broadcaster_id,
-                "timestamp": int(time.time() * 1000),
+                "timestamp": int(time.time() * 1000),   # ingestion clock, unchanged
+                "sent_at": msg.sent_timestamp,           # Twitch server clock, from tmi-sent-ts
                 "message_id": str(uuid.uuid4()),
                 "text": msg.text,
                 "user_id": int(msg.user.id) if msg.user.id else 0,
