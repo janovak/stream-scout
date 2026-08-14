@@ -12,6 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Bound twitchAPI's Chat.leave_room() with a timeout (upstream doesn't have
+# this; see patches/twitchapi_leave_room_timeout.py for why)
+COPY patches/twitchapi_leave_room_timeout.py /tmp/
+RUN python3 /tmp/twitchapi_leave_room_timeout.py && rm /tmp/twitchapi_leave_room_timeout.py
+
 # Copy application code
 COPY stream_monitoring_service.py .
 COPY token_manager.py .

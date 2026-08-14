@@ -58,6 +58,18 @@ CLIPPING_DISABLED_FETCH_BUFFER = 20
 REDIS_STREAMER_TTL = 180  # 3 minutes TTL for streamer online status
 POLL_INTERVAL_SECONDS = 120  # Poll every 2 minutes
 
+# aiohttp already bounds this request (ClientTimeout total=300s), but that is
+# well past our 120s poll interval, so a stalled call would silently eat
+# several cycles before raising. Measured median for this call is ~0.1s, so
+# 10s leaves ~100x headroom while still recovering within one poll interval.
+# Don't go much lower: a skipped poll opens a 240s gap against the 180s
+# REDIS_STREAMER_TTL, expiring online keys and churning lifecycle events.
+#
+# The chat-side hang (Chat.leave_room waiting forever on a PART confirmation
+# that a reconnect threw away) is fixed in the library itself -- see
+# patches/twitchapi_leave_room_timeout.py -- not with a wrapper here.
+GET_STREAMS_TIMEOUT_SECONDS = 10
+
 # Logging setup
 logger = logging.getLogger("stream_monitoring")
 logger.setLevel(getattr(logging, LOG_LEVEL.upper()))
@@ -223,11 +235,23 @@ class StreamMonitoringService:
             # disabled streamer near the top can't eat a rank slot it can never use.
             # See CLIPPING_DISABLED_FETCH_BUFFER above for why padding is needed.
             fetch_count = min(LEAVE_THRESHOLD + CLIPPING_DISABLED_FETCH_BUFFER, 100)
-            raw_streams = []
-            async for stream in self.twitch.get_streams(first=fetch_count):
-                raw_streams.append(stream)
-                if len(raw_streams) >= fetch_count:
-                    break
+
+            async def _fetch_top_streams():
+                collected = []
+                async for stream in self.twitch.get_streams(first=fetch_count):
+                    collected.append(stream)
+                    if len(collected) >= fetch_count:
+                        break
+                return collected
+
+            try:
+                raw_streams = await asyncio.wait_for(_fetch_top_streams(), timeout=GET_STREAMS_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.error("Timed out fetching top streams from Twitch API", extra={
+                    "timeout_seconds": GET_STREAMS_TIMEOUT_SECONDS
+                })
+                twitch_api_errors_total.labels(error_type="get_streams_timeout").inc()
+                return
 
             # Broadcasters we've already learned don't allow clip creation (via a
             # 403 from the clip-detector job) -- no point spending a chat
