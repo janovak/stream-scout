@@ -26,7 +26,8 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DEFAULT_CLIP_LIMIT = 24
 MAX_CLIP_LIMIT = 100
-DEFAULT_MIN_INTENSITY = 9.0  # "Unhinged" threshold
+# Must match `selectedThreshold` in static/app.js (spec 002 FR-002b, "Unhinged").
+DEFAULT_MIN_INTENSITY = 9.0
 
 # Logging setup
 logger = logging.getLogger("api_frontend")
@@ -244,7 +245,7 @@ def server_error(error):
 
 def main():
     """Main entry point."""
-    init_db_pool()
+    get_db_pool()
     logger.info("Starting API & Frontend Service", extra={"port": HTTP_PORT})
     app.run(host="0.0.0.0", port=HTTP_PORT, debug=False)
 
