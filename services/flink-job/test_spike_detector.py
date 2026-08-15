@@ -78,10 +78,19 @@ class TestShippedDefaults:
         assert config.window_seconds == 5
         assert config.min_baseline_fraction == 0.8
         assert config.cooldown_seconds == 30
-        # 0.8 x 300 = 240 baseline buckets, so a channel produces nothing for
-        # its first ~4 minutes of chat. That warm-up is what stream-monitoring's
-        # join/leave hysteresis exists to protect.
+        # 0.8 x 300 = 240 seconds of observation before a channel can produce
+        # anything -- about 4 minutes. stream-monitoring's rank hysteresis
+        # (JOIN 15 / LEAVE 30) softens the cost but does not remove it: those
+        # are ranks, not dwell times, so nothing guarantees a channel is
+        # watched for 4 minutes.
         assert int(config.baseline_seconds * config.min_baseline_fraction) == 240
+        assert config.retained_seconds == 305
+
+    def test_min_baseline_fraction_is_tunable_from_the_environment(self, monkeypatch):
+        # It was the one field from_env() did not read, so relaxing the gate
+        # needed a code change and a redeploy.
+        monkeypatch.setenv("DETECTION_MIN_BASELINE_FRACTION", "0.5")
+        assert DetectorConfig.from_env().min_baseline_fraction == 0.5
 
     def test_hold_cap_default_is_a_placeholder(self):
         # Untuned: Plan 06 Phase 4 step 19 picks the real value off the corpus.
@@ -263,18 +272,42 @@ class TestBaselineWindowSeparation:
 
 
 class TestWarmUpGate:
-    def test_too_few_populated_baseline_buckets_never_fires(self):
-        """min_baseline_fraction is 0.8, so 20s of baseline needs 16 buckets."""
+    """The gate measures elapsed observation time, not how busy a channel is."""
+
+    def test_a_channel_watched_for_too_short_a_time_never_fires(self):
+        """min_baseline_fraction is 0.8, so 20s of baseline needs 16s watched."""
         counts = {ts: 1000 for ts in WINDOW}
-        counts.update({ts: 5 for ts in range(981, 996)})  # 15 baseline buckets, one short
+        # Oldest baseline bucket is 981, so window_start - 981 = 15s watched.
+        counts.update({ts: 5 for ts in range(981, 996)})
         decision = evaluate_at(counts)
         assert decision.emit is None
         assert decision.hold is None
 
-    def test_one_more_bucket_clears_the_gate(self):
+    def test_one_more_second_of_history_clears_the_gate(self):
         counts = {ts: 1000 for ts in WINDOW}
-        counts.update({ts: 5 + (ts % 3) for ts in range(980, 996)})  # 16 buckets
+        counts.update({ts: 5 + (ts % 3) for ts in range(980, 996)})  # 16s watched
         assert evaluate_at(counts).hold is not None
+
+    def test_a_quiet_channel_is_not_blocked_by_its_own_silence(self):
+        """Regression for the finding that blocked 7 of 23 real broadcasters.
+
+        A gate that counted populated buckets rejected any channel whose chat
+        paused often, permanently rather than during warm-up. Silence is data:
+        an absent bucket is zero messages, and the arithmetic already reads it
+        that way. Only elapsed observation should gate.
+        """
+        counts = {ts: 1000 for ts in WINDOW}
+        # Watched for the full baseline, but only every 4th second has chat --
+        # 5 populated buckets out of 20, far under any density threshold.
+        counts.update({ts: 3 + (ts % 2) for ts in range(976, 996, 4)})
+        decision = evaluate_at(counts)
+        assert decision.hold is not None, "a sparse but long-observed channel must be measurable"
+
+    def test_a_returning_channel_must_warm_up_again(self):
+        """Buckets expire, so a channel that was away re-earns its history."""
+        counts = {ts: 1000 for ts in WINDOW}
+        counts.update({ts: 5 for ts in range(990, 996)})  # only 6s of history
+        assert evaluate_at(counts).hold is None
 
     def test_uniform_baseline_has_no_scale_and_does_not_fire(self):
         """std 0 would divide by zero; treat it as unmeasurable, not infinite."""
@@ -394,13 +427,15 @@ class TestPeakHold:
         assert decision.emit is None
         assert decision.hold == open_hold
 
-    def test_unmeasurable_baseline_suspends_the_cap_rather_than_guessing(self):
-        """The surprising half of the rule above: the cap does not fire either.
+    def test_a_hold_whose_peak_ages_past_the_cap_is_abandoned(self):
+        """The unmeasurable path suspends the cap, so it needs its own bound.
 
-        The cap exists to bound an episode, but firing it here would report a
-        peak measured against a baseline the detector can no longer see. The
-        hold waits for a second it can actually evaluate; the operator's state
-        TTL is what stops it waiting forever.
+        Passing the hold through unchanged is right for a second or two of
+        unmeasurable baseline. Held indefinitely it becomes a trap: when the
+        baseline recovers minutes later, the detector emits a peak from long
+        ago and ClipCreator cuts a clip of whatever is happening now. Drop the
+        hold instead once its peak is older than the cap, so no emitted peak is
+        ever staler than hold_cap_seconds.
         """
         open_hold = HoldState(
             started_at=NOW,
@@ -410,11 +445,35 @@ class TestPeakHold:
             peak_baseline_mean=10.0,
             peak_baseline_std=1.0,
         )
-        counts = {ts: 5 for ts in range(990, 996)}
-        way_past_cap = NOW + CONFIG.hold_cap_seconds * 5
-        decision = evaluate_at(counts, second=way_past_cap, hold=open_hold)
-        assert decision.emit is None
-        assert decision.hold == open_hold
+        # No buckets at all: unmeasurable at every second below, so the cap
+        # never gets a chance to end the period on its own.
+        blind = {}
+
+        # Still inside the cap: the hold survives untouched.
+        within = evaluate_at(blind, second=NOW + CONFIG.hold_cap_seconds, hold=open_hold)
+        assert within.emit is None
+        assert within.hold == open_hold
+
+        # Past it: abandoned, and never emitted.
+        beyond = evaluate_at(blind, second=NOW + CONFIG.hold_cap_seconds + 1, hold=open_hold)
+        assert beyond.emit is None
+        assert beyond.hold is None
+
+    def test_a_stale_hold_cannot_survive_a_blind_stretch_and_emit_later(self):
+        """End to end: the peak from a blind stretch never reaches a clip."""
+        counts = {ts: 10 + (1 if ts % 2 else -1) for ts in BASELINE}
+        counts.update({ts: 60 for ts in WINDOW})
+        hold = evaluate_at(counts).hold
+        assert hold is not None and hold.peak_at == NOW
+
+        # Chat stops entirely for well over the cap.
+        for offset in range(1, CONFIG.hold_cap_seconds * 3):
+            decision = evaluate_at({}, second=NOW + offset, hold=hold)
+            assert decision.emit is None, "a blind second must never emit"
+            hold = decision.hold
+            if hold is None:
+                break
+        assert hold is None, "the stale hold must be abandoned, not carried forever"
 
     def test_uniform_baseline_mid_hold_passes_the_hold_through(self):
         open_hold = HoldState(
@@ -528,3 +587,68 @@ class TestFutureBuckets:
         with_future = dict(counts)
         with_future.update({ts: 5000 for ts in range(NOW + 1, NOW + 6)})
         assert intensity_of(with_future) == pytest.approx(intensity_of(counts))
+
+
+class TestAtShippedDefaults:
+    """Every other test runs a small config, so nothing else exercises the
+    300-second baseline, the 240-second gate, or the 60-second cap that the
+    job actually runs with. A regression that only appears at those values
+    would otherwise pass the whole suite."""
+
+    DEFAULTS = DetectorConfig()
+    SECOND = 1_000_000
+    W_START = SECOND - DEFAULTS.window_seconds + 1
+    B_START = W_START - DEFAULTS.baseline_seconds
+
+    def full_baseline(self, level=20, wobble=2):
+        return {
+            ts: level + (wobble if ts % 2 else -wobble)
+            for ts in range(self.B_START, self.W_START)
+        }
+
+    def test_flat_traffic_scores_near_zero_at_300_seconds(self):
+        counts = self.full_baseline()
+        counts.update({ts: 20 for ts in range(self.W_START, self.SECOND + 1)})
+        assert intensity_of(
+            counts, second=self.SECOND, config=self.DEFAULTS
+        ) == pytest.approx(0.0, abs=0.05)
+
+    def test_the_gate_opens_at_exactly_240_seconds_of_history(self):
+        window = {ts: 5000 for ts in range(self.W_START, self.SECOND + 1)}
+
+        short = dict(window)
+        short.update({ts: 20 + ts % 3 for ts in range(self.W_START - 239, self.W_START)})
+        assert evaluate(short, self.SECOND, None, None, self.DEFAULTS).hold is None
+
+        just_enough = dict(window)
+        just_enough.update({ts: 20 + ts % 3 for ts in range(self.W_START - 240, self.W_START)})
+        assert evaluate(just_enough, self.SECOND, None, None, self.DEFAULTS).hold is not None
+
+    def test_a_real_spike_holds_to_its_60_second_cap(self):
+        hold, last_fire, emitted = None, None, []
+        for offset in range(70):
+            second = self.SECOND + offset
+            w_start = second - self.DEFAULTS.window_seconds + 1
+            counts = {
+                ts: 20 + (2 if ts % 2 else -2)
+                for ts in range(w_start - self.DEFAULTS.baseline_seconds, w_start)
+            }
+            counts.update({ts: 400 for ts in range(w_start, second + 1)})
+            decision = evaluate(counts, second, hold, last_fire, self.DEFAULTS)
+            hold = decision.hold
+            if decision.emit is not None:
+                emitted.append((second, decision.emit))
+                last_fire = second
+
+        assert len(emitted) == 1
+        fired_at, spike = emitted[0]
+        assert fired_at == self.SECOND + self.DEFAULTS.hold_cap_seconds
+        assert fired_at - spike.detected_at_seconds <= self.DEFAULTS.hold_cap_seconds
+
+    def test_expiry_keeps_exactly_the_retained_span(self):
+        counts = self.full_baseline()
+        counts.update({ts: 20 for ts in range(self.W_START, self.SECOND + 1)})
+        counts[self.B_START - 1] = 7
+        decision = evaluate(counts, self.SECOND, None, None, self.DEFAULTS)
+        assert decision.expired_buckets == [self.B_START - 1]
+        assert self.SECOND - self.B_START + 1 == self.DEFAULTS.retained_seconds

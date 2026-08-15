@@ -1,68 +1,66 @@
 """
 Pure spike-detection arithmetic, with no pyflink import.
 
-Flink owns the state (MapState/ValueState) for checkpointing; this module takes
-that state in as plain values and returns what should change. See
-AnomalyDetector in clip_detector_job.py for the Flink adapter that calls this.
+Flink owns the state (MapState/ValueState) for checkpointing. This module
+takes that state in as plain values. It returns what must change. See
+AnomalyDetector in clip_detector_job.py for the Flink adapter that calls it.
 
-Plan 06 Phase 3 rewrote the arithmetic. What changed, and why:
+Plan 06 Phase 3 changed the arithmetic. These are the changes:
 
-  - The baseline no longer contains the window it is measuring. Before, both
-    ranges started at `second - baseline_seconds`, so a spike inflated the
-    baseline it was compared against.
-  - `intensity` compares like with like: the window's mean messages-per-second
-    against the baseline's, in units of the baseline's standard deviation.
-    Before, a window *sum* (~6 buckets) was compared against per-bucket
-    statistics, which put a constant pedestal of roughly 5 x (mean / std) under
-    every reading -- so flat chat scored 7-17 on a scale whose trigger was 5,
-    and steadier chat scored higher than burstier chat.
-  - The detector holds through an elevation episode and reports its peak,
-    instead of reporting the first instant that crossed the trigger. The old
-    edge-trigger could only ever record `k + epsilon`, which is why the
-    recorded numbers carried no information.
+  - The baseline no longer contains the window that it measures. Before, both
+    ranges started at `second - baseline_seconds`. A spike thus increased the
+    baseline that it was compared against.
+  - `intensity` compares two values of the same unit. It compares the mean
+    messages per second in the window against the mean in the baseline. It
+    gives the result in baseline standard deviations. Before, the code
+    compared a window *sum* against per-bucket statistics. That put a constant
+    offset of approximately 5 x (mean / std) under every result. Flat chat
+    scored 7 to 17 on a scale whose trigger was 5. Steady chat also scored
+    higher than bursty chat.
+  - The detector holds through an elevated period. It reports the highest
+    value in that period. Before, it reported the first value that crossed
+    the trigger. That value was always `k + a small amount`.
 
-Bucket ranges, stated explicitly (Plan 06 step 10 asks for exactly this rather
-than inferring the edges from a `>=`). For a `second` S:
+These are the bucket ranges. Plan 06 step 10 asks for explicit ranges. For a
+`second` S:
 
     baseline  [S - window_seconds + 1 - baseline_seconds, S - window_seconds]
     window    [S - window_seconds + 1, S]
 
-Each range holds exactly as many buckets as the config names -- 300 and 5 by
-default -- and they do not overlap. Note the plan writes these as
-`[second-300, second-window)` and `[second-window, second]`, which is the same
-partition shifted by one: that spelling gives the window `window_seconds + 1`
-buckets, the 6-vs-5 off-by-one Plan 06 step 10 lists as a defect to fix. The
-ranges above are that fix, so the retained span is `baseline_seconds +
-window_seconds`, not `baseline_seconds`.
+Each range holds the number of buckets that its config field names. The
+defaults are 300 and 5. The ranges do not overlap. The plan writes these
+ranges as `[second-300, second-window)` and `[second-window, second]`. That is
+the same split, moved by one bucket. That spelling gives the window
+`window_seconds + 1` buckets. Plan 06 step 10 lists this as a defect to
+correct. The ranges above are the correction. The kept span is therefore
+`baseline_seconds + window_seconds`, not `baseline_seconds`.
 
-A bucket missing from `counts` means zero messages in that second, in both
-ranges. Chat that goes quiet has no Kafka message to create the bucket, so
-absent and zero are the same event. Counting only the buckets that happen to be
-present would make the two means incomparable -- the window would average over
-its busy seconds only while the baseline averaged over its own -- and
-`intensity` is exactly that comparison. The warm-up gate below is what
-separates "silent" from "not observed yet": it counts buckets that are really
-present, and refuses to evaluate until `min_baseline_fraction` of the baseline
-range has been seen.
+A bucket that is absent from `counts` means zero messages in that second, in
+both ranges. Chat that stops sends no Kafka message, so it creates no bucket.
+Absent and zero are the same event. If the code counted only the buckets that
+are present, the two means would not be comparable. The window would average
+its busy seconds only. The baseline would average its own busy seconds. The
+warm-up gate below tells a silent channel from an unobserved one. It measures
+how long the detector has watched the channel. It does not measure how busy
+the channel is.
 """
 
 import json
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import List, Mapping, Optional, Tuple
 
-# Plan 06 Phase 2: the watermark strategy's allowed out-of-orderness, in
-# seconds. Shared between clip_detector_job.py's WatermarkStrategy and
-# tools/replay.py's simulated watermark so the two compute event-time
-# readiness identically.
+# Plan 06 Phase 2: the allowed out-of-orderness of the watermark strategy, in
+# seconds. clip_detector_job.py's WatermarkStrategy and tools/replay.py's
+# simulated watermark share this value. The two must compute event-time
+# readiness in the same way.
 WATERMARK_OUT_OF_ORDERNESS_SECONDS = 5
 
-# Command messages (starting with "!") are filtered out before they ever
-# reach the detector. Pure regex, shared by clip_detector_job.py's
-# CommandFilter and tools/replay.py so the harness sees what the operator
-# sees.
+# The code removes command messages (messages that start with "!") before they
+# reach the detector. This regex is pure. clip_detector_job.py's CommandFilter
+# and tools/replay.py share it, so the harness sees what the operator sees.
 COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
 
 
@@ -74,38 +72,54 @@ def is_command(text: str) -> bool:
 class DetectorConfig:
     window_seconds: int = 5
 
-    # Restored to the original design intent (Plan 06 step 12). Commit c7afdab,
-    # a frontend change, dropped it to 10 and never put it back. The cost is a
-    # warm-up: at min_baseline_fraction 0.8 a channel produces nothing for its
-    # first ~4 minutes of chat, which is what stream-monitoring's join/leave
-    # hysteresis exists to protect.
+    # Plan 06 step 12 puts this back to the first design value. Commit c7afdab
+    # was a frontend change. It decreased this value to 10 and did not restore
+    # it. The cost is a warm-up delay. See min_baseline_fraction below.
+    #
+    # There is a second cost. The buckets of a spike enter the baseline
+    # window_seconds later and stay for this many seconds. They increase the
+    # baseline standard deviation for that time. The detector is therefore less
+    # sensitive to a second spike for up to 5 minutes after the first one. At
+    # baseline_seconds=10 that effect cleared in 10 seconds. The 30-second
+    # cooldown no longer describes the full recovery time. Plan 06 Phase 4 step
+    # 20 measures the interval between real spikes and decides what to do.
     baseline_seconds: int = 300
 
-    # The trigger, in standard deviations above the baseline mean -- spec 002's
-    # definition of Intensity. Named `std_dev_threshold` until Plan 06 Phase 3;
-    # the environment variable is still DETECTION_STD_DEV_THRESHOLD, because
-    # docker-compose.yml, spec 002 FR-001b and the comments around them all
-    # refer to it by that name.
+    # The trigger, in standard deviations above the baseline mean. Spec 002
+    # defines Intensity in these terms. This field was `std_dev_threshold`
+    # before Plan 06 Phase 3. The environment variable is still
+    # DETECTION_STD_DEV_THRESHOLD. docker-compose.yml and spec 002 FR-001b use
+    # that name.
     #
-    # 5.0 is carried over from the old formula and is NOT meaningful on the new
-    # scale -- the pedestal it was chosen against is gone. Plan 06 Phase 4
-    # picks the real value off a percentile of the corpus distribution.
+    # The value 5.0 comes from the earlier formula. It has no meaning on the
+    # new scale, because Phase 3 removed the constant offset that it was
+    # chosen against. Plan 06 Phase 4 selects the correct value from a
+    # percentile of the corpus distribution.
     k: float = 5.0
 
-    # How long an elevation episode may run before the detector fires anyway.
-    # Untuned placeholder: Plan 06 Phase 4 (corpus tuning) has not run yet, and
-    # step 19 picks this by plotting intensity through real spikes and seeing
-    # how long they actually stay elevated.
+    # The maximum length of one elevated period, before the detector reports a
+    # result. This value is a placeholder. Plan 06 Phase 4 step 19 sets it from
+    # the measured length of real spikes.
     hold_cap_seconds: int = 60
 
     cooldown_seconds: int = 30
+
+    # The warm-up gate. The detector must watch a channel for
+    # min_baseline_fraction x baseline_seconds before it reports anything. At
+    # the defaults this is 240 seconds, or approximately 4 minutes.
+    #
+    # This gate measures elapsed observation time. It does not measure how many
+    # baseline buckets hold messages. A quiet second is data, because an absent
+    # bucket counts as zero. A count of populated buckets would instead reject
+    # every quiet channel permanently. On the Plan 06 dev-slice corpus, a count
+    # of populated buckets blocks 7 of 23 broadcasters for the full hour.
     min_baseline_fraction: float = 0.8
 
     def __post_init__(self):
-        # Fail at construction, which for the operator means job startup with a
-        # readable message. A detector built on a nonsense window would divide
-        # by zero, or silently never fire, several layers away from the typo in
-        # docker-compose.yml that caused it.
+        # Fail when the object is built. For the operator this means the job
+        # stops at start-up with a clear message. A detector with a window of
+        # zero divides by zero. A detector with a bad gate stays silent. Both
+        # faults appear far from the docker-compose.yml error that caused them.
         if self.window_seconds < 1:
             raise ValueError(f"window_seconds must be >= 1, got {self.window_seconds}")
         if self.baseline_seconds < 2:
@@ -121,18 +135,23 @@ class DetectorConfig:
             raise ValueError(
                 f"min_baseline_fraction must be in (0, 1], got {self.min_baseline_fraction}"
             )
-        # The operator's timer chain only runs while the key still has buckets,
-        # which is baseline_seconds + window_seconds past its last message. A
-        # cap longer than that could not fire before the chain lapsed, leaving
-        # the episode stranded in state until its TTL. See
-        # AnomalyDetector.on_timer.
-        retained_seconds = self.baseline_seconds + self.window_seconds
+        # The timer chain of the operator runs only while the key holds
+        # buckets. That is baseline_seconds + window_seconds after the last
+        # message of the key. A longer cap cannot report a result before the
+        # chain stops. The period would stay in state until its TTL removes it.
+        # See AnomalyDetector.on_timer.
+        retained_seconds = self.retained_seconds
         if self.hold_cap_seconds >= retained_seconds:
             raise ValueError(
-                f"hold_cap_seconds ({self.hold_cap_seconds}) must be under "
+                f"hold_cap_seconds ({self.hold_cap_seconds}) must be less than "
                 f"baseline_seconds + window_seconds ({retained_seconds}), or a "
-                f"hold can outlive the buckets whose timers would fire it"
+                f"hold can outlive the buckets whose timers report it"
             )
+
+    @property
+    def retained_seconds(self) -> int:
+        """The full span of buckets that evaluate() keeps for one key."""
+        return self.baseline_seconds + self.window_seconds
 
     @classmethod
     def from_env(cls) -> "DetectorConfig":
@@ -142,31 +161,35 @@ class DetectorConfig:
             k=float(os.getenv("DETECTION_STD_DEV_THRESHOLD", cls.k)),
             hold_cap_seconds=int(os.getenv("DETECTION_HOLD_CAP_SECONDS", cls.hold_cap_seconds)),
             cooldown_seconds=int(os.getenv("DETECTION_COOLDOWN_SECONDS", cls.cooldown_seconds)),
+            min_baseline_fraction=float(
+                os.getenv("DETECTION_MIN_BASELINE_FRACTION", cls.min_baseline_fraction)
+            ),
         )
 
 
 @dataclass(frozen=True)
 class Spike:
-    message_count: int              # messages in the window, summed
+    message_count: int              # the number of messages in the window
     baseline_mean: float            # messages per second
     baseline_std: float
     intensity: float                # (window_mean - baseline_mean) / baseline_std
-    detected_at_seconds: int        # event-time second this was measured at
+    detected_at_seconds: int        # the event-time second of this measurement
 
 
 @dataclass(frozen=True)
 class HoldState:
-    """An elevation episode in progress, and the highest reading in it so far.
+    """An elevated period in progress, and its highest reading so far.
 
-    Every peak_* field comes from one single second -- the peak's -- so the
-    emitted Spike is one coherent measurement rather than a peak intensity
-    stapled to whatever the counts happened to be when the hold ended. Plan 06:
-    "never record a different quantity than the one you thresholded."
+    Every peak_* field comes from one single second. That second is the peak.
+    The reported Spike is therefore one complete measurement. It is not a peak
+    intensity joined to the counts of a different second. Plan 06 states the
+    rule: never record a different quantity than the one you compared against
+    the trigger.
     """
 
-    started_at: int                 # event-time second the hold opened
+    started_at: int                 # the event-time second the hold opened
     peak_intensity: float
-    peak_at: int                    # event-time second of the peak
+    peak_at: int                    # the event-time second of the peak
     peak_message_count: int
     peak_baseline_mean: float
     peak_baseline_std: float
@@ -183,11 +206,11 @@ class HoldState:
         )
 
     def with_peak(self, measurement: Spike) -> "HoldState":
-        """This hold, raised to `measurement` if it is a new high.
+        """This hold, increased to `measurement` if that is a new maximum.
 
-        Ties keep the earlier second: a plateau is reported at the moment it
-        was first reached, and the result does not depend on how long the
-        plateau happens to run.
+        Equal values keep the earlier second. The detector thus reports a flat
+        peak at the second it first occurred. The result does not change with
+        the length of the flat part.
         """
         if measurement.intensity <= self.peak_intensity:
             return self
@@ -209,21 +232,11 @@ class HoldState:
             detected_at_seconds=self.peak_at,
         )
 
-    # Flink has no built-in TypeInformation for a dataclass, so AnomalyDetector
-    # keeps this in a Types.STRING() ValueState. The encoding lives here so the
-    # operator does not have to know the field list.
+    # Flink has no TypeInformation for a dataclass. AnomalyDetector therefore
+    # keeps this object in a Types.STRING() ValueState. asdict() reads the
+    # field list from the dataclass, so the encoding cannot lose a new field.
     def to_json(self) -> str:
-        return json.dumps(
-            {
-                "started_at": self.started_at,
-                "peak_intensity": self.peak_intensity,
-                "peak_at": self.peak_at,
-                "peak_message_count": self.peak_message_count,
-                "peak_baseline_mean": self.peak_baseline_mean,
-                "peak_baseline_std": self.peak_baseline_std,
-            },
-            separators=(",", ":"),
-        )
+        return json.dumps(asdict(self), separators=(",", ":"))
 
     @classmethod
     def from_json(cls, encoded: Optional[str]) -> Optional["HoldState"]:
@@ -234,34 +247,34 @@ class HoldState:
 
 @dataclass(frozen=True)
 class Decision:
-    emit: Optional[Spike]           # fire now, carrying the peak
-    hold: Optional[HoldState]       # updated hold to persist in ValueState
-    expired_buckets: List[int]      # operator removes these from MapState
+    emit: Optional[Spike]           # report now, with the peak
+    hold: Optional[HoldState]       # the updated hold to keep in ValueState
+    expired_buckets: List[int]      # the operator removes these from MapState
 
 
 def evaluate(
     counts: Mapping[int, int],      # bucket second -> message count
-    second: int,                    # the event-time second being evaluated
+    second: int,                    # the event-time second to evaluate
     hold: Optional[HoldState],
     last_fire_second: Optional[int],
     config: DetectorConfig,
 ) -> Decision:
     """Pure. No I/O, no clock, no globals. The caller supplies `second`.
 
-    Called once per event-time second per broadcaster, from a timer -- not once
-    per message. See the module docstring for the bucket ranges and for why an
-    absent bucket counts as zero.
+    A timer calls this once per event-time second per broadcaster. It does not
+    run once per message. The module docstring gives the bucket ranges. It also
+    explains why an absent bucket counts as zero.
 
-    The caller must not pass buckets newer than `second`; both callers filter
-    them out (AnomalyDetector.on_timer, replay._fire) because the watermark
-    that makes `second` due has already admitted messages a few seconds past
-    it. Any that slip through are ignored here rather than counted.
+    The caller must not supply buckets that are newer than `second`. Both
+    callers remove them (AnomalyDetector.on_timer and replay._fire). The
+    watermark that makes `second` ready has already admitted messages a few
+    seconds later than `second`. This function ignores any such bucket.
     """
     window_start = second - config.window_seconds + 1
     baseline_start = window_start - config.baseline_seconds
 
     window_total = 0
-    baseline_present = 0
+    oldest_baseline_bucket = None
     baseline_counts = [0] * config.baseline_seconds
     expired_buckets: List[int] = []
 
@@ -270,34 +283,48 @@ def evaluate(
             expired_buckets.append(ts_bucket)
         elif ts_bucket < window_start:
             baseline_counts[ts_bucket - baseline_start] = count
-            baseline_present += 1
+            if oldest_baseline_bucket is None or ts_bucket < oldest_baseline_bucket:
+                oldest_baseline_bucket = ts_bucket
         elif ts_bucket <= second:
             window_total += count
 
-    # MapState.keys() promises no particular order, so sort: the operator's
-    # eviction order and the replay harness's output must not depend on how
-    # Flink happened to lay the map out.
+    # MapState.keys() gives no order. Sort the list. The eviction order of the
+    # operator and the output of the replay harness must not change with the
+    # internal order of the map.
     expired_buckets.sort()
 
-    # Warm-up gate. Counts buckets genuinely present, not the zero-filled
-    # slots -- an unobserved channel and a silent one look identical in
-    # `counts`, and only this gate tells them apart.
-    min_required = int(config.baseline_seconds * config.min_baseline_fraction)
-    if baseline_present < min_required:
-        # No measurement is possible this second. Leave any open hold exactly
-        # as it is and let a later second resolve it: dropping it would lose a
-        # spike that was really there, and firing it would report a peak the
-        # detector never finished watching.
-        return Decision(emit=None, hold=hold, expired_buckets=expired_buckets)
+    # Remove a hold whose peak is older than the cap. This rule applies to
+    # every path below, so no reported peak is ever older than
+    # hold_cap_seconds.
+    #
+    # The cap normally ends a period on the elevated path. It cannot do so when
+    # the detector cannot measure a second, because the code keeps the hold and
+    # does not reach the cap test. An unmeasurable baseline can therefore hold a
+    # peak for many minutes. The clip for such a peak shows the wrong part of
+    # the stream. The test must be here, before the gate, and not only on the
+    # unmeasurable path: a measurable second that follows a blind period would
+    # otherwise report that old peak.
+    if hold is not None and (second - hold.peak_at) > config.hold_cap_seconds:
+        hold = None
+
+    # The warm-up gate. It measures how long the detector has watched this key.
+    # The oldest bucket that is still in the baseline range gives that time.
+    # Buckets older than baseline_start are removed each second, so a warm key
+    # always reaches back to baseline_start.
+    min_observed_seconds = int(config.baseline_seconds * config.min_baseline_fraction)
+    observed_seconds = (
+        0 if oldest_baseline_bucket is None else window_start - oldest_baseline_bucket
+    )
+    if observed_seconds < min_observed_seconds:
+        return _unmeasurable(second, hold, expired_buckets, config)
 
     baseline_mean, baseline_std = _mean_and_sample_stdev(baseline_counts)
 
     if baseline_std <= 0.0:
-        # A perfectly uniform baseline leaves the z-score nothing to divide by.
-        # In practice this is an artifact of very thin traffic, not a channel
-        # so regular that any deviation is infinitely significant. Same
-        # treatment as an unmeasurable baseline above.
-        return Decision(emit=None, hold=hold, expired_buckets=expired_buckets)
+        # A baseline with no spread gives the score nothing to divide by. In
+        # practice this means very little traffic. It does not mean a channel
+        # so regular that any change is very large.
+        return _unmeasurable(second, hold, expired_buckets, config)
 
     window_mean = window_total / config.window_seconds
     intensity = (window_mean - baseline_mean) / baseline_std
@@ -315,44 +342,63 @@ def evaluate(
         if not elevated:
             return Decision(emit=None, hold=None, expired_buckets=expired_buckets)
         if _in_cooldown(second, last_fire_second, config):
-            # The cooldown gates *starting* an episode, not each fire. Once a
-            # hold is open it runs to its own end; peak-hold already fires
-            # once per episode, so a cooldown that could interrupt one would
-            # only truncate it and report a peak that had not arrived yet.
+            # The cooldown stops a new period from opening. It does not stop
+            # each report. An open period always runs to its own end. The hold
+            # already gives one report per period. A cooldown that could stop
+            # an open period would only cut it short. It would then report a
+            # peak that had not yet occurred.
             return Decision(emit=None, hold=None, expired_buckets=expired_buckets)
         hold = HoldState.opened(measurement)
     elif elevated:
         hold = hold.with_peak(measurement)
     else:
-        # Intensity fell back below the trigger: the episode is over, so fire
-        # the peak it reached. This second is not part of the episode and does
-        # not get to claim the peak.
+        # The intensity fell below the trigger. The period is complete, so
+        # report its peak. This second is not part of the period. It therefore
+        # cannot become the peak.
         return Decision(emit=hold.to_spike(), hold=None, expired_buckets=expired_buckets)
 
-    # Still elevated. Fire anyway once the hold has been open for its full cap,
-    # so an episode that stays up indefinitely still produces a clip.
+    # The channel is still elevated. Report a result when the hold reaches its
+    # full cap. A period that stays elevated must still produce a clip.
     if second - hold.started_at >= config.hold_cap_seconds:
         return Decision(emit=hold.to_spike(), hold=None, expired_buckets=expired_buckets)
 
     return Decision(emit=None, hold=hold, expired_buckets=expired_buckets)
 
 
+def _unmeasurable(
+    second: int,
+    hold: Optional[HoldState],
+    expired_buckets: List[int],
+    config: DetectorConfig,
+) -> Decision:
+    """The result for a second that the detector cannot measure.
+
+    Keep an open hold without a change. Do not report it and do not remove it.
+    A report here would give a peak that was measured against a baseline the
+    detector can no longer see. Removal would lose a real spike. evaluate()
+    has already removed the hold if its peak is too old.
+    """
+    return Decision(emit=None, hold=hold, expired_buckets=expired_buckets)
+
+
 def _mean_and_sample_stdev(values: List[int]) -> Tuple[float, float]:
     """Two-pass mean and sample (n-1) standard deviation.
 
-    Not statistics.mean/stdev: those compute in exact rational arithmetic and
-    cost ~380us on a 300-bucket baseline, which this detector evaluates once
-    per second per broadcaster -- and which the replay harness pays again for
-    every second of a 12-hour corpus. This agrees with them to ~1e-15 relative
-    on message counts and is ~10x faster. Two-pass, not sum-of-squares, so it
-    does not lose precision to cancellation.
+    This code does not use statistics.mean and statistics.stdev. Those
+    functions calculate in exact rational arithmetic. They need approximately
+    380 us for a 300-bucket baseline. The detector evaluates that baseline once
+    per second for each broadcaster. The replay harness pays the same cost for
+    every second of a 12-hour corpus. This code agrees with those functions to
+    approximately 1e-15 relative on message counts. It is approximately 10
+    times faster. It uses two passes, not a sum of squares, so it does not lose
+    precision.
     """
     n = len(values)
     mean = sum(values) / n
+    # Each term is a product of a float with itself, so no term is negative.
+    # The sum is therefore always zero or more.
     variance = sum((value - mean) * (value - mean) for value in values) / (n - 1)
-    # Guard the sqrt rather than the caller: rounding can leave a variance a
-    # hair below zero when every value is identical.
-    return mean, math.sqrt(variance) if variance > 0.0 else 0.0
+    return mean, math.sqrt(variance)
 
 
 def _in_cooldown(
