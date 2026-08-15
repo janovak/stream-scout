@@ -27,6 +27,16 @@ logger = logging.getLogger("token_manager")
 TWITCH_TOKEN_ENDPOINT = "https://id.twitch.tv/oauth2/token"
 
 
+def _chmod_shared(path: Path, mode: int) -> None:
+    """Force `mode` on `path`, regardless of umask or which container's
+    user created it. A no-op failure if some other container's user
+    already owns `path` -- only that container (or root) can rechmod it."""
+    try:
+        os.chmod(path, mode)
+    except PermissionError:
+        pass
+
+
 @dataclass(frozen=True)
 class TokenRecord:
     access_token: str
@@ -150,10 +160,17 @@ class TwitchCredentials:
 
     def _write_atomic(self, record: TokenRecord) -> None:
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
+        _chmod_shared(self.token_file.parent, 0o777)
         fd, tmp_path = tempfile.mkstemp(
             dir=self.token_file.parent, prefix=".tmp-tokens-", suffix=".json"
         )
         try:
+            # tempfile.mkstemp creates the file 0o600. os.replace keeps the
+            # temp file's mode, not the target's, so without this the next
+            # container to read/refresh under a different uid (stream-
+            # monitoring runs as root; the Flink containers run as uid 9999)
+            # gets Permission Denied on the token file itself.
+            os.fchmod(fd, 0o666)
             with os.fdopen(fd, "w") as f:
                 json.dump(
                     {
@@ -193,6 +210,7 @@ class TwitchCredentials:
         stay 0o666 regardless of umask or which container created it.
         """
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
+        _chmod_shared(self.token_file.parent, 0o777)
         lock_path = self.token_file.with_name(self.token_file.name + ".lock")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
         try:
