@@ -184,10 +184,22 @@ class TwitchCredentials:
         at once despite one supposedly waiting on the other. All three
         containers mount the same host secrets/ directory, so the sidecar
         is visible across processes the same way the token file is.
+
+        The three containers do not run as the same user (stream-monitoring
+        runs as root; the Flink containers drop to uid 9999). A plain
+        open(path, "w") applies the process umask, so whichever container
+        creates the sidecar first can leave it unreadable to the others.
+        os.open with an explicit mode plus an fchmod forces the sidecar to
+        stay 0o666 regardless of umask or which container created it.
         """
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.token_file.with_name(self.token_file.name + ".lock")
-        with open(lock_path, "w") as lock_file:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            os.fchmod(fd, 0o666)
+        except PermissionError:
+            pass  # sidecar already exists and is owned by another container's user
+        with os.fdopen(fd, "r+") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
                 yield
