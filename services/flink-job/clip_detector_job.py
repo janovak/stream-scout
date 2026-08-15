@@ -15,6 +15,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Iterator, Optional, Tuple
 
 import requests
@@ -35,6 +36,7 @@ from pyflink.datastream.connectors.kafka import (
 from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 
 from spike_detector import DetectorConfig, evaluate
+from token_manager import TwitchCredentials
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -202,12 +204,9 @@ class TwitchAPIClient:
         self.client_id = client_id
         self.client_secret = client_secret
         self.token_file = token_file
+        self._credentials = TwitchCredentials(Path(token_file))
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
-        # Guards refresh + token-file writes: with clip creation now running
-        # on background threads, two clips hitting a 401 at once could
-        # otherwise both refresh concurrently and tear the token file.
-        self._refresh_lock = threading.Lock()
         self._load_tokens()
         if validate_on_init:
             self._validate_and_refresh_if_needed()
@@ -221,38 +220,29 @@ class TwitchAPIClient:
         return f"{token[:4]}...{len(token) - 4} more chars"
 
     def _load_tokens(self):
-        """Load user tokens from JSON file."""
+        """Load user tokens via the shared credentials module."""
         logger.info(f"Loading tokens from file: {self.token_file}")
         try:
-            with open(self.token_file, "r") as f:
-                data = json.load(f)
-        except FileNotFoundError:
+            record = self._credentials.load()
+        except FileNotFoundError as e:
             logger.error(f"TOKEN FILE NOT FOUND: {self.token_file}")
             logger.error("Please run seed_twitch_tokens.py to generate tokens first")
-            raise TokenValidationError(f"Token file not found: {self.token_file}")
+            raise TokenValidationError(str(e))
         except json.JSONDecodeError as e:
             logger.error(f"TOKEN FILE INVALID JSON: {self.token_file} - {e}")
             raise TokenValidationError(f"Token file contains invalid JSON: {e}")
-        except Exception as e:
-            logger.error(f"TOKEN FILE READ ERROR: {self.token_file} - {e}")
-            raise TokenValidationError(f"Failed to read token file: {e}")
+        except ValueError as e:
+            logger.error(f"TOKEN FILE INVALID: {e}")
+            raise TokenValidationError(str(e))
 
-        self.access_token = data.get("access_token")
-        self.refresh_token = data.get("refresh_token")
-        scopes = data.get("scopes", [])
+        self.access_token = record.access_token
+        self.refresh_token = record.refresh_token
 
         # Log masked token values for debugging
         logger.info(f"Token file loaded successfully:")
         logger.info(f"  access_token: {self._mask_token(self.access_token)}")
         logger.info(f"  refresh_token: {self._mask_token(self.refresh_token)}")
-        logger.info(f"  scopes: {scopes}")
-
-        if not self.access_token:
-            logger.error("TOKEN FILE MISSING access_token field")
-            raise TokenValidationError("Token file missing required 'access_token' field")
-        if not self.refresh_token:
-            logger.error("TOKEN FILE MISSING refresh_token field")
-            raise TokenValidationError("Token file missing required 'refresh_token' field")
+        logger.info(f"  scopes: {record.scopes}")
 
     def _validate_and_refresh_if_needed(self):
         """Validate token with Twitch API and refresh if expired."""
@@ -292,12 +282,12 @@ class TwitchAPIClient:
             # Proactively refresh if expiring soon (within 10 minutes)
             if expires_in < 600:
                 logger.warning(f"Token expiring soon ({expires_in}s), refreshing proactively...")
-                self._refresh_access_token()
+                self._refresh()
 
         elif response.status_code == 401:
             logger.warning("Access token expired or invalid, attempting refresh...")
             try:
-                self._refresh_access_token()
+                self._refresh()
                 # Validate the new token
                 self._validate_and_refresh_if_needed()
             except Exception as e:
@@ -308,47 +298,14 @@ class TwitchAPIClient:
             logger.error(f"TOKEN VALIDATION FAILED: status={response.status_code}, body={response.text}")
             raise TokenValidationError(f"Token validation failed with status {response.status_code}")
 
-    def _save_tokens(self):
-        """Save tokens back to file after refresh."""
-        try:
-            # Read existing data to preserve scopes
-            with open(self.token_file, "r") as f:
-                data = json.load(f)
-            data["access_token"] = self.access_token
-            data["refresh_token"] = self.refresh_token
-            data["updated_at"] = datetime.now(timezone.utc).isoformat()
-            with open(self.token_file, "w") as f:
-                json.dump(data, f, indent=2)
-            logger.info(f"Saved refreshed tokens to {self.token_file}")
-        except Exception as e:
-            logger.error(f"Failed to save tokens: {e}")
-
-    def _refresh_access_token(self):
-        """Refresh the access token using the refresh token."""
-        with self._refresh_lock:
-            logger.info("Refreshing user access token...")
-            try:
-                response = requests.post(
-                    "https://id.twitch.tv/oauth2/token",
-                    data={
-                        "client_id": self.client_id,
-                        "client_secret": self.client_secret,
-                        "grant_type": "refresh_token",
-                        "refresh_token": self.refresh_token
-                    },
-                    timeout=30
-                )
-                if response.status_code != 200:
-                    logger.error(f"Token refresh failed: status={response.status_code}, body={response.text}")
-                    response.raise_for_status()
-                data = response.json()
-                self.access_token = data["access_token"]
-                self.refresh_token = data.get("refresh_token", self.refresh_token)
-                logger.info(f"Token refreshed successfully, expires in {data.get('expires_in', 'unknown')}s")
-                self._save_tokens()
-            except Exception as e:
-                logger.error(f"Token refresh exception: {e}")
-                raise
+    def _refresh(self) -> None:
+        """Refresh the access token via the shared credentials module, which
+        holds a cross-process file lock across the read-refresh-write so a
+        concurrent refresh from another container can't leave either side
+        holding a dead token."""
+        record = self._credentials.refresh(self.client_id, self.client_secret)
+        self.access_token = record.access_token
+        self.refresh_token = record.refresh_token
 
     def _is_retryable_status(self, status_code: int) -> bool:
         """Check if a status code indicates a retryable error."""
@@ -388,7 +345,7 @@ class TwitchAPIClient:
             elif response.status_code == 401:
                 # Token expired - try refresh once
                 logger.warning("Got 401, attempting token refresh...")
-                self._refresh_access_token()
+                self._refresh()
                 # Retry with new token
                 headers["Authorization"] = f"Bearer {self.access_token}"
                 response = requests.post(
@@ -456,7 +413,7 @@ class TwitchAPIClient:
             elif response.status_code == 401:
                 # Token expired - refresh and retry
                 logger.warning("Got 401 on get_clip, attempting token refresh...")
-                self._refresh_access_token()
+                self._refresh()
                 headers["Authorization"] = f"Bearer {self.access_token}"
                 response = requests.get(
                     "https://api.twitch.tv/helix/clips",

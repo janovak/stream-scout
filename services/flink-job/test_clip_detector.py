@@ -120,7 +120,7 @@ class TestTwitchAPIClient:
         clip_data = client.get_clip("nonexistent_clip")
         assert clip_data is None
 
-    @patch("clip_detector_job.requests.post")
+    @patch("token_manager.requests.post")
     def test_token_refresh_on_expiry(self, mock_post, token_file):
         """Token should be refreshed when expired."""
         # First call for token refresh
@@ -133,7 +133,7 @@ class TestTwitchAPIClient:
         client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
         client.access_token = None  # Force token refresh
 
-        client._refresh_access_token()
+        client._refresh()
 
         assert client.access_token == "new_token"
 

@@ -7,131 +7,242 @@ Tests token management, message processing, and service components.
 
 import json
 import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from token_manager import TokenManager
+from token_manager import TokenRecord, TwitchCredentials
 
 
-class TestTokenManager:
-    """Tests for TokenManager class."""
+class TestTwitchCredentials:
+    """Tests for TwitchCredentials -- real file I/O via tmp_path, zero mocks
+    except `requests`, patched at the module seam for refresh()."""
 
-    def test_load_tokens_success(self, tmp_path):
-        """Successfully load valid token file."""
+    def test_load_returns_token_record(self, tmp_path):
+        """Successfully load a valid token file."""
         token_file = tmp_path / "tokens.json"
-        token_data = {
+        token_file.write_text(json.dumps({
             "access_token": "test_access_token",
             "refresh_token": "test_refresh_token",
             "scopes": ["chat:read", "clips:edit"],
             "created_at": "2026-01-11T00:00:00Z",
-        }
-        token_file.write_text(json.dumps(token_data))
+        }))
 
-        manager = TokenManager(token_file)
-        access, refresh, scopes = manager.load_tokens()
+        record = TwitchCredentials(token_file).load()
 
-        assert access == "test_access_token"
-        assert refresh == "test_refresh_token"
-        assert scopes == ["chat:read", "clips:edit"]
+        assert record == TokenRecord(
+            access_token="test_access_token",
+            refresh_token="test_refresh_token",
+            scopes=["chat:read", "clips:edit"],
+            created_at="2026-01-11T00:00:00Z",
+            updated_at=None,
+        )
 
-    def test_load_tokens_file_not_found(self, tmp_path):
-        """Raise FileNotFoundError when token file doesn't exist."""
+    def test_load_seed_tool_record_loads_cleanly(self, tmp_path):
+        """A record shaped like seed_twitch_tokens.py writes it (created_at,
+        no updated_at) loads without error."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "seeded_access",
+            "refresh_token": "seeded_refresh",
+            "scopes": ["chat:read"],
+            "created_at": "2026-01-11T00:00:00Z",
+        }))
+
+        record = TwitchCredentials(token_file).load()
+
+        assert record.access_token == "seeded_access"
+        assert record.created_at == "2026-01-11T00:00:00Z"
+        assert record.updated_at is None
+
+    def test_load_missing_file_raises_error_naming_seed_tool(self, tmp_path):
+        """A missing token file should point the operator at the seed tool."""
         token_file = tmp_path / "nonexistent.json"
-        manager = TokenManager(token_file)
 
-        with pytest.raises(FileNotFoundError):
-            manager.load_tokens()
+        with pytest.raises(FileNotFoundError, match="seed_twitch_tokens.py"):
+            TwitchCredentials(token_file).load()
 
-    def test_load_tokens_missing_access_token(self, tmp_path):
-        """Raise ValueError when access_token is missing."""
-        token_file = tmp_path / "tokens.json"
-        token_data = {
-            "refresh_token": "test_refresh_token",
-            "scopes": ["chat:read"],
-        }
-        token_file.write_text(json.dumps(token_data))
-
-        manager = TokenManager(token_file)
-
-        with pytest.raises(ValueError, match="missing access_token"):
-            manager.load_tokens()
-
-    def test_load_tokens_missing_refresh_token(self, tmp_path):
-        """Raise ValueError when refresh_token is missing."""
-        token_file = tmp_path / "tokens.json"
-        token_data = {
-            "access_token": "test_access_token",
-            "scopes": ["chat:read"],
-        }
-        token_file.write_text(json.dumps(token_data))
-
-        manager = TokenManager(token_file)
-
-        with pytest.raises(ValueError, match="missing.*refresh_token"):
-            manager.load_tokens()
-
-    def test_load_tokens_invalid_json(self, tmp_path):
-        """Raise JSONDecodeError when file contains invalid JSON."""
+    def test_load_malformed_json_raises_clear_error(self, tmp_path):
+        """Malformed JSON should raise JSONDecodeError, not something opaque."""
         token_file = tmp_path / "tokens.json"
         token_file.write_text("not valid json {{{")
 
-        manager = TokenManager(token_file)
-
         with pytest.raises(json.JSONDecodeError):
-            manager.load_tokens()
+            TwitchCredentials(token_file).load()
 
-    def test_save_tokens_creates_file(self, tmp_path):
-        """save_tokens should create file if it doesn't exist."""
-        token_file = tmp_path / "subdir" / "tokens.json"
-        manager = TokenManager(token_file)
-        manager._scopes = ["chat:read"]
-
-        manager.save_tokens("new_access", "new_refresh")
-
-        assert token_file.exists()
-        data = json.loads(token_file.read_text())
-        assert data["access_token"] == "new_access"
-        assert data["refresh_token"] == "new_refresh"
-        assert data["scopes"] == ["chat:read"]
-        assert "updated_at" in data
-
-    def test_save_tokens_overwrites_existing(self, tmp_path):
-        """save_tokens should overwrite existing file."""
+    def test_load_missing_access_token_raises(self, tmp_path):
+        """Raise ValueError when access_token is missing."""
         token_file = tmp_path / "tokens.json"
-        token_file.write_text(json.dumps({"old": "data"}))
-
-        manager = TokenManager(token_file)
-        manager._scopes = ["clips:edit"]
-        manager.save_tokens("new_access", "new_refresh")
-
-        data = json.loads(token_file.read_text())
-        assert data["access_token"] == "new_access"
-        assert "old" not in data
-
-    def test_properties_return_cached_values(self, tmp_path):
-        """Properties should return cached token values after loading."""
-        token_file = tmp_path / "tokens.json"
-        token_data = {
-            "access_token": "cached_access",
-            "refresh_token": "cached_refresh",
+        token_file.write_text(json.dumps({
+            "refresh_token": "test_refresh_token",
             "scopes": ["chat:read"],
+        }))
+
+        with pytest.raises(ValueError, match="access_token"):
+            TwitchCredentials(token_file).load()
+
+    def test_load_missing_refresh_token_raises(self, tmp_path):
+        """Raise ValueError when refresh_token is missing."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "test_access_token",
+            "scopes": ["chat:read"],
+        }))
+
+        with pytest.raises(ValueError, match="refresh_token"):
+            TwitchCredentials(token_file).load()
+
+    def test_persist_preserves_scopes_and_created_at_without_prior_load(self, tmp_path):
+        """This is the bug that exists today: a caller that never called
+        `load` first must not blank out scopes/created_at on persist."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "scopes": ["chat:read", "clips:edit"],
+            "created_at": "2026-01-11T00:00:00Z",
+        }))
+
+        record = TwitchCredentials(token_file).persist("new_access", "new_refresh")
+
+        assert record.scopes == ["chat:read", "clips:edit"]
+        assert record.created_at == "2026-01-11T00:00:00Z"
+        data = json.loads(token_file.read_text())
+        assert data["scopes"] == ["chat:read", "clips:edit"]
+        assert data["created_at"] == "2026-01-11T00:00:00Z"
+
+    def test_persist_sets_updated_at(self, tmp_path):
+        """persist should stamp updated_at on every write."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "scopes": [],
+        }))
+
+        record = TwitchCredentials(token_file).persist("new_access", "new_refresh")
+
+        assert record.updated_at is not None
+        data = json.loads(token_file.read_text())
+        assert data["updated_at"] == record.updated_at
+
+    def test_persist_interrupted_write_leaves_previous_file_intact(self, tmp_path):
+        """A crash between the temp-file write and the atomic replace must
+        not corrupt or lose the previous file."""
+        token_file = tmp_path / "tokens.json"
+        original = {
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "scopes": ["chat:read"],
+            "created_at": "2026-01-11T00:00:00Z",
         }
-        token_file.write_text(json.dumps(token_data))
+        token_file.write_text(json.dumps(original))
 
-        manager = TokenManager(token_file)
-        manager.load_tokens()
+        with patch("token_manager.os.replace", side_effect=OSError("simulated crash")):
+            with pytest.raises(OSError):
+                TwitchCredentials(token_file).persist("new_access", "new_refresh")
 
-        assert manager.access_token == "cached_access"
-        assert manager.refresh_token == "cached_refresh"
-        assert manager.scopes == ["chat:read"]
+        assert json.loads(token_file.read_text()) == original
+        assert list(tmp_path.glob(".tmp-tokens-*")) == []
 
-    def test_default_token_file_path(self):
-        """TokenManager should use default path when none specified."""
-        manager = TokenManager()
-        assert manager.token_file == Path("/app/secrets/twitch_user_tokens.json")
+    @patch("token_manager.requests.post")
+    def test_refresh_stores_rotated_refresh_token(self, mock_post, tmp_path):
+        """refresh should store the new refresh token when Twitch rotates it."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "scopes": ["clips:edit"],
+            "created_at": "2026-01-11T00:00:00Z",
+        }))
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {
+            "access_token": "new_access",
+            "refresh_token": "rotated_refresh",
+            "expires_in": 3600,
+        }
+
+        record = TwitchCredentials(token_file).refresh("client_id", "client_secret")
+
+        assert record.access_token == "new_access"
+        assert record.refresh_token == "rotated_refresh"
+        assert record.scopes == ["clips:edit"]
+        assert record.created_at == "2026-01-11T00:00:00Z"
+
+    @patch("token_manager.requests.post")
+    def test_refresh_keeps_old_refresh_token_when_omitted(self, mock_post, tmp_path):
+        """refresh should keep the old refresh token when Twitch's response
+        omits a new one."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "scopes": [],
+        }))
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {
+            "access_token": "new_access",
+            "expires_in": 3600,
+        }
+
+        record = TwitchCredentials(token_file).refresh("client_id", "client_secret")
+
+        assert record.access_token == "new_access"
+        assert record.refresh_token == "old_refresh"
+
+    def test_concurrent_refreshes_serialize(self, tmp_path):
+        """Two TwitchCredentials instances refreshing the same file at once
+        must not interleave -- one waits for the other, and the file is
+        never torn."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "scopes": [],
+        }))
+
+        intervals = []
+        intervals_lock = threading.Lock()
+
+        def fake_post(*args, **kwargs):
+            start = time.monotonic()
+            time.sleep(0.05)
+            end = time.monotonic()
+            with intervals_lock:
+                intervals.append((start, end))
+            response = MagicMock()
+            response.status_code = 200
+            response.json.return_value = {
+                "access_token": f"access-{start}",
+                "refresh_token": f"refresh-{start}",
+                "expires_in": 3600,
+            }
+            return response
+
+        results = []
+
+        def run():
+            creds = TwitchCredentials(token_file)
+            results.append(creds.refresh("client_id", "client_secret"))
+
+        with patch("token_manager.requests.post", side_effect=fake_post):
+            threads = [threading.Thread(target=run) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert len(results) == 2
+        (s1, e1), (s2, e2) = intervals
+        assert e1 <= s2 or e2 <= s1, "refreshes overlapped -- lock did not serialize them"
+
+        # File is valid JSON with the winning refresh's values -- never torn.
+        data = json.loads(token_file.read_text())
+        assert data["access_token"] in {r.access_token for r in results}
 
 
 class TestMessagePayload:
