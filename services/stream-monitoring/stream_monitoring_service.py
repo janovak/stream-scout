@@ -28,7 +28,7 @@ from twitchAPI.chat import Chat, ChatMessage, EventData
 from twitchAPI.twitch import Twitch
 from twitchAPI.type import AuthScope, ChatEvent
 
-from token_manager import TokenManager, get_token_manager
+from token_manager import TwitchCredentials, get_credentials
 
 
 # Configuration
@@ -98,7 +98,7 @@ class StreamMonitoringService:
         self.kafka_producer: Optional[Producer] = None
         self.db_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
         self.redis_client: Optional[redis.Redis] = None
-        self.token_manager: Optional[TokenManager] = None
+        self.credentials: Optional[TwitchCredentials] = None
         self.running = True
         self.joined_channels: Set[str] = set()
         self.broadcaster_ids: Dict[str, int] = {}  # login -> id mapping
@@ -106,8 +106,8 @@ class StreamMonitoringService:
     async def _on_token_refresh(self, access_token: str, refresh_token: str):
         """Callback invoked when tokens are refreshed by pyTwitchAPI."""
         logger.info("Twitch tokens refreshed, persisting to file")
-        if self.token_manager:
-            self.token_manager.save_tokens(access_token, refresh_token)
+        if self.credentials:
+            self.credentials.persist(access_token, refresh_token)
 
     async def initialize(self):
         """Initialize all connections and services."""
@@ -117,13 +117,13 @@ class StreamMonitoringService:
         self.twitch = await Twitch(TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET)
 
         # Load user tokens from file and set up user authentication
-        self.token_manager = get_token_manager()
+        self.credentials = get_credentials()
         try:
-            access_token, refresh_token, scopes = self.token_manager.load_tokens()
+            record = self.credentials.load()
 
             # Convert scope strings to AuthScope enums
             auth_scopes = []
-            for scope in scopes:
+            for scope in record.scopes:
                 if scope == "chat:read":
                     auth_scopes.append(AuthScope.CHAT_READ)
                 elif scope == "clips:edit":
@@ -131,16 +131,16 @@ class StreamMonitoringService:
 
             # Set user authentication with loaded tokens
             await self.twitch.set_user_authentication(
-                access_token,
+                record.access_token,
                 auth_scopes,
-                refresh_token
+                record.refresh_token
             )
 
             # Register callback for token refresh
             self.twitch.user_auth_refresh_callback = self._on_token_refresh
 
             logger.info("User authentication configured with pre-seeded tokens", extra={
-                "scopes": scopes
+                "scopes": record.scopes
             })
 
         except FileNotFoundError as e:

@@ -139,6 +139,7 @@ services:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
       - ./services/flink-job/spike_detector.py:/opt/flink/usrlib/spike_detector.py:ro
+      - ./services/flink-job/token_manager.py:/opt/flink/usrlib/token_manager.py:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -191,6 +192,7 @@ services:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
       - ./services/flink-job/spike_detector.py:/opt/flink/usrlib/spike_detector.py:ro
+      - ./services/flink-job/token_manager.py:/opt/flink/usrlib/token_manager.py:ro
     depends_on:
       - flink-jobmanager
     networks:
@@ -222,6 +224,7 @@ services:
     volumes:
       - ./secrets:/app/secrets:rw
       - ./services/stream-monitoring/stream_monitoring_service.py:/app/stream_monitoring_service.py:ro
+      - ./services/stream-monitoring/token_manager.py:/app/token_manager.py:ro
     depends_on:
       postgres:
         condition: service_healthy

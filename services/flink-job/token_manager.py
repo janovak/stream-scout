@@ -4,9 +4,9 @@ Twitch OAuth Credentials
 One module, one record shape, for the on-disk Twitch token file that
 stream-monitoring and the Flink clip-detector job both read and write.
 
-Duplicated at services/flink-job/token_manager.py -- the two build contexts
-are per-service, so this file cannot be a real shared import. Keep both
-copies identical.
+Duplicated at services/stream-monitoring/token_manager.py -- the two build
+contexts are per-service, so this file cannot be a real shared import. Keep
+both copies identical.
 """
 
 import fcntl
