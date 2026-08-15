@@ -234,6 +234,9 @@ class TwitchAPIClient:
         except ValueError as e:
             logger.error(f"TOKEN FILE INVALID: {e}")
             raise TokenValidationError(str(e))
+        except Exception as e:
+            logger.error(f"TOKEN FILE READ ERROR: {self.token_file} - {e}")
+            raise TokenValidationError(f"Failed to read token file: {e}")
 
         self.access_token = record.access_token
         self.refresh_token = record.refresh_token
