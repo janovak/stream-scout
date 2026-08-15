@@ -129,11 +129,25 @@ services:
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
       - DETECTION_WINDOW_SECONDS=5
-      - DETECTION_BASELINE_SECONDS=10
-      # Deliberately below the lowest displayed level (7), so clips between 5 and 7
-      # are collected but not shown. See spec 002 FR-001b. Raising it above 7 empties
-      # a UI level.
+      # Restored to the original 5 minutes (Plan 06 step 12). Commit c7afdab, a
+      # frontend change, dropped this to 10 and never put it back. Costs a ~4
+      # minute warm-up per channel, which the join/leave hysteresis in
+      # stream-monitoring exists to cover.
+      - DETECTION_BASELINE_SECONDS=300
+      # The trigger, in standard deviations above the baseline mean. Read by
+      # DetectorConfig.k -- the variable keeps its old name, which spec 002
+      # FR-001b refers to.
+      #
+      # 5.0 is inherited from the old formula and is NOT meaningful on the new
+      # scale: it was set just below the lowest displayed level (7) back when
+      # resting traffic scored 7-17, and Plan 06 Phase 3 removed that pedestal.
+      # Phase 4 picks the real value off the corpus distribution, and the
+      # 7/9/11 display levels have to be renumbered against the new range.
       - DETECTION_STD_DEV_THRESHOLD=5.0
+      # How long one elevation episode may run before the detector fires
+      # anyway. Untuned placeholder -- Phase 4 step 19 sets this from real
+      # spike durations.
+      - DETECTION_HOLD_CAP_SECONDS=60
       - DETECTION_COOLDOWN_SECONDS=30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
@@ -183,11 +197,25 @@ services:
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
       - METRICS_PORT=9250
       - DETECTION_WINDOW_SECONDS=5
-      - DETECTION_BASELINE_SECONDS=10
-      # Deliberately below the lowest displayed level (7), so clips between 5 and 7
-      # are collected but not shown. See spec 002 FR-001b. Raising it above 7 empties
-      # a UI level.
+      # Restored to the original 5 minutes (Plan 06 step 12). Commit c7afdab, a
+      # frontend change, dropped this to 10 and never put it back. Costs a ~4
+      # minute warm-up per channel, which the join/leave hysteresis in
+      # stream-monitoring exists to cover.
+      - DETECTION_BASELINE_SECONDS=300
+      # The trigger, in standard deviations above the baseline mean. Read by
+      # DetectorConfig.k -- the variable keeps its old name, which spec 002
+      # FR-001b refers to.
+      #
+      # 5.0 is inherited from the old formula and is NOT meaningful on the new
+      # scale: it was set just below the lowest displayed level (7) back when
+      # resting traffic scored 7-17, and Plan 06 Phase 3 removed that pedestal.
+      # Phase 4 picks the real value off the corpus distribution, and the
+      # 7/9/11 display levels have to be renumbered against the new range.
       - DETECTION_STD_DEV_THRESHOLD=5.0
+      # How long one elevation episode may run before the detector fires
+      # anyway. Untuned placeholder -- Phase 4 step 19 sets this from real
+      # spike durations.
+      - DETECTION_HOLD_CAP_SECONDS=60
       - DETECTION_COOLDOWN_SECONDS=30
       - CLIP_INITIAL_DELAY_SECONDS=10
       - CLIP_CREATE_RETRY_DELAYS=0,2,4
