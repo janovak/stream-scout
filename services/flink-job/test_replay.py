@@ -77,6 +77,37 @@ def test_idle_key_evaluated_by_other_keys_traffic_then_chain_lapses():
     assert 2 not in replayer._states or not replayer._states[2].counts
 
 
+def test_future_buckets_already_in_state_are_excluded_from_evaluate():
+    """Regression: a message for second+1..+bound can already be counted by
+    the time `second`'s own timer fires (its timer only needs the watermark
+    to pass `second`, and the watermark itself needs those later messages to
+    have already arrived and been counted). evaluate() has no upper bound on
+    ts_bucket -- that invariant used to be guaranteed by the caller when
+    now_seconds was real wall-clock time -- so without filtering, those
+    future buckets leak into `second`'s baseline and window and can
+    manufacture a spike that was never really there."""
+    replayer = EventTimeReplayer(CONFIG)  # window=5, baseline=10
+
+    # Steady baseline: buckets 990..1000, one message each -- uniform, so
+    # std=0 and evaluate() can never fire a spike from this alone.
+    evaluations = []
+    for second in range(990, 1001):
+        evaluations.extend(replayer.feed(1, sent_at_ms=second * 1000))
+
+    # A heavy burst for 1001..1005 lands in state before bucket 1000's timer
+    # becomes due (needs watermark >= 1000000, i.e. max_sent_at_ms >= 1005001).
+    for second in range(1001, 1006):
+        for _ in range(100):
+            evaluations.extend(replayer.feed(1, sent_at_ms=second * 1000))
+
+    # One more message pushes the watermark past bucket 1000's boundary.
+    evaluations.extend(replayer.feed(1, sent_at_ms=1005 * 1000 + 1))
+
+    fired_for_1000 = [e for e in evaluations if e.second == 1000]
+    assert len(fired_for_1000) == 1
+    assert fired_for_1000[0].spike is None  # not the spurious spike the future burst would manufacture
+
+
 def test_command_messages_filtered_like_production_commandfilter():
     lines = [
         msg(1, 1000 * 1000, text="hello"),

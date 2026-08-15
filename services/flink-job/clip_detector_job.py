@@ -518,9 +518,13 @@ class SentAtTimestampAssigner(TimestampAssigner):
 
     def extract_timestamp(self, value: str, record_timestamp: int) -> int:
         try:
-            return json.loads(value)["sent_at"]
+            sent_at = json.loads(value)["sent_at"]
         except (json.JSONDecodeError, KeyError):
             return record_timestamp
+        # sent_at is present-but-null, not just missing: fall back rather
+        # than handing None to Flink's timestamp assignment, which expects
+        # an int and isn't guarded against it.
+        return record_timestamp if sent_at is None else sent_at
 
 
 class AnomalyDetector(KeyedProcessFunction):
@@ -591,17 +595,32 @@ class AnomalyDetector(KeyedProcessFunction):
         broadcaster_id = ctx.get_current_key()
         try:
             now_seconds = timestamp // 1000
-            counts = {ts: self.message_counts.get(ts) for ts in self.message_counts.keys()}
-            decision = evaluate(counts, now_seconds, self.last_anomaly_time.value(), self.config)
+            all_counts = {ts: self.message_counts.get(ts) for ts in self.message_counts.keys()}
+
+            # A message for second now_seconds+1..+5 can already be in
+            # MapState by the time now_seconds's timer fires -- its own timer
+            # only requires the watermark to pass now_seconds, but the
+            # watermark itself only advances that far once messages up to
+            # ~now_seconds + WATERMARK_OUT_OF_ORDERNESS_SECONDS have already
+            # arrived and been counted in process_element. evaluate() has no
+            # upper bound on ts_bucket (that invariant used to be guaranteed
+            # by the caller, back when now_seconds was real wall-clock time
+            # and no bucket could exceed it) so without this filter, future
+            # buckets already sitting in state would leak into "now_seconds"'s
+            # baseline/window.
+            counts_as_of_now = {ts: c for ts, c in all_counts.items() if ts <= now_seconds}
+            decision = evaluate(counts_as_of_now, now_seconds, self.last_anomaly_time.value(), self.config)
 
             for expired_bucket in decision.expired_buckets:
                 self.message_counts.remove(expired_bucket)
-                counts.pop(expired_bucket, None)
+                all_counts.pop(expired_bucket, None)
 
             # Keep the per-second cadence going only while this key still has
             # data in its baseline -- an idle broadcaster's chain lapses here
-            # and a later message restarts it from process_element.
-            if counts:
+            # and a later message restarts it from process_element. Checked
+            # against all_counts (not counts_as_of_now): a future bucket that
+            # was excluded above still needs its own future timer.
+            if all_counts:
                 ctx.timer_service().register_event_time_timer(timestamp + 1000)
 
             if decision.spike:

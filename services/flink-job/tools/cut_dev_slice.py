@@ -30,10 +30,20 @@ def parse_args():
     return parser.parse_args()
 
 
+def parse_utc_ms(value: str, flag: str) -> int:
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        # A naive datetime's .timestamp() is interpreted in the host's local
+        # timezone, not UTC -- silently slicing the wrong window against
+        # sent_at, which is always UTC. Require an explicit offset instead.
+        raise SystemExit(f"{flag} must include a UTC offset (e.g. '+00:00'), got: {value!r}")
+    return int(dt.timestamp() * 1000)
+
+
 def main():
     args = parse_args()
-    start_ms = int(datetime.fromisoformat(args.start).timestamp() * 1000)
-    end_ms = int(datetime.fromisoformat(args.end).timestamp() * 1000)
+    start_ms = parse_utc_ms(args.start, "--start")
+    end_ms = parse_utc_ms(args.end, "--end")
 
     kept = 0
     seen = 0

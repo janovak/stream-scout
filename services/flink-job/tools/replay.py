@@ -144,7 +144,17 @@ class EventTimeReplayer:
 
     def _fire(self, broadcaster_id: int, second: int) -> Evaluation:
         state = self._states[broadcaster_id]
-        decision = evaluate(dict(state.counts), second, state.last_spike_ms, self.config)
+        # A message for second+1..second+bound can already be in state.counts
+        # by the time second's timer fires (its timer only needs the
+        # watermark to pass `second`, which itself only advances that far
+        # once later messages have already arrived and been counted in
+        # feed()). evaluate() has no upper bound on ts_bucket -- that
+        # invariant used to be guaranteed by the caller when now_seconds was
+        # real wall-clock time -- so future buckets must be filtered out here
+        # or they'd leak into "second"'s baseline/window. Mirrors
+        # clip_detector_job.py AnomalyDetector.on_timer.
+        counts_as_of_second = {ts: c for ts, c in state.counts.items() if ts <= second}
+        decision = evaluate(counts_as_of_second, second, state.last_spike_ms, self.config)
 
         for expired_bucket in decision.expired_buckets:
             state.counts.pop(expired_bucket, None)
