@@ -30,10 +30,12 @@ would. Do not treat a clean harness/production diff as proof production
 would also fire at that instant -- verify against a live run before relying
 on this for anything beyond internal-consistency and determinism checks.
 
-Note evaluate()'s own arithmetic (the baseline/window overlap, the unit
-mismatch) is untouched here -- that's Plan 06 Phase 3, deliberately a
-separate change. This harness's job is to prove the timing migration is
-correct and deterministic before the math underneath it changes.
+Since Plan 06 Phase 3 this also carries evaluate()'s peak-hold state: an
+elevation episode spans many seconds, so `_KeyState` persists the open hold
+and the last firing second between evaluations exactly as AnomalyDetector
+persists them in Flink ValueState. A printed SPIKE line is therefore the end
+of an episode, and the measurement on it is the peak's -- see
+format_evaluation.
 """
 
 import heapq
@@ -49,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from spike_detector import (  # noqa: E402
     DetectorConfig,
+    HoldState,
     WATERMARK_OUT_OF_ORDERNESS_SECONDS,
     evaluate,
     is_command,
@@ -59,15 +62,18 @@ WATERMARK_OUT_OF_ORDERNESS_MS = WATERMARK_OUT_OF_ORDERNESS_SECONDS * 1000
 
 @dataclass
 class _KeyState:
+    """Stands in for AnomalyDetector's three keyed states, in the same units."""
+
     counts: Dict[int, int] = field(default_factory=dict)
-    last_spike_ms: Optional[int] = None
+    hold: Optional[HoldState] = None
+    last_fire_second: Optional[int] = None
 
 
 @dataclass(frozen=True)
 class Evaluation:
     broadcaster_id: int
     second: int
-    spike: object  # spike_detector.Spike | None
+    emit: object  # spike_detector.Spike | None -- the peak, when an episode ended here
 
 
 class EventTimeReplayer:
@@ -154,10 +160,14 @@ class EventTimeReplayer:
         # or they'd leak into "second"'s baseline/window. Mirrors
         # clip_detector_job.py AnomalyDetector.on_timer.
         counts_as_of_second = {ts: c for ts, c in state.counts.items() if ts <= second}
-        decision = evaluate(counts_as_of_second, second, state.last_spike_ms, self.config)
+        decision = evaluate(
+            counts_as_of_second, second, state.hold, state.last_fire_second, self.config
+        )
 
         for expired_bucket in decision.expired_buckets:
             state.counts.pop(expired_bucket, None)
+
+        state.hold = decision.hold
 
         # Keep the per-second cadence going only while this key still has
         # data in its baseline -- an idle broadcaster's chain lapses here and
@@ -166,10 +176,12 @@ class EventTimeReplayer:
         if state.counts:
             self._register_timer(broadcaster_id, second + 1)
 
-        if decision.spike is not None:
-            state.last_spike_ms = second * 1000
+        # The cooldown runs from the firing second, not from the peak the
+        # emitted Spike carries -- matches AnomalyDetector.on_timer.
+        if decision.emit is not None:
+            state.last_fire_second = second
 
-        return Evaluation(broadcaster_id=broadcaster_id, second=second, spike=decision.spike)
+        return Evaluation(broadcaster_id=broadcaster_id, second=second, emit=decision.emit)
 
 
 def replay(lines: Iterable[str], config: DetectorConfig) -> Iterator[Evaluation]:
@@ -186,11 +198,15 @@ def replay(lines: Iterable[str], config: DetectorConfig) -> Iterator[Evaluation]
 
 
 def format_evaluation(evaluation: Evaluation) -> str:
-    spike = evaluation.spike
+    spike = evaluation.emit
     if spike is None:
         return f"{evaluation.second} {evaluation.broadcaster_id} no-spike"
+    # The leading second is when the episode ended and the detector fired;
+    # peak_at is the second the reported measurement was taken, and is what
+    # reaches the clips table as detected_at.
     return (
         f"{evaluation.second} {evaluation.broadcaster_id} SPIKE "
+        f"peak_at={spike.detected_at_seconds} "
         f"count={spike.message_count} mean={spike.baseline_mean:.4f} "
         f"std={spike.baseline_std:.4f} intensity={spike.intensity:.4f}"
     )

@@ -20,7 +20,7 @@ import requests
 from prometheus_client import Counter, Gauge, start_http_server
 from pyflink.common import Row, Types, WatermarkStrategy
 from pyflink.common.serialization import SimpleStringSchema
-from pyflink.common.time import Duration
+from pyflink.common.time import Duration, Time
 from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.datastream import (
     KeyedProcessFunction,
@@ -32,10 +32,20 @@ from pyflink.datastream.connectors.kafka import (
     KafkaOffsetsInitializer,
     KafkaSource,
 )
-from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
+from pyflink.datastream.state import (
+    MapStateDescriptor,
+    StateTtlConfig,
+    ValueStateDescriptor,
+)
 
 from clip_attempt import ClipAttempt, ClipPolicy, RealClock
-from spike_detector import DetectorConfig, WATERMARK_OUT_OF_ORDERNESS_SECONDS, evaluate, is_command
+from spike_detector import (
+    DetectorConfig,
+    HoldState,
+    WATERMARK_OUT_OF_ORDERNESS_SECONDS,
+    evaluate,
+    is_command,
+)
 from token_manager import TwitchCredentials
 
 # Configuration
@@ -539,13 +549,61 @@ class AnomalyDetector(KeyedProcessFunction):
     Per-message evaluation depends on message interleaving, so it can't
     replay deterministically; per-second timers can. See
     tools/replay.py for the pure-Python equivalent this mirrors.
+
+    Peak-hold (Plan 06 Phase 3): the detector no longer reports a spike at the
+    second that first crosses the trigger. evaluate() opens a hold and records
+    the highest intensity while chat stays elevated. It reports one result when
+    the period ends or when the cap is reached. That result carries the value
+    and the timestamp of the peak. This operator keeps the hold between
+    seconds. It also stamps the anomaly with the second of the peak, not the
+    second of the report.
     """
 
     def __init__(self):
         self.message_counts = None  # MapState: event-time second (sent_at bucket) -> count
-        self.last_anomaly_time = None  # ValueState: last anomaly timestamp, event-time ms
+        self.hold = None  # ValueState: HoldState as JSON, or null when no episode is open
+        self.last_fire_second = None  # ValueState: event-time second of the last emit
         self.config = None
         self.subtask_index = 0
+
+    def _state_ttl(self):
+        """
+        TTL for the keyed state of this operator (Plan 06 step 16).
+
+        Which state leaks, exactly: `last_fire_second` is written when the
+        detector reports a spike and is never cleared, so one entry stays for
+        every broadcaster that ever produced a clip. `hold` stays if a period
+        is open when the watermark stops. `message_counts` does not leak --
+        on_timer expires its buckets and re-arms the timer only while buckets
+        remain, so it empties itself after a broadcaster goes offline. The TTL
+        covers all three anyway, because a per-key leak of any size is
+        unbounded over the life of the job.
+
+        Size: the TTL must be longer than the span of buckets that one key
+        keeps, or the TTL could delete a bucket that the baseline still needs.
+        MapState applies the TTL per entry with OnCreateAndWrite, so each
+        bucket's clock starts at its single write and must survive
+        config.retained_seconds. The factor of 4 gives room for event time to
+        run behind processing time, which is what the TTL measures.
+
+        NeverReturnExpired is important for `hold`. If the whole pipeline goes
+        quiet with a period open, the watermark stops, no timer runs, and the
+        hold stays in state. See the event-time note in
+        plans/06-detection-math.md. This setting makes a stale hold read back
+        as absent. The detector therefore cannot report a peak from hours ago.
+        """
+        return (
+            StateTtlConfig
+            .new_builder(Time.seconds(self.config.retained_seconds * 4))
+            .set_update_type(StateTtlConfig.UpdateType.OnCreateAndWrite)
+            .set_state_visibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+            # run_cleanup_for_every_record is False. The timer chain already
+            # reads all three states once per key per second, and incremental
+            # cleanup runs on those accesses. True would add three cleanup
+            # scans to every chat message on the hot path instead.
+            .cleanup_incrementally(10, False)
+            .build()
+        )
 
     def open(self, runtime_context):
         # Start the metrics server here so it comes up on the first chat
@@ -561,13 +619,29 @@ class AnomalyDetector(KeyedProcessFunction):
         # entirely: "TypeError: cannot pickle '_thread.lock' object").
         self.subtask_index = runtime_context.get_index_of_this_subtask()
         _init_metrics(self.subtask_index)
-        self.message_counts = runtime_context.get_map_state(
-            MapStateDescriptor("message_counts", Types.LONG(), Types.INT())
-        )
-        self.last_anomaly_time = runtime_context.get_state(
-            ValueStateDescriptor("last_anomaly_time", Types.LONG())
-        )
         self.config = DetectorConfig.from_env()
+
+        ttl_config = self._state_ttl()
+
+        counts_descriptor = MapStateDescriptor("message_counts", Types.LONG(), Types.INT())
+        counts_descriptor.enable_time_to_live(ttl_config)
+        self.message_counts = runtime_context.get_map_state(counts_descriptor)
+
+        # Flink has no TypeInformation for a dataclass, so the hold travels as
+        # JSON -- HoldState.to_json/from_json own the encoding.
+        hold_descriptor = ValueStateDescriptor("hold", Types.STRING())
+        hold_descriptor.enable_time_to_live(ttl_config)
+        self.hold = runtime_context.get_state(hold_descriptor)
+
+        # This state was "last_anomaly_time" and held event-time milliseconds.
+        # It now holds event-time seconds, which is what evaluate() accepts.
+        # The new name is deliberate. The same name would let Flink restore
+        # milliseconds into a field that reads seconds, with no error.
+        # Checkpointing is off for this job (see flink-conf.yaml), so Flink
+        # restores nothing today.
+        last_fire_descriptor = ValueStateDescriptor("last_fire_second", Types.LONG())
+        last_fire_descriptor.enable_time_to_live(ttl_config)
+        self.last_fire_second = runtime_context.get_state(last_fire_descriptor)
 
     def process_element(self, value, ctx: KeyedProcessFunction.Context) -> None:
         try:
@@ -595,7 +669,13 @@ class AnomalyDetector(KeyedProcessFunction):
         broadcaster_id = ctx.get_current_key()
         try:
             now_seconds = timestamp // 1000
-            all_counts = {ts: self.message_counts.get(ts) for ts in self.message_counts.keys()}
+            # items() reads the map in one pass. keys() plus one get() per key
+            # costs one state access per bucket, which is ~305 accesses per
+            # broadcaster per second at baseline_seconds=300. It can also
+            # return None for a key that keys() just listed, because the TTL
+            # filter runs per access. Drop any None for that reason: evaluate()
+            # adds these counts and cannot accept one.
+            all_counts = {ts: c for ts, c in self.message_counts.items() if c is not None}
 
             # A message for second now_seconds+1..+5 can already be in
             # MapState by the time now_seconds's timer fires -- its own timer
@@ -609,36 +689,80 @@ class AnomalyDetector(KeyedProcessFunction):
             # buckets already sitting in state would leak into "now_seconds"'s
             # baseline/window.
             counts_as_of_now = {ts: c for ts, c in all_counts.items() if ts <= now_seconds}
-            decision = evaluate(counts_as_of_now, now_seconds, self.last_anomaly_time.value(), self.config)
+            hold = HoldState.from_json(self.hold.value())
+            decision = evaluate(
+                counts_as_of_now,
+                now_seconds,
+                hold,
+                self.last_fire_second.value(),
+                self.config,
+            )
 
             for expired_bucket in decision.expired_buckets:
                 self.message_counts.remove(expired_bucket)
                 all_counts.pop(expired_bucket, None)
+
+            # Keep the elevated period across seconds. Write only when the
+            # value changes. The code reads an open hold every second, so an
+            # unconditional write would store the same value up to 60 times in
+            # one period.
+            if decision.hold != hold:
+                if decision.hold is None:
+                    self.hold.clear()
+                else:
+                    self.hold.update(decision.hold.to_json())
 
             # Keep the per-second cadence going only while this key still has
             # data in its baseline -- an idle broadcaster's chain lapses here
             # and a later message restarts it from process_element. Checked
             # against all_counts (not counts_as_of_now): a future bucket that
             # was excluded above still needs its own future timer.
+            #
+            # The cap normally ends an open period long before this chain
+            # stops. DetectorConfig keeps hold_cap_seconds below
+            # baseline_seconds + window_seconds (60 against 305 at the
+            # defaults), and buckets stay for that full span after the last
+            # message. One case can still stop the chain with a period open: a
+            # watermark that stops, so no timer runs at all. The state TTL
+            # above covers it. evaluate() covers the other case itself, by
+            # removing a hold whose peak is older than the cap.
             if all_counts:
                 ctx.timer_service().register_event_time_timer(timestamp + 1000)
 
-            if decision.spike:
-                spike = decision.spike
-                self.last_anomaly_time.update(timestamp)
+            if decision.emit is not None:
+                spike = decision.emit
+                # The cooldown starts at the second of the report, which is
+                # now. It does not start at the peak, which can be up to
+                # hold_cap_seconds earlier.
+                self.last_fire_second.update(now_seconds)
 
+                # detected_at is the second of the peak, not this second. Plan
+                # 06 Phase 3: the clips table now records the time that chat
+                # reached its peak. Before, it recorded the time that the
+                # detector first crossed the trigger. Every other field below
+                # comes from that same peak second.
+                #
+                # WARNING: this increases the difference between detected_at
+                # and the content of the clip. ClipCreator still asks Twitch
+                # for the last 30 seconds at the time that it runs. A period
+                # that holds for longer than approximately 20 seconds thus
+                # produces a clip that does not contain its own peak. Phase 6
+                # (cutover) must correct this. The correction needs the
+                # duration and vod_offset data from Plan 04 and is out of scope
+                # for this phase. See plans/06-detection-math.md, Out of scope.
                 anomaly = {
                     "broadcaster_id": broadcaster_id,
-                    "detected_at": timestamp,
+                    "detected_at": spike.detected_at_seconds * 1000,
                     "message_count": spike.message_count,
                     "baseline_mean": spike.baseline_mean,
                     "baseline_std": spike.baseline_std,
                     "intensity": spike.intensity
                 }
-                threshold = spike.baseline_mean + (self.config.std_dev_threshold * spike.baseline_std)
                 logger.info(f"ANOMALY DETECTED for broadcaster {broadcaster_id}: "
-                           f"count={spike.message_count}, threshold={threshold:.2f}, mean={spike.baseline_mean:.2f}, "
-                           f"std={spike.baseline_std:.2f}, intensity={spike.intensity:.2f}")
+                           f"intensity={spike.intensity:.2f} (trigger k={self.config.k}), "
+                           f"peaked at {spike.detected_at_seconds} ({now_seconds - spike.detected_at_seconds}s ago), "
+                           f"count={spike.message_count}, mean={spike.baseline_mean:.2f}, "
+                           f"std={spike.baseline_std:.2f}")
                 _init_metrics(self.subtask_index)
                 if _anomalies_detected_total:
                     _anomalies_detected_total.labels(broadcaster_id=str(broadcaster_id)).inc()
@@ -816,7 +940,10 @@ def main():
     logger.info(f"  FLINK_PARALLELISM: {FLINK_PARALLELISM}")
     logger.info(f"  DETECTION_WINDOW_SECONDS: {detector_config.window_seconds}")
     logger.info(f"  DETECTION_BASELINE_SECONDS: {detector_config.baseline_seconds}")
-    logger.info(f"  DETECTION_STD_DEV_THRESHOLD: {detector_config.std_dev_threshold}")
+    # DetectorConfig calls this field `k`; the environment variable keeps its
+    # original name, which spec 002 FR-001b and docker-compose.yml refer to.
+    logger.info(f"  DETECTION_STD_DEV_THRESHOLD: {detector_config.k}")
+    logger.info(f"  DETECTION_HOLD_CAP_SECONDS: {detector_config.hold_cap_seconds}")
     logger.info(f"  DETECTION_COOLDOWN_SECONDS: {detector_config.cooldown_seconds}")
     logger.info(f"  TWITCH_CLIENT_ID: {'set' if TWITCH_CLIENT_ID else 'NOT SET'}")
     logger.info(f"  TWITCH_CLIENT_SECRET: {'set' if TWITCH_CLIENT_SECRET else 'NOT SET'}")

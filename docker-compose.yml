@@ -129,11 +129,38 @@ services:
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
       - DETECTION_WINDOW_SECONDS=5
-      - DETECTION_BASELINE_SECONDS=10
-      # Deliberately below the lowest displayed level (7), so clips between 5 and 7
-      # are collected but not shown. See spec 002 FR-001b. Raising it above 7 empties
-      # a UI level.
+      # Back to the first design value of 5 minutes (Plan 06 step 12). Commit
+      # c7afdab was a frontend change. It decreased this to 10 and did not
+      # restore it. The cost is a warm-up of approximately 4 minutes per
+      # channel (DETECTION_MIN_BASELINE_FRACTION x this value).
+      #
+      # The join/leave hysteresis in stream-monitoring (JOIN_THRESHOLD 15,
+      # LEAVE_THRESHOLD 30) helps here, but it does not remove the cost. Those
+      # thresholds are ranks, not times. They stop a channel near the rank
+      # boundary from leaving and rejoining. They do not guarantee that any
+      # channel stays monitored for 4 minutes. A channel that enters the top 15
+      # and leaves the top 30 within 4 minutes produces no detections.
+      - DETECTION_BASELINE_SECONDS=300
+      # The trigger, in standard deviations above the baseline mean.
+      # DetectorConfig reads this into its field `k`. The variable keeps its
+      # first name, because spec 002 FR-001b uses that name.
+      #
+      # WARNING: 5.0 comes from the earlier formula. It has no meaning on the
+      # new scale. The earlier formula added a constant offset, and 5.0 sat
+      # just below the lowest displayed level of 7. Plan 06 Phase 3 removed
+      # that offset. Flat chat now scores approximately 0, and the highest
+      # value measured on the dev-slice corpus is 6.11. Phase 4 selects the
+      # correct value from the corpus distribution. The display levels of
+      # 7, 9 and 11 in the frontend need new numbers at the same time.
       - DETECTION_STD_DEV_THRESHOLD=5.0
+      # The maximum length of one elevated period, before the detector reports
+      # a result. This value is a placeholder. Plan 06 Phase 4 step 19 sets it
+      # from the measured length of real spikes.
+      - DETECTION_HOLD_CAP_SECONDS=60
+      # How long the detector must watch a channel before it reports anything,
+      # as a fraction of DETECTION_BASELINE_SECONDS. This gate measures elapsed
+      # observation time, not how busy the channel is.
+      - DETECTION_MIN_BASELINE_FRACTION=0.8
       - DETECTION_COOLDOWN_SECONDS=30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
@@ -183,11 +210,38 @@ services:
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
       - METRICS_PORT=9250
       - DETECTION_WINDOW_SECONDS=5
-      - DETECTION_BASELINE_SECONDS=10
-      # Deliberately below the lowest displayed level (7), so clips between 5 and 7
-      # are collected but not shown. See spec 002 FR-001b. Raising it above 7 empties
-      # a UI level.
+      # Back to the first design value of 5 minutes (Plan 06 step 12). Commit
+      # c7afdab was a frontend change. It decreased this to 10 and did not
+      # restore it. The cost is a warm-up of approximately 4 minutes per
+      # channel (DETECTION_MIN_BASELINE_FRACTION x this value).
+      #
+      # The join/leave hysteresis in stream-monitoring (JOIN_THRESHOLD 15,
+      # LEAVE_THRESHOLD 30) helps here, but it does not remove the cost. Those
+      # thresholds are ranks, not times. They stop a channel near the rank
+      # boundary from leaving and rejoining. They do not guarantee that any
+      # channel stays monitored for 4 minutes. A channel that enters the top 15
+      # and leaves the top 30 within 4 minutes produces no detections.
+      - DETECTION_BASELINE_SECONDS=300
+      # The trigger, in standard deviations above the baseline mean.
+      # DetectorConfig reads this into its field `k`. The variable keeps its
+      # first name, because spec 002 FR-001b uses that name.
+      #
+      # WARNING: 5.0 comes from the earlier formula. It has no meaning on the
+      # new scale. The earlier formula added a constant offset, and 5.0 sat
+      # just below the lowest displayed level of 7. Plan 06 Phase 3 removed
+      # that offset. Flat chat now scores approximately 0, and the highest
+      # value measured on the dev-slice corpus is 6.11. Phase 4 selects the
+      # correct value from the corpus distribution. The display levels of
+      # 7, 9 and 11 in the frontend need new numbers at the same time.
       - DETECTION_STD_DEV_THRESHOLD=5.0
+      # The maximum length of one elevated period, before the detector reports
+      # a result. This value is a placeholder. Plan 06 Phase 4 step 19 sets it
+      # from the measured length of real spikes.
+      - DETECTION_HOLD_CAP_SECONDS=60
+      # How long the detector must watch a channel before it reports anything,
+      # as a fraction of DETECTION_BASELINE_SECONDS. This gate measures elapsed
+      # observation time, not how busy the channel is.
+      - DETECTION_MIN_BASELINE_FRACTION=0.8
       - DETECTION_COOLDOWN_SECONDS=30
       - CLIP_INITIAL_DELAY_SECONDS=10
       - CLIP_CREATE_RETRY_DELAYS=0,2,4
