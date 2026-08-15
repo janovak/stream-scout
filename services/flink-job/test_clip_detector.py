@@ -11,13 +11,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from clip_detector_job import (
-    COMMAND_PATTERN,
     AnomalyEvent,
     ChatMessage,
     ClipResult,
     TwitchAPIClient,
     TwitchAPIError,
 )
+from spike_detector import COMMAND_PATTERN
 
 
 class TestCommandFilter:

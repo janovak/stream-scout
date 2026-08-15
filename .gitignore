@@ -71,5 +71,9 @@ temp/
 # Throwaway remediation plans (architecture review 2026-08-12)
 plans/
 
+# Replay-harness dev/test corpus slices (Plan 06) -- large, regenerate with
+# services/flink-job/tools/cut_dev_slice.py from ~/stream-scout-corpus/
+services/flink-job/corpus/
+
 # Agent-created git worktrees (full duplicate checkouts)
 .claude/worktrees/
