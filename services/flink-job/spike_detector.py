@@ -7,9 +7,26 @@ AnomalyDetector in clip_detector_job.py for the Flink adapter that calls this.
 """
 
 import os
+import re
 import statistics
 from dataclasses import dataclass
 from typing import List, Mapping, Optional
+
+# Plan 06 Phase 2: the watermark strategy's allowed out-of-orderness, in
+# seconds. Shared between clip_detector_job.py's WatermarkStrategy and
+# tools/replay.py's simulated watermark so the two compute event-time
+# readiness identically.
+WATERMARK_OUT_OF_ORDERNESS_SECONDS = 5
+
+# Command messages (starting with "!") are filtered out before they ever
+# reach the detector. Pure regex, shared by clip_detector_job.py's
+# CommandFilter and tools/replay.py so the harness sees what the operator
+# sees.
+COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
+
+
+def is_command(text: str) -> bool:
+    return bool(COMMAND_PATTERN.match(text))
 
 
 @dataclass(frozen=True)

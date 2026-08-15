@@ -9,8 +9,6 @@ creates clips via Twitch API, and stores metadata in Postgres.
 import json
 import logging
 import os
-import re
-import time
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -23,6 +21,7 @@ from prometheus_client import Counter, Gauge, start_http_server
 from pyflink.common import Row, Types, WatermarkStrategy
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.time import Duration
+from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.datastream import (
     KeyedProcessFunction,
     OutputTag,
@@ -36,7 +35,7 @@ from pyflink.datastream.connectors.kafka import (
 from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 
 from clip_attempt import ClipAttempt, ClipPolicy, RealClock
-from spike_detector import DetectorConfig, evaluate
+from spike_detector import DetectorConfig, WATERMARK_OUT_OF_ORDERNESS_SECONDS, evaluate, is_command
 from token_manager import TwitchCredentials
 
 # Configuration
@@ -53,9 +52,6 @@ FLINK_PARALLELISM = int(os.getenv("FLINK_PARALLELISM", "4"))
 
 # HTTP status codes that are retryable (transient errors)
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-
-# Command message regex
-COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
 
 # Logging
 logging.basicConfig(
@@ -506,21 +502,48 @@ class CommandFilter(ProcessFunction):
         try:
             msg = json.loads(value)
             text = msg.get("text", "")
-            if not COMMAND_PATTERN.match(text):
+            if not is_command(text):
                 yield value
         except json.JSONDecodeError:
             pass
+
+
+class SentAtTimestampAssigner(TimestampAssigner):
+    """
+    Assigns event time from `sent_at` (Twitch's own clock), not `timestamp`
+    (our ingestion clock). Plan 06 Phase 2 -- see AnomalyDetector below,
+    which buckets and schedules its per-second timers off this, via
+    ctx.timestamp() / the watermark it drives.
+    """
+
+    def extract_timestamp(self, value: str, record_timestamp: int) -> int:
+        try:
+            sent_at = json.loads(value)["sent_at"]
+        except (json.JSONDecodeError, KeyError):
+            return record_timestamp
+        # sent_at is present-but-null, not just missing: fall back rather
+        # than handing None to Flink's timestamp assignment, which expects
+        # an int and isn't guarded against it.
+        return record_timestamp if sent_at is None else sent_at
 
 
 class AnomalyDetector(KeyedProcessFunction):
     """
     Adapter that feeds Flink's keyed MapState/ValueState into spike_detector.evaluate()
     and applies the resulting Decision. See DetectorConfig for the tuning.
+
+    Event time throughout (Plan 06 Phase 2): process_element only buckets the
+    incoming message and arms a timer; evaluate() itself runs once per
+    elapsed event-time second from on_timer, when the watermark -- built
+    from sent_at by SentAtTimestampAssigner, below -- passes that second.
+    Per-message evaluation depends on message interleaving, so it can't
+    replay deterministically; per-second timers can. See
+    tools/replay.py for the pure-Python equivalent this mirrors.
     """
 
     def __init__(self):
-        self.message_counts = None  # MapState: timestamp_bucket -> count
-        self.last_anomaly_time = None  # ValueState: last anomaly timestamp
+        self.message_counts = None  # MapState: event-time second (sent_at bucket) -> count
+        self.last_anomaly_time = None  # ValueState: last anomaly timestamp, event-time ms
         self.config = None
         self.subtask_index = 0
 
@@ -546,42 +569,67 @@ class AnomalyDetector(KeyedProcessFunction):
         )
         self.config = DetectorConfig.from_env()
 
-    def process_element(self, value, ctx: KeyedProcessFunction.Context) -> Iterator[str]:
-        broadcaster_id = None
+    def process_element(self, value, ctx: KeyedProcessFunction.Context) -> None:
         try:
-            # value is a tuple (broadcaster_id, json_string) from the key_by operation
-            if isinstance(value, tuple):
-                broadcaster_id, json_str = value
-                msg = json.loads(json_str)
-            else:
-                msg = json.loads(value)
-                broadcaster_id = msg["broadcaster_id"]
-            timestamp = msg["timestamp"]
+            # ctx.timestamp() is sent_at (Twitch's own clock) -- assigned by
+            # SentAtTimestampAssigner on the source's WatermarkStrategy, not
+            # our ingestion timestamp and not wall-clock time.
+            bucket = ctx.timestamp() // 1000
 
-            # Calculate time bucket (1-second buckets)
-            bucket = timestamp // 1000
-
-            # Update message count for this bucket
             current_count = self.message_counts.get(bucket)
             if current_count is None:
                 current_count = 0
             self.message_counts.put(bucket, current_count + 1)
 
-            counts = {ts: self.message_counts.get(ts) for ts in self.message_counts.keys()}
-            current_time = int(time.time())
-            decision = evaluate(counts, current_time, self.last_anomaly_time.value(), self.config)
+            # Fire once this second's watermark passes, via on_timer below --
+            # not once per message. Registering the same timestamp twice is
+            # a no-op in Flink, so it's safe to call on every message.
+            ctx.timer_service().register_event_time_timer(bucket * 1000)
+        except Exception as e:
+            logger.error(
+                f"Error updating message counts for broadcaster {ctx.get_current_key()}: {e}",
+                exc_info=True,
+            )
+
+    def on_timer(self, timestamp: int, ctx: KeyedProcessFunction.OnTimerContext) -> Iterator[str]:
+        broadcaster_id = ctx.get_current_key()
+        try:
+            now_seconds = timestamp // 1000
+            all_counts = {ts: self.message_counts.get(ts) for ts in self.message_counts.keys()}
+
+            # A message for second now_seconds+1..+5 can already be in
+            # MapState by the time now_seconds's timer fires -- its own timer
+            # only requires the watermark to pass now_seconds, but the
+            # watermark itself only advances that far once messages up to
+            # ~now_seconds + WATERMARK_OUT_OF_ORDERNESS_SECONDS have already
+            # arrived and been counted in process_element. evaluate() has no
+            # upper bound on ts_bucket (that invariant used to be guaranteed
+            # by the caller, back when now_seconds was real wall-clock time
+            # and no bucket could exceed it) so without this filter, future
+            # buckets already sitting in state would leak into "now_seconds"'s
+            # baseline/window.
+            counts_as_of_now = {ts: c for ts, c in all_counts.items() if ts <= now_seconds}
+            decision = evaluate(counts_as_of_now, now_seconds, self.last_anomaly_time.value(), self.config)
 
             for expired_bucket in decision.expired_buckets:
                 self.message_counts.remove(expired_bucket)
+                all_counts.pop(expired_bucket, None)
+
+            # Keep the per-second cadence going only while this key still has
+            # data in its baseline -- an idle broadcaster's chain lapses here
+            # and a later message restarts it from process_element. Checked
+            # against all_counts (not counts_as_of_now): a future bucket that
+            # was excluded above still needs its own future timer.
+            if all_counts:
+                ctx.timer_service().register_event_time_timer(timestamp + 1000)
 
             if decision.spike:
                 spike = decision.spike
-                current_ms = current_time * 1000
-                self.last_anomaly_time.update(current_ms)
+                self.last_anomaly_time.update(timestamp)
 
                 anomaly = {
                     "broadcaster_id": broadcaster_id,
-                    "detected_at": current_ms,
+                    "detected_at": timestamp,
                     "message_count": spike.message_count,
                     "baseline_mean": spike.baseline_mean,
                     "baseline_std": spike.baseline_std,
@@ -597,8 +645,7 @@ class AnomalyDetector(KeyedProcessFunction):
                 yield json.dumps(anomaly)
 
         except Exception as e:
-            broadcaster_str = str(broadcaster_id) if broadcaster_id else "unknown"
-            logger.error(f"Error in anomaly detection for broadcaster {broadcaster_str}: {e}", exc_info=True)
+            logger.error(f"Error in anomaly detection for broadcaster {broadcaster_id}: {e}", exc_info=True)
 
 
 class ClipCreator(ProcessFunction):
@@ -792,10 +839,15 @@ def main():
         .set_value_only_deserializer(SimpleStringSchema()) \
         .build()
 
-    # Create watermark strategy
+    # Create watermark strategy. Event time comes from sent_at (Twitch's own
+    # clock) via SentAtTimestampAssigner -- AnomalyDetector's bucketing and
+    # per-second timers ride on this, not on our ingestion timestamp or
+    # wall-clock time. WATERMARK_OUT_OF_ORDERNESS_SECONDS is shared with
+    # tools/replay.py so the harness simulates the same allowed lateness.
     watermark_strategy = WatermarkStrategy \
-        .for_bounded_out_of_orderness(Duration.of_seconds(5)) \
-        .with_idleness(Duration.of_minutes(1))
+        .for_bounded_out_of_orderness(Duration.of_seconds(WATERMARK_OUT_OF_ORDERNESS_SECONDS)) \
+        .with_idleness(Duration.of_minutes(1)) \
+        .with_timestamp_assigner(SentAtTimestampAssigner())
 
     # Build the pipeline
     messages = env.from_source(

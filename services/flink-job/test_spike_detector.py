@@ -2,9 +2,20 @@
 
 import pytest
 
-from spike_detector import DetectorConfig, evaluate
+from spike_detector import DetectorConfig, evaluate, is_command
 
 CONFIG = DetectorConfig()  # window=5, baseline=10, std_dev_threshold=5.0, cooldown=30
+
+
+def test_is_command_matches_bang_prefix():
+    assert is_command("!clip")
+    assert is_command("!8ball magic")
+
+
+def test_is_command_false_for_ordinary_chat():
+    assert not is_command("hello world")
+    assert not is_command("")
+    assert not is_command("? not a command")
 
 
 def test_flat_baseline_no_spike():
