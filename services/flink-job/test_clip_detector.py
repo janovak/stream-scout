@@ -6,16 +6,12 @@ Tests the anomaly detection logic, command filtering, and clip creation flow.
 """
 
 import json
-import statistics
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from clip_detector_job import (
     COMMAND_PATTERN,
-    COOLDOWN_SECONDS,
-    STD_DEV_THRESHOLD,
     AnomalyEvent,
     ChatMessage,
     ClipResult,
@@ -46,91 +42,6 @@ class TestCommandFilter:
         assert not COMMAND_PATTERN.match("! space")
         assert not COMMAND_PATTERN.match("!@symbol")
         assert not COMMAND_PATTERN.match("!#hashtag")
-
-
-class TestAnomalyDetectionThreshold:
-    """Tests for anomaly detection threshold calculation."""
-
-    def test_threshold_uses_correct_std_dev_multiplier(self):
-        """Threshold should be mean + STD_DEV_THRESHOLD * std_dev."""
-        assert STD_DEV_THRESHOLD == 5.0, "Threshold should be 5.0 std dev per spec"
-
-    def test_threshold_calculation(self):
-        """Test threshold calculation with sample data."""
-        # Simulate baseline data (5 minutes of message counts per second)
-        baseline_counts = [5, 6, 4, 5, 7, 6, 5, 4, 6, 5] * 30  # 300 samples
-
-        mean = statistics.mean(baseline_counts)
-        std_dev = statistics.stdev(baseline_counts)
-        threshold = mean + (STD_DEV_THRESHOLD * std_dev)
-
-        assert threshold > mean
-        assert threshold == mean + (STD_DEV_THRESHOLD * std_dev)
-
-    def test_anomaly_detected_when_above_threshold(self):
-        """Anomaly should be detected when current count exceeds threshold."""
-        baseline_counts = [5] * 300  # Consistent baseline of 5 msgs/sec
-        mean = statistics.mean(baseline_counts)
-        std_dev = statistics.stdev(baseline_counts) if len(baseline_counts) > 1 else 0
-
-        if std_dev == 0:
-            std_dev = 0.1  # Avoid division by zero
-
-        threshold = mean + (STD_DEV_THRESHOLD * std_dev)
-
-        # Window sum of 10 should trigger anomaly with baseline of 5
-        window_sum = 10
-        is_anomaly = window_sum > threshold and std_dev > 0
-
-        # With std_dev near 0, threshold ~5.1, so 10 should trigger
-        assert is_anomaly or std_dev <= 0
-
-    def test_no_anomaly_when_below_threshold(self):
-        """No anomaly when current count is within normal range."""
-        baseline_counts = [5, 6, 4, 5, 7, 6, 5, 4, 6, 5] * 30
-        mean = statistics.mean(baseline_counts)
-        std_dev = statistics.stdev(baseline_counts)
-        threshold = mean + (STD_DEV_THRESHOLD * std_dev)
-
-        # Window sum equal to mean should not trigger
-        window_sum = int(mean)
-        is_anomaly = window_sum > threshold
-
-        assert not is_anomaly
-
-
-class TestCooldownLogic:
-    """Tests for cooldown tracking between anomaly detections."""
-
-    def test_cooldown_period_is_30_seconds(self):
-        """Cooldown should be 30 seconds as per spec."""
-        assert COOLDOWN_SECONDS == 30
-
-    def test_anomaly_blocked_during_cooldown(self):
-        """Second anomaly within cooldown period should be blocked."""
-        last_anomaly_time = int(time.time() * 1000)
-        current_time = last_anomaly_time + 15000  # 15 seconds later
-
-        should_trigger = (current_time - last_anomaly_time) > (COOLDOWN_SECONDS * 1000)
-        assert not should_trigger
-
-    def test_anomaly_allowed_after_cooldown(self):
-        """Anomaly should be allowed after cooldown period expires."""
-        last_anomaly_time = int(time.time() * 1000)
-        current_time = last_anomaly_time + 35000  # 35 seconds later
-
-        should_trigger = (current_time - last_anomaly_time) > (COOLDOWN_SECONDS * 1000)
-        assert should_trigger
-
-    def test_first_anomaly_always_triggers(self):
-        """First anomaly should always trigger (no previous time)."""
-        last_anomaly_time = None
-        current_time = int(time.time() * 1000)
-
-        should_trigger = last_anomaly_time is None or (
-            current_time - last_anomaly_time
-        ) > (COOLDOWN_SECONDS * 1000)
-        assert should_trigger
 
 
 class TestTwitchAPIClient:
@@ -318,51 +229,3 @@ class TestMessageParsing:
         assert len(filtered) == 2
         assert filtered[0]["text"] == "LUL that was funny"
         assert filtered[1]["text"] == "POGGERS"
-
-
-class TestAnomalyDetectionScenarios:
-    """Integration-style tests for anomaly detection scenarios."""
-
-    def test_spike_detection_scenario(self):
-        """Simulate a chat spike that should trigger anomaly detection."""
-        # Baseline: 10 messages per second for 5 minutes
-        baseline_counts = [10] * 300
-
-        # Spike: 25 messages in the 5-second window
-        current_window_sum = 25
-
-        mean = statistics.mean(baseline_counts)
-        std_dev = statistics.stdev(baseline_counts) if len(set(baseline_counts)) > 1 else 0.1
-
-        threshold = mean + (STD_DEV_THRESHOLD * std_dev)
-
-        # With uniform baseline, std_dev is 0, so use minimum
-        if std_dev < 0.1:
-            std_dev = 0.1
-            threshold = mean + (STD_DEV_THRESHOLD * std_dev)
-
-        is_anomaly = current_window_sum > threshold
-        assert is_anomaly, f"Spike of {current_window_sum} should exceed threshold {threshold}"
-
-    def test_high_variance_baseline_higher_threshold(self):
-        """High variance baseline should have higher threshold."""
-        # High variance baseline
-        high_var_baseline = [5, 15, 8, 20, 3, 18, 7, 22, 4, 16] * 30
-
-        mean_high = statistics.mean(high_var_baseline)
-        std_high = statistics.stdev(high_var_baseline)
-        threshold_high = mean_high + (STD_DEV_THRESHOLD * std_high)
-
-        # Low variance baseline
-        low_var_baseline = [10, 10, 11, 10, 9, 10, 11, 10, 10, 9] * 30
-
-        mean_low = statistics.mean(low_var_baseline)
-        std_low = statistics.stdev(low_var_baseline)
-        threshold_low = mean_low + (STD_DEV_THRESHOLD * std_low)
-
-        # High variance should have higher threshold
-        assert threshold_high > threshold_low
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

@@ -128,9 +128,17 @@ services:
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+      - DETECTION_WINDOW_SECONDS=5
+      - DETECTION_BASELINE_SECONDS=10
+      # Deliberately below the lowest displayed level (7), so clips between 5 and 7
+      # are collected but not shown. See spec 002 FR-001b. Raising it above 7 empties
+      # a UI level.
+      - DETECTION_STD_DEV_THRESHOLD=5.0
+      - DETECTION_COOLDOWN_SECONDS=30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
+      - ./services/flink-job/spike_detector.py:/opt/flink/usrlib/spike_detector.py:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -172,9 +180,17 @@ services:
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
       - METRICS_PORT=9250
+      - DETECTION_WINDOW_SECONDS=5
+      - DETECTION_BASELINE_SECONDS=10
+      # Deliberately below the lowest displayed level (7), so clips between 5 and 7
+      # are collected but not shown. See spec 002 FR-001b. Raising it above 7 empties
+      # a UI level.
+      - DETECTION_STD_DEV_THRESHOLD=5.0
+      - DETECTION_COOLDOWN_SECONDS=30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
+      - ./services/flink-job/spike_detector.py:/opt/flink/usrlib/spike_detector.py:ro
     depends_on:
       - flink-jobmanager
     networks:
