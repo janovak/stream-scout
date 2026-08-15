@@ -29,6 +29,13 @@ def steady_baseline(level=10, wobble=1):
     return {ts: level + (wobble if ts % 2 else -wobble) for ts in BASELINE}
 
 
+def baseline_std(counts):
+    """Sample standard deviation over the baseline range, absent buckets as 0."""
+    values = [counts.get(ts, 0) for ts in BASELINE]
+    mean = sum(values) / len(values)
+    return (sum((v - mean) ** 2 for v in values) / (len(values) - 1)) ** 0.5
+
+
 def evaluate_at(counts, second=NOW, hold=None, last_fire_second=None, config=CONFIG):
     return evaluate(counts, second, hold, last_fire_second, config)
 
@@ -103,6 +110,20 @@ class TestShippedDefaults:
     def test_nonsense_config_is_rejected_at_construction(self, kwargs):
         with pytest.raises(ValueError):
             DetectorConfig(**kwargs)
+
+    def test_hold_cap_longer_than_the_retained_span_is_rejected(self):
+        """A cap that outlives the buckets could never fire -- the operator's
+        timer chain lapses once a key's last bucket expires."""
+        with pytest.raises(ValueError, match="hold_cap_seconds"):
+            DetectorConfig(window_seconds=5, baseline_seconds=10, hold_cap_seconds=15)
+        # One under the retained span is the largest workable cap.
+        assert DetectorConfig(
+            window_seconds=5, baseline_seconds=10, hold_cap_seconds=14
+        ).hold_cap_seconds == 14
+
+    def test_shipped_defaults_satisfy_that_coupling(self):
+        config = DetectorConfig()
+        assert config.hold_cap_seconds < config.baseline_seconds + config.window_seconds
 
 
 class TestIntensityScale:
@@ -190,13 +211,7 @@ class TestIntensityScale:
             del silent[ts]
         # A silent window sits a full baseline-mean below the baseline.
         assert intensity_of(silent) < intensity_of(counts)
-        assert intensity_of(silent) == pytest.approx(-10.0 / counts_std(counts), rel=1e-9)
-
-
-def counts_std(counts):
-    values = [counts.get(ts, 0) for ts in BASELINE]
-    mean = sum(values) / len(values)
-    return (sum((v - mean) ** 2 for v in values) / (len(values) - 1)) ** 0.5
+        assert intensity_of(silent) == pytest.approx(-10.0 / baseline_std(counts), rel=1e-9)
 
 
 class TestBaselineWindowSeparation:
@@ -376,6 +391,28 @@ class TestPeakHold:
         )
         counts = {ts: 5 for ts in range(990, 996)}  # far below the warm-up gate
         decision = evaluate_at(counts, second=NOW, hold=open_hold)
+        assert decision.emit is None
+        assert decision.hold == open_hold
+
+    def test_unmeasurable_baseline_suspends_the_cap_rather_than_guessing(self):
+        """The surprising half of the rule above: the cap does not fire either.
+
+        The cap exists to bound an episode, but firing it here would report a
+        peak measured against a baseline the detector can no longer see. The
+        hold waits for a second it can actually evaluate; the operator's state
+        TTL is what stops it waiting forever.
+        """
+        open_hold = HoldState(
+            started_at=NOW,
+            peak_intensity=9.5,
+            peak_at=NOW,
+            peak_message_count=300,
+            peak_baseline_mean=10.0,
+            peak_baseline_std=1.0,
+        )
+        counts = {ts: 5 for ts in range(990, 996)}
+        way_past_cap = NOW + CONFIG.hold_cap_seconds * 5
+        decision = evaluate_at(counts, second=way_past_cap, hold=open_hold)
         assert decision.emit is None
         assert decision.hold == open_hold
 

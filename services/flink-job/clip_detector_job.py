@@ -701,12 +701,14 @@ class AnomalyDetector(KeyedProcessFunction):
             # against all_counts (not counts_as_of_now): a future bucket that
             # was excluded above still needs its own future timer.
             #
-            # An open hold cannot be stranded by this chain lapsing, as long as
-            # hold_cap_seconds stays below baseline_seconds + window_seconds
-            # (60 vs 305 by default): buckets outlive the last message by the
-            # whole retained span, so the cap always fires while timers are
-            # still ticking. A stalled watermark is the case this cannot cover
-            # -- that is what the state TTL above is for.
+            # An open hold is normally bounded by its cap well before this
+            # chain can lapse -- DetectorConfig enforces hold_cap_seconds below
+            # baseline_seconds + window_seconds (60 vs 305 by default), and
+            # buckets outlive the last message by that whole span. Two cases
+            # escape that bound, and the state TTL above is the backstop for
+            # both: a stalled watermark (no timer fires at all), and a baseline
+            # that stops being measurable mid-episode, which by design leaves
+            # the hold untouched rather than guessing at a peak.
             if all_counts:
                 ctx.timer_service().register_event_time_timer(timestamp + 1000)
 
@@ -721,6 +723,14 @@ class AnomalyDetector(KeyedProcessFunction):
                 # Phase 3: the clips table now records when chat actually
                 # peaked, instead of when the detector noticed the episode had
                 # ended. Every other field below is from that same second too.
+                #
+                # Note this widens the gap between detected_at and what the
+                # clip actually contains: ClipCreator still asks Twitch for
+                # "the last ~30 seconds" as of when it runs, so an episode that
+                # held for a while is clipped that much after its peak.
+                # Re-anchoring clip timing on the peak needs Plan 04's
+                # duration/vod_offset measurements and is deliberately out of
+                # scope here -- see plans/06-detection-math.md, Out of scope.
                 anomaly = {
                     "broadcaster_id": broadcaster_id,
                     "detected_at": spike.detected_at_seconds * 1000,

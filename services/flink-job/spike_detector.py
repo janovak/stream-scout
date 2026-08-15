@@ -121,6 +121,18 @@ class DetectorConfig:
             raise ValueError(
                 f"min_baseline_fraction must be in (0, 1], got {self.min_baseline_fraction}"
             )
+        # The operator's timer chain only runs while the key still has buckets,
+        # which is baseline_seconds + window_seconds past its last message. A
+        # cap longer than that could not fire before the chain lapsed, leaving
+        # the episode stranded in state until its TTL. See
+        # AnomalyDetector.on_timer.
+        retained_seconds = self.baseline_seconds + self.window_seconds
+        if self.hold_cap_seconds >= retained_seconds:
+            raise ValueError(
+                f"hold_cap_seconds ({self.hold_cap_seconds}) must be under "
+                f"baseline_seconds + window_seconds ({retained_seconds}), or a "
+                f"hold can outlive the buckets whose timers would fire it"
+            )
 
     @classmethod
     def from_env(cls) -> "DetectorConfig":
