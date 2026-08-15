@@ -35,6 +35,7 @@ from pyflink.datastream.connectors.kafka import (
 )
 from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 
+from clip_attempt import ClipAttempt, ClipPolicy, RealClock
 from spike_detector import DetectorConfig, evaluate
 from token_manager import TwitchCredentials
 
@@ -52,27 +53,6 @@ FLINK_PARALLELISM = int(os.getenv("FLINK_PARALLELISM", "4"))
 
 # HTTP status codes that are retryable (transient errors)
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-
-# Clip creation retry parameters
-MAX_RETRY_ATTEMPTS = 3
-RETRY_DELAYS = [0, 2, 4]  # seconds (within 5-second retry window)
-CLIP_DELAY_SECONDS = 10  # Wait before first clip attempt to center moment in clip
-
-# Twitch's own docs (dev.twitch.tv/docs/api/clips/) only say clip creation is
-# async and to "assume it failed" if Get Clips hasn't returned the clip after
-# 15 seconds -- no recommended poll interval or attempt count, and no stated
-# guarantee of a minimum or maximum processing time either way. A single
-# check at the 15s mark (the old behavior) missed ~15% of real clips per our
-# own metrics, so we retry with real backoff instead of waiting once and
-# giving up. Tried pushing this much further out (t=5,60,360,1260) to see if
-# the small residual failure rate (~1-1.5% even with the original schedule)
-# was just slow clips needing more time -- it wasn't: zero recoveries on the
-# added attempts 3/4 across everything we watched, same failure rate as
-# before, just taking up to 21 minutes to find out instead of 50 seconds.
-# Settled on a modest bump over the original instead: same 4 attempts, same
-# shape, just a longer last step (t=5,15,30,60 vs the original t=5,15,30,50).
-GET_CLIP_MAX_ATTEMPTS = 4
-GET_CLIP_RETRY_DELAYS = [5, 10, 15, 30]  # seconds before each attempt (t=5,15,30,60)
 
 # Command message regex
 COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
@@ -182,6 +162,8 @@ class ClipResult:
     detected_at: int
     success: bool
     intensity: Optional[float] = None  # Z-score: (message_count - mean) / std_dev
+    duration: Optional[float] = None  # seconds, from Twitch Get Clips; may be null
+    vod_offset: Optional[int] = None  # seconds into the VOD where the clip starts; may be null
 
 
 class TwitchAPIError(Exception):
@@ -468,8 +450,8 @@ class PostgresClient:
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO clips (broadcaster_id, clip_id, embed_url, thumbnail_url, detected_at, intensity)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO clips (broadcaster_id, clip_id, embed_url, thumbnail_url, detected_at, intensity, duration, vod_offset)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (clip_id) DO NOTHING
                 """, (
                     clip.broadcaster_id,
@@ -477,7 +459,9 @@ class PostgresClient:
                     clip.embed_url,
                     clip.thumbnail_url,
                     datetime.fromtimestamp(clip.detected_at / 1000, tz=timezone.utc),
-                    clip.intensity
+                    clip.intensity,
+                    clip.duration,
+                    clip.vod_offset
                 ))
                 rows_affected = cur.rowcount
                 conn.commit()
@@ -638,10 +622,11 @@ class ClipCreator(ProcessFunction):
             POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB,
             POSTGRES_USER, POSTGRES_PASSWORD
         )
+        self.clip_policy = ClipPolicy.from_env()
         # The single Postgres connection and the lazily-initialized Prometheus
         # metrics can't handle concurrent use from multiple clip threads --
-        # these serialize just the quick DB write / first-init check, not the
-        # long sleeps around them.
+        # these now guard only the apply step below (the DB write and the
+        # metrics update), not the long sleeps that precede it.
         self._postgres_lock = threading.Lock()
         self._metrics_lock = threading.Lock()
 
@@ -659,8 +644,8 @@ class ClipCreator(ProcessFunction):
             return iter(())
 
         # The full flow below can sleep for the better part of half an hour
-        # (CLIP_DELAY_SECONDS + retry delays + GET_CLIP_RETRY_DELAYS) waiting
-        # on Twitch. Running it inline on process_element would block this
+        # (ClipPolicy's initial delay + retry delays + metadata retry delays)
+        # waiting on Twitch. Running it inline on process_element would block this
         # subtask's task thread for that whole time -- starving every other
         # broadcaster keyed onto the same subtask, and even a second anomaly
         # for this same broadcaster, until it finished. Run it on its own
@@ -675,123 +660,65 @@ class ClipCreator(ProcessFunction):
 
     def _create_and_poll_clip(self, anomaly: dict, broadcaster_id, detected_at) -> None:
         try:
-            start_time = time.time()
-
             logger.info(f"=== CLIP CREATION START for broadcaster {broadcaster_id} ===")
             logger.info(f"Anomaly details: count={anomaly.get('message_count')}, "
                        f"mean={anomaly.get('baseline_mean', 0):.2f}, std={anomaly.get('baseline_std', 0):.2f}")
 
-            # Wait before first clip attempt to center the moment in the clip
-            logger.info(f"Waiting {CLIP_DELAY_SECONDS}s before clip creation to center moment in clip...")
-            time.sleep(CLIP_DELAY_SECONDS)
-
-            # Try to create clip with smart retries (only retry transient errors)
-            clip_id = None
-            last_error = None
-            for attempt, delay in enumerate(RETRY_DELAYS):
-                if delay > 0:
-                    logger.info(f"Retry delay: waiting {delay}s before attempt {attempt + 1}")
-                    time.sleep(delay)
-
-                try:
-                    logger.info(f"Clip creation attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS}")
-                    clip_id = self.twitch_client.create_clip(broadcaster_id)
-                    if clip_id:
-                        logger.info(f"Clip creation successful on attempt {attempt + 1}: clip_id={clip_id}")
-                        break
-                    else:
-                        logger.warning(f"Clip creation attempt {attempt + 1} returned no clip_id")
-                except TwitchAPIError as e:
-                    last_error = e
-                    logger.warning(f"Clip creation attempt {attempt + 1} failed: {e} (retryable={e.is_retryable})")
-                    if not e.is_retryable:
-                        logger.error(f"Non-retryable error (status={e.status_code}), stopping retry attempts")
-                        break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(f"Clip creation attempt {attempt + 1} unexpected exception: {e}")
-                    # Unexpected errors are not retryable
-                    break
-
-            if not clip_id:
-                with self._metrics_lock:
-                    _init_metrics(self.subtask_index)
-                if last_error:
-                    logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id}: {last_error}")
-                    reason = "api_error" if isinstance(last_error, TwitchAPIError) else "unknown"
-                    if _clips_created_failed_total:
-                        _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason=reason).inc()
-                    # Twitch returns 403 here specifically when the broadcaster hasn't
-                    # authorized clip creation on their channel -- that's permanent
-                    # until they change it, not something a retry or token refresh
-                    # fixes. Record it so stream-monitoring stops watching their chat.
-                    if isinstance(last_error, TwitchAPIError) and last_error.status_code == 403:
-                        logger.warning(f"Broadcaster {broadcaster_id} does not authorize clip creation; marking allows_clipping=FALSE")
-                        with self._postgres_lock:
-                            self.postgres_client.mark_clipping_disabled(broadcaster_id)
-                else:
-                    logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id} after {MAX_RETRY_ATTEMPTS} attempts")
-                    if _clips_created_failed_total:
-                        _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason="max_retries").inc()
-                return
-
-            # Poll for clip metadata -- Twitch's clip processing is async and
-            # doesn't always finish by the time a single check would land, so
-            # retry a few times instead of waiting once and giving up.
-            clip_data = None
-            for attempt, delay in enumerate(GET_CLIP_RETRY_DELAYS):
-                logger.info(f"Waiting {delay}s before clip metadata attempt {attempt + 1}/{GET_CLIP_MAX_ATTEMPTS} for {clip_id}...")
-                time.sleep(delay)
-                clip_data = self.twitch_client.get_clip(clip_id)
-                if clip_data:
-                    logger.info(f"Clip metadata retrieved on attempt {attempt + 1}: clip_id={clip_id}")
-                    break
-                # Not ready yet is expected mid-retry, not a problem -- only the
-                # exhaustion after the final attempt (logged below, once the loop
-                # ends without a break) is an actual failure.
-                logger.info(f"Clip metadata attempt {attempt + 1}/{GET_CLIP_MAX_ATTEMPTS} found nothing yet for {clip_id}")
-
-            if clip_data:
-                # Get intensity from anomaly data
-                intensity = anomaly.get("intensity")
-
-                clip_result = ClipResult(
-                    broadcaster_id=broadcaster_id,
-                    clip_id=clip_id,
-                    embed_url=clip_data.get("embed_url", ""),
-                    thumbnail_url=clip_data.get("thumbnail_url", ""),
-                    detected_at=detected_at,
-                    success=True,
-                    intensity=intensity
-                )
-
-                # Store in Postgres
-                logger.info(f"Storing clip {clip_id} in database...")
-                with self._postgres_lock:
-                    self.postgres_client.insert_clip(clip_result)
-
-                # Record success metrics
-                duration = time.time() - start_time
-                with self._metrics_lock:
-                    _init_metrics(self.subtask_index)
-                if _clips_created_success_total:
-                    _clips_created_success_total.labels(broadcaster_id=str(broadcaster_id)).inc()
-                if _clip_creation_duration_seconds:
-                    _clip_creation_duration_seconds.labels(broadcaster_id=str(broadcaster_id)).set(duration)
-
-                # Nothing downstream consumes ClipCreator's old yielded output
-                # besides clips.print() (a debug echo) -- this log line is the
-                # durable record, alongside the Postgres row and metrics above.
-                logger.info(f"=== CLIP CREATION COMPLETE for broadcaster {broadcaster_id}: clip_id={clip_id} (took {duration:.1f}s) ===")
-            else:
-                logger.error(f"CLIP METADATA RETRIEVAL FAILED for clip_id={clip_id} after {GET_CLIP_MAX_ATTEMPTS} attempts")
-                with self._metrics_lock:
-                    _init_metrics(self.subtask_index)
-                if _clips_created_failed_total:
-                    _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason="metadata_fetch").inc()
-
+            attempt = ClipAttempt(self.twitch_client, self.clip_policy, RealClock())
+            result = attempt.run(broadcaster_id)
+            self._apply_result(anomaly, broadcaster_id, detected_at, result)
         except Exception as e:
             logger.error(f"CLIP CREATION ERROR for broadcaster {broadcaster_id}: {e}", exc_info=True)
+
+    def _apply_result(self, anomaly: dict, broadcaster_id, detected_at, result) -> None:
+        if result.failure_reason:
+            # ClipAttempt already logged the retry/poll detail and the failure
+            # reason for broadcaster_id -- this is just the metrics/signal apply step.
+            with self._metrics_lock:
+                _init_metrics(self.subtask_index)
+            if _clips_created_failed_total:
+                _clips_created_failed_total.labels(broadcaster_id=str(broadcaster_id), reason=result.failure_reason).inc()
+            # Twitch returns 403 here specifically when the broadcaster hasn't
+            # authorized clip creation on their channel -- that's permanent
+            # until they change it, not something a retry or token refresh
+            # fixes. Record it so stream-monitoring stops watching their chat.
+            if result.clipping_disabled:
+                logger.warning(f"Broadcaster {broadcaster_id} does not authorize clip creation; marking allows_clipping=FALSE")
+                with self._postgres_lock:
+                    self.postgres_client.mark_clipping_disabled(broadcaster_id)
+            return
+
+        clip_data = result.clip_data
+        intensity = anomaly.get("intensity")
+
+        clip_result = ClipResult(
+            broadcaster_id=broadcaster_id,
+            clip_id=result.clip_id,
+            embed_url=clip_data.get("embed_url", ""),
+            thumbnail_url=clip_data.get("thumbnail_url", ""),
+            detected_at=detected_at,
+            success=True,
+            intensity=intensity,
+            duration=clip_data.get("duration"),
+            vod_offset=clip_data.get("vod_offset"),
+        )
+
+        logger.info(f"Storing clip {result.clip_id} in database...")
+        with self._postgres_lock:
+            self.postgres_client.insert_clip(clip_result)
+
+        with self._metrics_lock:
+            _init_metrics(self.subtask_index)
+        if _clips_created_success_total:
+            _clips_created_success_total.labels(broadcaster_id=str(broadcaster_id)).inc()
+        if _clip_creation_duration_seconds:
+            _clip_creation_duration_seconds.labels(broadcaster_id=str(broadcaster_id)).set(result.duration_seconds)
+
+        # Nothing downstream consumes ClipCreator's old yielded output
+        # besides clips.print() (a debug echo) -- this log line is the
+        # durable record, alongside the Postgres row and metrics above.
+        logger.info(f"=== CLIP CREATION COMPLETE for broadcaster {broadcaster_id}: "
+                    f"clip_id={result.clip_id} (took {result.duration_seconds:.1f}s) ===")
 
 
 def validate_tokens_at_startup():

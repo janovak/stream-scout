@@ -21,7 +21,9 @@ CREATE TABLE clips (
     thumbnail_url TEXT NOT NULL,
     detected_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    intensity FLOAT  -- Standard deviations above mean (Z-score), nullable for legacy clips
+    intensity FLOAT,  -- Standard deviations above mean (Z-score), nullable for legacy clips
+    duration FLOAT,   -- seconds, from Twitch Get Clips; null if video unavailable or offset not yet computed
+    vod_offset INTEGER  -- seconds into the VOD where the clip starts; null under the same conditions as duration
 );
 
 CREATE INDEX idx_clips_detected_at ON clips(detected_at DESC);

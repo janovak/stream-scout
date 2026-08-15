@@ -59,7 +59,7 @@ docker exec streamscout-flink-jobmanager flink list
 ```
 If the output shows "No running jobs", submit the job:
 ```bash
-docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py -d
+docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
 
 **Then verify:**
@@ -138,7 +138,7 @@ Expect to see: `Stream Monitoring Service started`, `Polling for top streams`, `
    ```
 4. Check whether a job auto-started. If not, submit one:
    ```bash
-   docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py -d
+   docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
    ```
 5. Confirm it is running, then check that it is processing:
    ```bash
@@ -217,14 +217,14 @@ docker logs -t streamscout-stream-monitoring --tail 20 # with timestamps
 ### "No running jobs" in Flink
 Submit the job:
 ```bash
-docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py -d
+docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
 
 ### Flink job fails with "heartbeat timeout"
 ```bash
 docker compose restart flink-jobmanager flink-taskmanager
 sleep 30
-docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py -d
+docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
 
 ### "Token file not found" in Flink logs
@@ -280,6 +280,6 @@ This is expected. Some streamers turn off clip creation. The system still create
 | Stop everything | `docker compose down` |
 | Check status | `docker compose ps` |
 | Check Flink job | `docker exec streamscout-flink-jobmanager flink list` |
-| Submit Flink job | `docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py -d` |
+| Submit Flink job | `docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d` |
 | View service logs | `docker logs streamscout-<service-name>` |
 | Restart a service | `docker compose restart <service-name>` |
