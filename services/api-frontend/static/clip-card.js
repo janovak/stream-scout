@@ -29,6 +29,7 @@ function getIntensityLabel(intensity) {
             return INTENSITY_LEVELS[i];
         }
     }
+    return { label: 'Unknown', threshold: 0 };
 }
 
 function formatTime(isoString) {
@@ -82,9 +83,6 @@ function renderPlayer(clip) {
 
 function renderCard(clip, { playing = false } = {}) {
     const intensityInfo = getIntensityLabel(clip.intensity);
-    const intensityDisplay = (clip.intensity !== null && clip.intensity !== undefined)
-        ? intensityInfo.label
-        : 'Unknown';
 
     return `
         <div class="clip-card${playing ? ' playing' : ''}" data-clip-id="${escapeAttr(clip.clip_id)}" onclick="openClip(this.dataset.clipId)">
@@ -94,7 +92,7 @@ function renderCard(clip, { playing = false } = {}) {
             <div class="clip-meta">
                 <h3>${escapeAttr(clip.streamer_login || 'Unknown Streamer')}</h3>
                 <div class="clip-details">
-                    <span class="intensity-badge" data-level="${intensityInfo.threshold}">${intensityDisplay}</span>
+                    <span class="intensity-badge" data-level="${intensityInfo.threshold}">${intensityInfo.label}</span>
                     <span class="clip-time">${formatTime(clip.detected_at)}</span>
                 </div>
             </div>
