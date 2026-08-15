@@ -672,8 +672,8 @@ class ClipCreator(ProcessFunction):
 
     def _apply_result(self, anomaly: dict, broadcaster_id, detected_at, result) -> None:
         if result.failure_reason:
-            logger.error(f"CLIP CREATION FAILED for broadcaster {broadcaster_id}: "
-                        f"reason={result.failure_reason}")
+            # ClipAttempt already logged the retry/poll detail and the failure
+            # reason for broadcaster_id -- this is just the metrics/signal apply step.
             with self._metrics_lock:
                 _init_metrics(self.subtask_index)
             if _clips_created_failed_total:

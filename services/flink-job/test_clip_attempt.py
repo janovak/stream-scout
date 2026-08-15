@@ -7,8 +7,20 @@ sequence, not on elapsed wall-clock time -- the whole suite must run in
 well under a second.
 """
 
-from clip_attempt import AttemptResult, ClipAttempt, ClipPolicy
-from clip_detector_job import TwitchAPIError
+import pytest
+
+from clip_attempt import ClipAttempt, ClipPolicy
+
+
+class FakeTwitchAPIError(Exception):
+    """Stands in for clip_detector_job.TwitchAPIError without importing that
+    module (and its pyflink import chain) into this test file -- ClipAttempt
+    only duck-types on is_retryable/status_code, so this is enough."""
+
+    def __init__(self, message: str, status_code: int, is_retryable: bool):
+        super().__init__(message)
+        self.status_code = status_code
+        self.is_retryable = is_retryable
 
 
 class FakeClock:
@@ -84,7 +96,7 @@ class TestClipAttemptCreateRetries:
         clock = FakeClock()
         twitch = StubTwitch(
             create_clip_effects=[
-                TwitchAPIError("server error", 503, is_retryable=True),
+                FakeTwitchAPIError("server error", 503, is_retryable=True),
                 "clip123",
             ],
             get_clip_effects=[{"embed_url": "u", "thumbnail_url": "t"}],
@@ -98,7 +110,7 @@ class TestClipAttemptCreateRetries:
         clock = FakeClock()
         twitch = StubTwitch(
             create_clip_effects=[
-                TwitchAPIError("bad request", 400, is_retryable=False),
+                FakeTwitchAPIError("bad request", 400, is_retryable=False),
                 "clip123",  # would succeed if retried -- it must not be
             ],
         )
@@ -112,7 +124,7 @@ class TestClipAttemptCreateRetries:
         clock = FakeClock()
         twitch = StubTwitch(
             create_clip_effects=[
-                TwitchAPIError("forbidden", 403, is_retryable=False),
+                FakeTwitchAPIError("forbidden", 403, is_retryable=False),
             ],
         )
         result = ClipAttempt(twitch, DEFAULT_POLICY, clock).run(broadcaster_id=1)
@@ -131,6 +143,18 @@ class TestClipAttemptCreateRetries:
         assert result.clip_id is None
         assert result.failure_reason == "max_retries"
         assert result.clipping_disabled is False
+
+
+class TestClipPolicyFromEnv:
+    def test_empty_create_retry_delays_raises(self, monkeypatch):
+        monkeypatch.setenv("CLIP_CREATE_RETRY_DELAYS", "")
+        with pytest.raises(ValueError):
+            ClipPolicy.from_env()
+
+    def test_empty_metadata_retry_delays_raises(self, monkeypatch):
+        monkeypatch.setenv("CLIP_METADATA_RETRY_DELAYS", "")
+        with pytest.raises(ValueError):
+            ClipPolicy.from_env()
 
 
 class TestClipAttemptMetadataRetries:
