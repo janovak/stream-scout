@@ -20,10 +20,15 @@ plans/06-detection-math.md Phase 2. Determinism here is the whole point:
 
 Watermark model: a single global watermark (max sent_at seen so far, minus
 WATERMARK_OUT_OF_ORDERNESS_SECONDS), shared across all broadcasters. Real
-Flink computes one watermark per parallel subtask, so with
-FLINK_PARALLELISM > 1 a broadcaster's true watermark may run ahead of this
-harness's. That only makes this harness fire later than production, never
-earlier -- it can't manufacture a spike production wouldn't also see.
+Flink's downstream watermark is the MINIMUM across its upstream source
+splits, each bounded by only the traffic on that split/partition; this
+harness instead takes a running MAXIMUM over the whole corpus at once.
+With FLINK_PARALLELISM > 1 and uneven per-partition traffic, that means
+this harness's watermark can run AHEAD of a real subtask's, and it can
+become ready to fire a given broadcaster-second sooner than production
+would. Do not treat a clean harness/production diff as proof production
+would also fire at that instant -- verify against a live run before relying
+on this for anything beyond internal-consistency and determinism checks.
 
 Note evaluate()'s own arithmetic (the baseline/window overlap, the unit
 mismatch) is untouched here -- that's Plan 06 Phase 3, deliberately a
@@ -91,13 +96,21 @@ class EventTimeReplayer:
     def _watermark_ms(self) -> Optional[int]:
         if self._max_sent_at_ms is None:
             return None
-        return self._max_sent_at_ms - WATERMARK_OUT_OF_ORDERNESS_MS
+        # Flink's BoundedOutOfOrdernessWatermarks emits maxTimestamp -
+        # outOfOrdernessMillis - 1, not maxTimestamp - outOfOrdernessMillis --
+        # the extra -1 keeps an event exactly at the bound from counting as
+        # late. Match it so a timer at second*1000 == this boundary doesn't
+        # fire here a millisecond before real Flink would fire it.
+        return self._max_sent_at_ms - WATERMARK_OUT_OF_ORDERNESS_MS - 1
 
-    def feed(self, broadcaster_id: int, sent_at_ms: int) -> Iterator[Evaluation]:
-        """Record one message; yields any evaluations its watermark advance unblocks."""
+    def _bump_watermark(self, sent_at_ms: int) -> None:
         self._max_sent_at_ms = (
             sent_at_ms if self._max_sent_at_ms is None else max(self._max_sent_at_ms, sent_at_ms)
         )
+
+    def feed(self, broadcaster_id: int, sent_at_ms: int) -> Iterator[Evaluation]:
+        """Record one message; yields any evaluations its watermark advance unblocks."""
+        self._bump_watermark(sent_at_ms)
         bucket = sent_at_ms // 1000
 
         state = self._states.setdefault(broadcaster_id, _KeyState())
@@ -105,6 +118,19 @@ class EventTimeReplayer:
 
         self._register_timer(broadcaster_id, bucket)
 
+        yield from self._drain_due_timers()
+
+    def observe_watermark(self, sent_at_ms: int) -> Iterator[Evaluation]:
+        """
+        For a record that affects the watermark but is never counted -- e.g. a
+        command message. In production, SentAtTimestampAssigner runs on the
+        WatermarkStrategy attached at the Kafka source, upstream of
+        CommandFilter, so a command's sent_at still advances the real
+        watermark even though CommandFilter drops it before AnomalyDetector
+        ever sees it. Mirror that ordering here rather than silently letting
+        the harness's watermark lag behind production on command-heavy chat.
+        """
+        self._bump_watermark(sent_at_ms)
         yield from self._drain_due_timers()
 
     def _drain_due_timers(self) -> Iterator[Evaluation]:
@@ -144,6 +170,7 @@ def replay(lines: Iterable[str], config: DetectorConfig) -> Iterator[Evaluation]
         except json.JSONDecodeError:
             continue
         if is_command(msg.get("text", "")):
+            yield from replayer.observe_watermark(msg["sent_at"])
             continue
         yield from replayer.feed(msg["broadcaster_id"], msg["sent_at"])
 

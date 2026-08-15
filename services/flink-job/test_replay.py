@@ -32,21 +32,26 @@ def test_bucket_comes_from_sent_at_not_other_fields():
 def test_evaluation_waits_for_watermark_to_pass_the_second():
     replayer = EventTimeReplayer(CONFIG)
     list(replayer.feed(1, sent_at_ms=1000 * 1000))  # bucket 1000, no eval yet (watermark lags 5s)
-    evaluations = list(replayer.feed(1, sent_at_ms=1004 * 1000))  # watermark = 1004-5 = 999
+    evaluations = list(replayer.feed(1, sent_at_ms=1004 * 1000))  # watermark = 1004000-5000-1 = 998999
     assert evaluations == []
-    evaluations = list(replayer.feed(1, sent_at_ms=1005 * 1000))  # watermark = 1000
+    evaluations = list(replayer.feed(1, sent_at_ms=1005 * 1000))  # watermark = 1005000-5000-1 = 999999, still < 1000000
+    assert evaluations == []
+    # Flink's real BoundedOutOfOrdernessWatermarks emits maxTimestamp -
+    # outOfOrdernessMillis - 1, so it takes one more ms to cross second 1000's
+    # boundary than a naive max-bound subtraction would.
+    evaluations = list(replayer.feed(1, sent_at_ms=1005 * 1000 + 1))  # watermark = 1000000
     assert [e.second for e in evaluations] == [1000]
 
 
 def test_out_of_order_message_within_bound_still_counted_before_its_second_fires():
     replayer = EventTimeReplayer(CONFIG)
-    # second 1000 arrives, then second 1003 (pushes watermark to 998, second
+    # second 1000 arrives, then second 1003 (pushes watermark to 997999, second
     # 1000 still not due), then a late second-1000 message arrives before the
     # watermark passes 1000 -- must land in the same bucket as the first.
     list(replayer.feed(1, sent_at_ms=1000 * 1000))
     list(replayer.feed(1, sent_at_ms=1003 * 1000))
     list(replayer.feed(1, sent_at_ms=1000 * 1000 + 500))  # same second, out of order
-    evaluations = list(replayer.feed(1, sent_at_ms=1005 * 1000))  # watermark -> 1000, fires
+    evaluations = list(replayer.feed(1, sent_at_ms=1005 * 1000 + 1))  # watermark -> 1000000, fires
     fired = [e for e in evaluations if e.second == 1000]
     assert len(fired) == 1
     # Second 1000's bucket holds both the on-time and the out-of-order
@@ -85,6 +90,21 @@ def test_command_messages_filtered_like_production_commandfilter():
         if not m["text"].startswith("!"):
             list(replayer.feed(m["broadcaster_id"], m["sent_at"]))
     assert replayer._states[1].counts.get(1000, 0) == 1  # the "!clip" message never counted
+
+
+def test_command_message_still_advances_watermark():
+    """SentAtTimestampAssigner runs on the source's WatermarkStrategy,
+    upstream of CommandFilter in clip_detector_job.py -- so a command's
+    sent_at advances the real watermark even though CommandFilter drops it
+    before AnomalyDetector ever sees it. If replay() only fed non-command
+    messages into the watermark, a command-heavy channel would make the
+    harness's clock lag behind what production actually does."""
+    lines = [
+        msg(1, 1000 * 1000, text="hello"),      # bucket 1000, not yet due
+        msg(1, 1005 * 1000 + 1, text="!clip"),  # command -- watermark -> 1000000, never counted
+    ]
+    evaluations = list(replay(lines, CONFIG))
+    assert [e.second for e in evaluations] == [1000]
 
 
 def test_replay_is_deterministic_on_repeat():
