@@ -138,6 +138,7 @@ services:
     volumes:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
+      - ./services/flink-job/clip_attempt.py:/opt/flink/usrlib/clip_attempt.py:ro
       - ./services/flink-job/spike_detector.py:/opt/flink/usrlib/spike_detector.py:ro
       - ./services/flink-job/token_manager.py:/opt/flink/usrlib/token_manager.py:ro
     depends_on:
@@ -188,9 +189,13 @@ services:
       # a UI level.
       - DETECTION_STD_DEV_THRESHOLD=5.0
       - DETECTION_COOLDOWN_SECONDS=30
+      - CLIP_INITIAL_DELAY_SECONDS=10
+      - CLIP_CREATE_RETRY_DELAYS=0,2,4
+      - CLIP_METADATA_RETRY_DELAYS=5,10,15,30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
+      - ./services/flink-job/clip_attempt.py:/opt/flink/usrlib/clip_attempt.py:ro
       - ./services/flink-job/spike_detector.py:/opt/flink/usrlib/spike_detector.py:ro
       - ./services/flink-job/token_manager.py:/opt/flink/usrlib/token_manager.py:ro
     depends_on:
