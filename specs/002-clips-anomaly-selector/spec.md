@@ -97,11 +97,16 @@ As a user visiting the clips page, I want a clean, contemporary interface, so th
   | 11+ | Legendary |
 - **FR-001a**: The threshold-to-label mapping MUST be stored as a frontend constant (single JavaScript object) for easy modification.
 - **FR-001b**: The displayed levels are deliberately **not** derived from the detection floor
-  (`STD_DEV_THRESHOLD`, currently 5.0). The floor is a collection decision and is set lower on
-  purpose: a Twitch clip cannot be created retroactively, so clips are captured from 5.0 up to keep
+  (`STD_DEV_THRESHOLD`, currently 4.0). The floor is a collection decision and is set lower on
+  purpose: a Twitch clip cannot be created retroactively, so clips are captured from 4.0 up to keep
   the option of exposing a lower level later. Clips scoring between the floor and the lowest displayed
   level are stored but not reachable through the UI. This is intended. The floor MUST never be set
   *above* the lowest displayed level, which would leave that level permanently empty.
+  *(Plan 06 Phase 4 set the floor to 4.0 from the corpus distribution. The levels above are still the
+  ones chosen for the pre-Plan-06 scale, on which a resting channel scored 7 to 17. On the current
+  scale 7 is the 99.96th percentile of per-second readings and 11 the 99.995th, so the three
+  levels no longer divide the range they were drawn for. Renumbering them is blocked on Plan 06
+  Phase 6 and is not part of this change.)*
 - **FR-002**: System MUST filter displayed clips to only show those meeting or exceeding the selected anomaly threshold.
 - **FR-002a**: System MUST always have a threshold selected; "no filter" or "show all" is NOT a valid option.
 - **FR-002b**: System MUST default to "Unhinged" (9+ std dev) when a user first visits the page.

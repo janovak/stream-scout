@@ -43,15 +43,14 @@ def evaluate_at(counts, second=NOW, hold=None, last_fire_second=None, config=CON
 def intensity_of(counts, second=NOW, config=CONFIG):
     """The intensity evaluate() measured this second, fired or not.
 
-    evaluate() only reports a measurement when an episode ends, so most seconds
-    surface nothing. Drop the trigger to -inf and every second counts as
-    elevated, which opens a hold whose peak is that second's own reading.
+    `emit` only carries a measurement when an episode ends, so most seconds
+    surface nothing there. Decision.measurement is the same second's reading,
+    reported whether or not it reached the trigger (Plan 06 Phase 4 step 17).
     Returns None only when the second was genuinely unmeasurable (warm-up gate,
     or a baseline with no spread).
     """
-    always_elevated = replace(config, k=float("-inf"))
-    decision = evaluate(counts, second, None, None, always_elevated)
-    return None if decision.hold is None else decision.hold.peak_intensity
+    decision = evaluate(counts, second, None, None, config)
+    return None if decision.measurement is None else decision.measurement.intensity
 
 
 class TestCommandFilter:
@@ -92,9 +91,24 @@ class TestShippedDefaults:
         monkeypatch.setenv("DETECTION_MIN_BASELINE_FRACTION", "0.5")
         assert DetectorConfig.from_env().min_baseline_fraction == 0.5
 
-    def test_hold_cap_default_is_a_placeholder(self):
-        # Untuned: Plan 06 Phase 4 step 19 picks the real value off the corpus.
-        assert DetectorConfig().hold_cap_seconds == 60
+    def test_tuned_defaults_come_from_the_corpus(self):
+        """Plan 06 Phase 4 replaced two placeholders with measured values.
+
+        Both were read off 840,225 per-second readings from the 12-hour
+        corpus, recorded with the trigger disabled. k is the 99.71st
+        percentile of that distribution. The cap is one second past the
+        longest elevated period in the whole corpus, which ran 24 seconds --
+        deliberately the smallest value that truncates nothing, because the
+        cap bounds how far a reported peak can sit behind the clip request.
+        """
+        config = DetectorConfig()
+        assert config.k == 4.0
+        assert config.hold_cap_seconds == 25
+
+    def test_the_cap_still_leaves_room_for_the_longest_measured_period(self):
+        # The longest elevated period in 12h was 24s, at every k from 2.5 up.
+        # A cap at or under that would truncate real spikes.
+        assert DetectorConfig().hold_cap_seconds > 24
 
     def test_k_reads_the_unchanged_environment_variable_name(self, monkeypatch):
         # Renamed std_dev_threshold -> k in code only. docker-compose.yml and
@@ -316,6 +330,83 @@ class TestWarmUpGate:
         decision = evaluate_at(counts)
         assert decision.emit is None
         assert decision.hold is None
+
+
+class TestPerSecondMeasurement:
+    """Plan 06 Phase 4 step 17: every second's reading, elevated or not.
+
+    `emit` reports the peak of a period that has already ended, so it censors
+    the distribution twice over -- it drops every quiet second, and it reports
+    one value per period instead of one per second. Decision.measurement is
+    additive and carries the same arithmetic the trigger compared. The
+    operator ignores it.
+    """
+
+    def test_a_quiet_second_still_reports_its_reading(self):
+        counts = steady_baseline()
+        counts.update({ts: 10 for ts in WINDOW})
+        decision = evaluate_at(counts)
+        assert decision.emit is None and decision.hold is None
+        assert decision.measurement is not None
+        assert decision.measurement.detected_at_seconds == NOW
+        # Window mean equals baseline mean, so the reading is 0 -- a real
+        # number, and the value the trigger compared against k.
+        assert decision.measurement.intensity == pytest.approx(0.0, abs=1e-9)
+
+    def test_the_reading_does_not_depend_on_the_trigger(self):
+        """The whole point of step 17: one replay gives every k's distribution."""
+        counts = steady_baseline()
+        counts.update({ts: 40 for ts in WINDOW})
+        readings = [
+            evaluate_at(counts, config=replace(CONFIG, k=k)).measurement
+            for k in (0.5, 3.0, 1000.0)
+        ]
+        assert readings[0] == readings[1] == readings[2]
+        assert readings[0].intensity > 0
+
+    def test_the_reading_is_this_second_not_the_reported_peak(self):
+        """On the second an episode ends, the two carry different values."""
+        counts = steady_baseline()
+        counts.update({ts: 10 for ts in WINDOW})  # back to resting, ends the episode
+        peak = Spike(
+            message_count=500,
+            baseline_mean=10.0,
+            baseline_std=1.0,
+            intensity=90.0,
+            detected_at_seconds=NOW - 4,
+        )
+        decision = evaluate_at(counts, hold=HoldState.opened(peak))
+        assert decision.emit.intensity == 90.0
+        assert decision.emit.detected_at_seconds == NOW - 4
+        assert decision.measurement.detected_at_seconds == NOW
+        assert decision.measurement.intensity == pytest.approx(0.0, abs=1e-9)
+
+    def test_an_unmeasurable_second_reports_no_reading(self):
+        """None distinguishes 'could not measure' from 'measured a low value'."""
+        warming_up = {ts: 1000 for ts in WINDOW}
+        warming_up.update({ts: 5 for ts in range(981, 996)})  # 15s watched, gate needs 16
+        assert evaluate_at(warming_up).measurement is None
+
+        no_spread = {ts: 5 for ts in BASELINE}
+        no_spread.update({ts: 5000 for ts in WINDOW})
+        assert evaluate_at(no_spread).measurement is None
+
+    def test_observed_seconds_is_what_the_gate_compares(self):
+        """Step 22 prices min_baseline_fraction from a run at another value."""
+        counts = {ts: 1000 for ts in WINDOW}
+        counts.update({ts: 5 for ts in range(981, 996)})
+        # Window starts at 996 and the oldest baseline bucket is 981.
+        assert evaluate_at(counts).observed_seconds == 15
+        # Reported on the blocked path too -- that is the path step 22 counts.
+        assert evaluate_at(counts).measurement is None
+
+    def test_observed_seconds_is_zero_when_nothing_has_been_seen(self):
+        assert evaluate_at({ts: 3 for ts in WINDOW}).observed_seconds == 0
+
+    def test_observed_seconds_saturates_at_the_full_baseline(self):
+        counts = steady_baseline()
+        counts.update({ts: 10 for ts in WINDOW})
+        assert evaluate_at(counts).observed_seconds == CONFIG.baseline_seconds
 
 
 class TestPeakHold:

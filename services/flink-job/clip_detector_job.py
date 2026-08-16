@@ -611,7 +611,8 @@ class AnomalyDetector(KeyedProcessFunction):
         # it only started inside the anomaly branch -> the /metrics endpoint
         # stayed dark, tripping ClipDetectorMetricsDown, through any quiet
         # stretch with no spikes -- much more likely now that
-        # STD_DEV_THRESHOLD is 5.0 instead of 1.0).
+        # STD_DEV_THRESHOLD is 4.0 instead of 1.0, and on a scale where a
+        # resting channel scores about 0 rather than 7 to 17).
         # Must be here, not at module scope: module-level start_http_server()
         # runs on the jobmanager during job submission too, and pollutes the
         # driver process with an unpicklable thread lock before cloudpickle
