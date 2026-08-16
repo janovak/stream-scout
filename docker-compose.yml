@@ -295,7 +295,18 @@ services:
       # removes few real events. The value stays at 30 on purpose. Plan 06
       # keeps it at 30 for now, so that this phase changes one thing only.
       - DETECTION_COOLDOWN_SECONDS=30
-      - CLIP_INITIAL_DELAY_SECONDS=10
+      # How long to wait after a detection before the clip request. This was
+      # 10 seconds, which was correct for the earlier detector: that one
+      # reported at the start of a spike, and the wait moved the clip window
+      # forward onto the moment. Plan 06 Phase 3 moved the report to the end of
+      # the spike, so the same wait moved the window past the moment.
+      #
+      # Measured on the 12-hour corpus. At 10 seconds the clip covered -9.9 to
+      # +20.1 seconds around the report, and 6 of 516 clips did not contain
+      # their own peak. At 0 the clip covers -19.9 to +10.1 seconds, all 516
+      # contain their peak, and the median peak sits 60% through the clip
+      # instead of 26%. See ClipPolicy in services/flink-job/clip_attempt.py.
+      - CLIP_INITIAL_DELAY_SECONDS=0
       - CLIP_CREATE_RETRY_DELAYS=0,2,4
       - CLIP_METADATA_RETRY_DELAYS=5,10,15,30
     volumes:

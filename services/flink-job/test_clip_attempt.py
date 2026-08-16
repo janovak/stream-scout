@@ -7,6 +7,8 @@ sequence, not on elapsed wall-clock time -- the whole suite must run in
 well under a second.
 """
 
+from dataclasses import replace
+
 import pytest
 
 from clip_attempt import ClipAttempt, ClipPolicy
@@ -86,9 +88,19 @@ class TestClipAttemptHappyPath:
         )
         ClipAttempt(twitch, DEFAULT_POLICY, clock).run(broadcaster_id=1)
 
-        # initial delay (10), then the 0-delay create retry is skipped (no
-        # sleep for delay==0), then the metadata schedule: 5, 10, 15, 30
-        assert clock.sleeps == [10, 5, 10, 15, 30]
+        # The initial delay is 0 and is skipped, as the 0-delay create retry
+        # is. What remains is the metadata schedule: 5, 10, 15, 30.
+        assert clock.sleeps == [5, 10, 15, 30]
+
+    def test_a_configured_initial_delay_is_still_waited(self):
+        clock = FakeClock()
+        twitch = StubTwitch(
+            create_clip_effects=["clip123"],
+            get_clip_effects=[{"embed_url": "u", "thumbnail_url": "t"}],
+        )
+        policy = replace(DEFAULT_POLICY, initial_delay_seconds=10)
+        ClipAttempt(twitch, policy, clock).run(broadcaster_id=1)
+        assert clock.sleeps == [10, 5]
 
 
 class TestClipAttemptCreateRetries:

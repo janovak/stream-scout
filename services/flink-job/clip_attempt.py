@@ -52,7 +52,29 @@ class ClipPolicy:
     # before, just taking up to 21 minutes to find out instead of 50 seconds.
     # Settled on a modest bump over the original instead: same 4 attempts, same
     # shape, just a longer last step (t=5,15,30,60 vs the original t=5,15,30,50).
-    initial_delay_seconds: int = 10
+    # This wait was correct for the earlier detector, which reported at the
+    # start of a spike. A wait then moved the clip window forward, onto the
+    # moment. Plan 06 Phase 3 moved the report to the end of the spike. The
+    # same wait now moves the window past the moment.
+    #
+    # Plan 06 Phase 4 measured the full chain on the 12-hour corpus. At a wait
+    # of 10 seconds the API call occurs 15.1 seconds after the report: 5
+    # seconds for the watermark to pass that second, 0.1 seconds from Twitch to
+    # our Kafka, and the 10-second wait. Twitch publishes the last 30 seconds
+    # of its capture, which is 25 seconds before the call to 5 seconds after.
+    # The clip thus covers -9.9 to +20.1 seconds around the report. A peak more
+    # than 9.9 seconds before the report is not in its own clip. That was true
+    # for 6 of 516 clips.
+    #
+    # At 0 the clip covers -19.9 to +10.1 seconds. All 516 clips then contain
+    # their peak. The median peak also moves from 26% to 60% through the clip.
+    #
+    # Do not use 3 seconds. It centers the median peak more exactly, but it
+    # leaves only 0.9 seconds of margin on the worst case that the corpus
+    # found. Margin is more important here, because the two failures are not
+    # equal: a peak near the start of a clip is still a usable clip, and a
+    # missing peak is not.
+    initial_delay_seconds: int = 0
     create_retry_delays: tuple = (0, 2, 4)
     metadata_retry_delays: tuple = (5, 10, 15, 30)
 
@@ -67,7 +89,7 @@ class ClipPolicy:
             raise ValueError("CLIP_METADATA_RETRY_DELAYS must not be empty -- an empty schedule "
                               "means get_clip is never called")
         return cls(
-            initial_delay_seconds=int(os.getenv("CLIP_INITIAL_DELAY_SECONDS", "10")),
+            initial_delay_seconds=int(os.getenv("CLIP_INITIAL_DELAY_SECONDS", "0")),
             create_retry_delays=create_retry_delays,
             metadata_retry_delays=metadata_retry_delays,
         )
@@ -97,9 +119,12 @@ class ClipAttempt:
     def run(self, broadcaster_id: int) -> AttemptResult:
         start_time = self._clock.now()
 
-        logger.info(f"Waiting {self._policy.initial_delay_seconds}s before clip creation "
-                    f"to center moment in clip...")
-        self._clock.sleep(self._policy.initial_delay_seconds)
+        # Skip the sleep at 0, as the create-retry loop below does for a delay
+        # of 0. The shipped value is 0, so this is the usual path.
+        if self._policy.initial_delay_seconds > 0:
+            logger.info(f"Waiting {self._policy.initial_delay_seconds}s before clip creation. "
+                        f"This moves the clip window later, away from the peak.")
+            self._clock.sleep(self._policy.initial_delay_seconds)
 
         clip_id = None
         last_error = None
