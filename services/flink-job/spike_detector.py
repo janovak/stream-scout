@@ -76,13 +76,22 @@ class DetectorConfig:
     # was a frontend change. It decreased this value to 10 and did not restore
     # it. The cost is a warm-up delay. See min_baseline_fraction below.
     #
-    # There is a second cost. The buckets of a spike enter the baseline
-    # window_seconds later and stay for this many seconds. They increase the
-    # baseline standard deviation for that time. The detector is therefore less
-    # sensitive to a second spike for up to 5 minutes after the first one. At
-    # baseline_seconds=10 that effect cleared in 10 seconds. The 30-second
-    # cooldown no longer describes the full recovery time. Plan 06 Phase 4 step
-    # 20 measures the interval between real spikes and decides what to do.
+    # There is a second cost. Plan 06 Phase 4 step 21 measured it on the
+    # 12-hour corpus. The buckets of a spike enter the baseline
+    # window_seconds later. They stay for this many seconds. The detector is
+    # thus less sensitive to a second spike. Sensitivity falls to 0.66 at the
+    # end of the cooldown. It is worst at 0.57, near 240 seconds. It returns
+    # at approximately 305 seconds. That time is baseline_seconds +
+    # window_seconds. The 30-second cooldown covers a tenth of it.
+    #
+    # This is mostly not a defect. The baseline mean increases 1.55 times in
+    # that period. The standard deviation increases 1.57 times. Their ratio
+    # stays between 1.03 and 1.14. The channel is thus truly more busy after
+    # a large moment, and a trailing baseline must follow that. Only the
+    # additional spread comes from the buckets of the spike. A robust
+    # baseline that removed all of it gives 8.9% more detections. That is a
+    # change to the arithmetic, not to a value here. It belongs with the
+    # cooldown question that Plan 06 keeps for a later time.
     baseline_seconds: int = 300
 
     # The trigger, in standard deviations above the baseline mean. Spec 002
@@ -91,17 +100,50 @@ class DetectorConfig:
     # DETECTION_STD_DEV_THRESHOLD. docker-compose.yml and spec 002 FR-001b use
     # that name.
     #
-    # The value 5.0 comes from the earlier formula. It has no meaning on the
-    # new scale, because Phase 3 removed the constant offset that it was
-    # chosen against. Plan 06 Phase 4 selects the correct value from a
-    # percentile of the corpus distribution.
-    k: float = 5.0
+    # Plan 06 Phase 4 step 18 read this value from the corpus distribution.
+    # The corpus gives 840,225 broadcaster-seconds, in 12 hours, from 72
+    # broadcasters. The tool recorded the reading of every second with the
+    # trigger off. 4.0 is the 99.71st percentile of that distribution. The
+    # median second scores -0.15. Flat chat thus scores approximately zero,
+    # and the trigger is in the tail.
+    #
+    # The result is 516 detections in 12 hours. That is 2.2 for each
+    # broadcaster-hour, from 61 of the 72 broadcasters. The median detection
+    # is a burst 6.4 times the resting rate of its channel. The tool measured
+    # the adjacent values also. 3.0 gives 4.7 for each broadcaster-hour. 5.0
+    # gives 1.1, and only 54 broadcasters. The earlier value of 5.0 came from
+    # the formula that Phase 3 deleted. It had no meaning on this scale.
+    k: float = 4.0
 
     # The maximum length of one elevated period, before the detector reports a
-    # result. This value is a placeholder. Plan 06 Phase 4 step 19 sets it from
-    # the measured length of real spikes.
-    hold_cap_seconds: int = 60
+    # result. Plan 06 Phase 4 step 19 measured real periods on the corpus with
+    # no cap. The median period lasts 2 seconds. The 99th percentile is 14
+    # seconds. The longest one in 12 hours is 24 seconds. A cap of 25 thus
+    # cuts short no period. This is true for each trigger from 4.0 up. At a
+    # trigger of 2.5 the cap cuts short 0.4% of the periods.
+    #
+    # Use the smallest cap that cuts short no period. Do not use a large one.
+    # Phase 3 moved the report from the start of a period to its end. The cap
+    # thus sets the maximum distance between the peak and the second that
+    # asks Twitch for a clip. The earlier value of 60 was a placeholder. It
+    # permitted a distance 2.5 times more than any real period needs. Phase 6
+    # must correct that defect. This value does not correct it. It keeps the
+    # defect no larger than the measurements permit.
+    hold_cap_seconds: int = 25
 
+    # Plan 06 Phase 4 step 20 measured the interval between periods with this
+    # value at zero. The distribution has two parts, with almost nothing
+    # between them. 22.7% of the adjacent pairs are less than 3 seconds apart.
+    # Each of those is one chat reaction that moves across the trigger more
+    # than one time. 61.2% are more than 300 seconds apart. Those are separate
+    # events. Only 2.7% are between 10 and 30 seconds. Thus 30 removes very
+    # few real events. But a 3-second cooldown removes almost the same
+    # flicker.
+    #
+    # The value stays at 30. Plan 06 keeps it at 30 for now on purpose. Two
+    # changes to behavior at the same time make attribution impossible. Also,
+    # the correct tool for flicker is re-arm hysteresis, not a flat delay.
+    # The measurement above is what that later decision needs.
     cooldown_seconds: int = 30
 
     # The warm-up gate. The detector must watch a channel for
@@ -113,6 +155,21 @@ class DetectorConfig:
     # bucket counts as zero. A count of populated buckets would instead reject
     # every quiet channel permanently. On the Plan 06 dev-slice corpus, a count
     # of populated buckets blocks 7 of 23 broadcasters for the full hour.
+    #
+    # Plan 06 Phase 4 step 22 measured this value, which no one had measured
+    # before. 0.8 blocks 2.22% of the evaluated seconds. It costs nothing
+    # more. The shortest appearance in the corpus is 410 seconds, so each
+    # channel gets past the gate. Each value from 0.5 to 0.9 gives the same
+    # result, to within 5 detections of 516. The value is thus on a flat part
+    # of the curve.
+    #
+    # The two ends are different. Below approximately 0.1 the readings have no
+    # value. With the gate open, a second whose baseline holds one populated
+    # bucket in 300 scores as much as 478. Do not use 1.0. observed_seconds
+    # reaches the full 300 only when a message is in the single oldest
+    # baseline second. 1.0 thus becomes a test of bucket density. It blocks
+    # 39.9% of the seconds, against 2.7% at 0.9. That is the same fault that
+    # the new gate removed. __post_init__ rejects 1.0 for that reason.
     min_baseline_fraction: float = 0.8
 
     def __post_init__(self):
@@ -131,9 +188,17 @@ class DetectorConfig:
             raise ValueError(f"hold_cap_seconds must be >= 0, got {self.hold_cap_seconds}")
         if self.cooldown_seconds < 0:
             raise ValueError(f"cooldown_seconds must be >= 0, got {self.cooldown_seconds}")
-        if not 0.0 < self.min_baseline_fraction <= 1.0:
+        # The range excludes 1.0, and not only the values above it.
+        # observed_seconds reaches the full baseline only when a message is in
+        # the single oldest baseline second. 1.0 thus stops the measurement of
+        # elapsed time. It becomes a test of bucket density. On the Plan 06
+        # corpus it blocks 39.9% of the seconds, against 2.7% at 0.9. The
+        # fault is silent, so reject the value here.
+        if not 0.0 < self.min_baseline_fraction < 1.0:
             raise ValueError(
-                f"min_baseline_fraction must be in (0, 1], got {self.min_baseline_fraction}"
+                f"min_baseline_fraction must be in (0, 1), got "
+                f"{self.min_baseline_fraction}. 1.0 needs a message in the oldest "
+                f"baseline second, which makes the gate a density test."
             )
         # The timer chain of the operator runs only while the key holds
         # buckets. That is baseline_seconds + window_seconds after the last
@@ -251,6 +316,31 @@ class Decision:
     hold: Optional[HoldState]       # the updated hold to keep in ValueState
     expired_buckets: List[int]      # the operator removes these from MapState
 
+    # The two fields below are diagnostic. The operator does not read them.
+    # AnomalyDetector uses `emit`, `hold` and `expired_buckets` only.
+    #
+    # Plan 06 Phase 4 step 17 needs the reading of every second. `emit` gives
+    # the seconds that reported a spike only. It also carries the peak of a
+    # period that ended before it. A separate tool could calculate the same
+    # numbers again. But that tool could then disagree with the detector.
+    # These fields thus give the arithmetic of the detector itself. The
+    # measured distribution is therefore the distribution that the detector
+    # sees.
+
+    # The reading of this second, at the trigger or not. It is None for a
+    # second that the detector cannot measure. That occurs when the warm-up
+    # gate rejects the second, or when the baseline has no spread.
+    # `intensity` does not depend on `k`, `hold_cap_seconds` or
+    # `cooldown_seconds`. Thus one replay gives the full distribution for each
+    # value of those three fields.
+    measurement: Optional[Spike] = None
+
+    # The time that the detector has watched this key, in seconds. The warm-up
+    # gate compares this quantity against `min_baseline_fraction x
+    # baseline_seconds`. Plan 06 Phase 4 step 22 uses it to measure the cost
+    # of the gate at other fractions.
+    observed_seconds: int = 0
+
 
 def evaluate(
     counts: Mapping[int, int],      # bucket second -> message count
@@ -316,7 +406,7 @@ def evaluate(
         0 if oldest_baseline_bucket is None else window_start - oldest_baseline_bucket
     )
     if observed_seconds < min_observed_seconds:
-        return _unmeasurable(second, hold, expired_buckets, config)
+        return _unmeasurable(hold, expired_buckets, observed_seconds)
 
     baseline_mean, baseline_std = _mean_and_sample_stdev(baseline_counts)
 
@@ -324,7 +414,7 @@ def evaluate(
         # A baseline with no spread gives the score nothing to divide by. In
         # practice this means very little traffic. It does not mean a channel
         # so regular that any change is very large.
-        return _unmeasurable(second, hold, expired_buckets, config)
+        return _unmeasurable(hold, expired_buckets, observed_seconds)
 
     window_mean = window_total / config.window_seconds
     intensity = (window_mean - baseline_mean) / baseline_std
@@ -338,16 +428,30 @@ def evaluate(
     )
     elevated = intensity >= config.k
 
+    # Each branch below gives the same three values. Only `emit` and `hold`
+    # change. This local function keeps the three values in one place. A new
+    # field on Decision is thus added one time, and not at five different
+    # points. At five points, the one that you forget returns a default value
+    # with no error.
+    def decide(emit: Optional[Spike], hold: Optional[HoldState]) -> Decision:
+        return Decision(
+            emit=emit,
+            hold=hold,
+            expired_buckets=expired_buckets,
+            measurement=measurement,
+            observed_seconds=observed_seconds,
+        )
+
     if hold is None:
         if not elevated:
-            return Decision(emit=None, hold=None, expired_buckets=expired_buckets)
+            return decide(emit=None, hold=None)
         if _in_cooldown(second, last_fire_second, config):
             # The cooldown stops a new period from opening. It does not stop
             # each report. An open period always runs to its own end. The hold
             # already gives one report per period. A cooldown that could stop
             # an open period would only cut it short. It would then report a
             # peak that had not yet occurred.
-            return Decision(emit=None, hold=None, expired_buckets=expired_buckets)
+            return decide(emit=None, hold=None)
         hold = HoldState.opened(measurement)
     elif elevated:
         hold = hold.with_peak(measurement)
@@ -355,21 +459,20 @@ def evaluate(
         # The intensity fell below the trigger. The period is complete, so
         # report its peak. This second is not part of the period. It therefore
         # cannot become the peak.
-        return Decision(emit=hold.to_spike(), hold=None, expired_buckets=expired_buckets)
+        return decide(emit=hold.to_spike(), hold=None)
 
     # The channel is still elevated. Report a result when the hold reaches its
     # full cap. A period that stays elevated must still produce a clip.
     if second - hold.started_at >= config.hold_cap_seconds:
-        return Decision(emit=hold.to_spike(), hold=None, expired_buckets=expired_buckets)
+        return decide(emit=hold.to_spike(), hold=None)
 
-    return Decision(emit=None, hold=hold, expired_buckets=expired_buckets)
+    return decide(emit=None, hold=hold)
 
 
 def _unmeasurable(
-    second: int,
     hold: Optional[HoldState],
     expired_buckets: List[int],
-    config: DetectorConfig,
+    observed_seconds: int,
 ) -> Decision:
     """The result for a second that the detector cannot measure.
 
@@ -377,8 +480,18 @@ def _unmeasurable(
     A report here would give a peak that was measured against a baseline the
     detector can no longer see. Removal would lose a real spike. evaluate()
     has already removed the hold if its peak is too old.
+
+    `measurement` stays None here. A caller can thus tell an unmeasurable
+    second from a second with a low intensity. `observed_seconds` still comes
+    out. The warm-up gate is one of the two causes of an unmeasurable second,
+    and step 22 must count how frequently it is the cause.
     """
-    return Decision(emit=None, hold=hold, expired_buckets=expired_buckets)
+    return Decision(
+        emit=None,
+        hold=hold,
+        expired_buckets=expired_buckets,
+        observed_seconds=observed_seconds,
+    )
 
 
 def _mean_and_sample_stdev(values: List[int]) -> Tuple[float, float]:

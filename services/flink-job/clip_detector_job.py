@@ -611,7 +611,8 @@ class AnomalyDetector(KeyedProcessFunction):
         # it only started inside the anomaly branch -> the /metrics endpoint
         # stayed dark, tripping ClipDetectorMetricsDown, through any quiet
         # stretch with no spikes -- much more likely now that
-        # STD_DEV_THRESHOLD is 5.0 instead of 1.0).
+        # STD_DEV_THRESHOLD is 4.0 instead of 1.0, and on a scale where a
+        # resting channel scores about 0 rather than 7 to 17).
         # Must be here, not at module scope: module-level start_http_server()
         # runs on the jobmanager during job submission too, and pollutes the
         # driver process with an unpicklable thread lock before cloudpickle
@@ -704,8 +705,8 @@ class AnomalyDetector(KeyedProcessFunction):
 
             # Keep the elevated period across seconds. Write only when the
             # value changes. The code reads an open hold every second, so an
-            # unconditional write would store the same value up to 60 times in
-            # one period.
+            # unconditional write would store the same value once per second
+            # of the period, up to hold_cap_seconds times.
             if decision.hold != hold:
                 if decision.hold is None:
                     self.hold.clear()
@@ -720,7 +721,7 @@ class AnomalyDetector(KeyedProcessFunction):
             #
             # The cap normally ends an open period long before this chain
             # stops. DetectorConfig keeps hold_cap_seconds below
-            # baseline_seconds + window_seconds (60 against 305 at the
+            # baseline_seconds + window_seconds (25 against 305 at the
             # defaults), and buckets stay for that full span after the last
             # message. One case can still stop the chain with a period open: a
             # watermark that stops, so no timer runs at all. The state TTL

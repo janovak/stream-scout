@@ -139,28 +139,54 @@ services:
       # thresholds are ranks, not times. They stop a channel near the rank
       # boundary from leaving and rejoining. They do not guarantee that any
       # channel stays monitored for 4 minutes. A channel that enters the top 15
-      # and leaves the top 30 within 4 minutes produces no detections.
+      # and leaves the top 30 within 4 minutes produces no detections. Plan 06
+      # Phase 4 step 22 found no such channel in 12 hours: the shortest
+      # unbroken appearance was 410 seconds, against a gate of 240.
       - DETECTION_BASELINE_SECONDS=300
       # The trigger, in standard deviations above the baseline mean.
       # DetectorConfig reads this into its field `k`. The variable keeps its
       # first name, because spec 002 FR-001b uses that name.
       #
-      # WARNING: 5.0 comes from the earlier formula. It has no meaning on the
-      # new scale. The earlier formula added a constant offset, and 5.0 sat
-      # just below the lowest displayed level of 7. Plan 06 Phase 3 removed
-      # that offset. Flat chat now scores approximately 0, and the highest
-      # value measured on the dev-slice corpus is 6.11. Phase 4 selects the
-      # correct value from the corpus distribution. The display levels of
-      # 7, 9 and 11 in the frontend need new numbers at the same time.
-      - DETECTION_STD_DEV_THRESHOLD=5.0
+      # Plan 06 Phase 4 step 18 set this value from the 12-hour corpus. 4.0 is
+      # the 99.71st percentile of 840,225 per-second readings. The tool took
+      # those readings with the trigger off, so nothing removed part of the
+      # distribution. The result is 516 detections in 12 hours. That is 2.2
+      # for each broadcaster-hour, across 61 of the 72 broadcasters. The
+      # median detection is a burst 6.4 times the resting rate of its channel.
+      # The earlier value of 5.0 came from the formula that Phase 3 deleted.
+      # See DetectorConfig in services/flink-job/spike_detector.py.
+      #
+      # This does NOT set the 7 / 9 / 11 display levels in the frontend, or
+      # DEFAULT_MIN_INTENSITY = 9.0 in api_frontend_service.py. On this scale
+      # 9.0 is the 99.99th percentile. That default filter thus hides almost
+      # every clip. Phase 6 must correct it.
+      - DETECTION_STD_DEV_THRESHOLD=4.0
       # The maximum length of one elevated period, before the detector reports
-      # a result. This value is a placeholder. Plan 06 Phase 4 step 19 sets it
-      # from the measured length of real spikes.
-      - DETECTION_HOLD_CAP_SECONDS=60
+      # a result. Plan 06 Phase 4 step 19 measured real periods with no cap.
+      # The median is 2 seconds, the 99th percentile is 14, and the longest in
+      # 12 hours is 24. A cap of 25 thus cuts short no period. Use the
+      # smallest cap that cuts short no period, and not a large one. The cap
+      # sets the maximum distance between the peak and the clip request. The
+      # earlier value of 60 was a placeholder.
+      - DETECTION_HOLD_CAP_SECONDS=25
       # How long the detector must watch a channel before it reports anything,
       # as a fraction of DETECTION_BASELINE_SECONDS. This gate measures elapsed
       # observation time, not how busy the channel is.
+      #
+      # Plan 06 Phase 4 step 22 measured it. 0.8 blocks 2.22% of the evaluated
+      # seconds. Each value from 0.5 to 0.9 stays within 5 detections of it.
+      # Do not set this to 1.0. observed_seconds reaches the full 300 only
+      # when a message is in the single oldest baseline second. 1.0 thus
+      # becomes a test of bucket density. It blocks 39.9% of the seconds,
+      # against 2.7% at 0.9. DetectorConfig rejects 1.0 at start-up.
       - DETECTION_MIN_BASELINE_FRACTION=0.8
+      # Plan 06 Phase 4 step 20 measured the interval between periods with
+      # this value at zero. 22.7% of the adjacent pairs are less than 3
+      # seconds apart. Each of those is one reaction that moves across the
+      # trigger more than one time. 61.2% are more than 300 seconds apart, and
+      # those are separate events. Only 2.7% are between 10 and 30, so 30
+      # removes few real events. The value stays at 30 on purpose. Plan 06
+      # keeps it at 30 for now, so that this phase changes one thing only.
       - DETECTION_COOLDOWN_SECONDS=30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
@@ -220,30 +246,67 @@ services:
       # thresholds are ranks, not times. They stop a channel near the rank
       # boundary from leaving and rejoining. They do not guarantee that any
       # channel stays monitored for 4 minutes. A channel that enters the top 15
-      # and leaves the top 30 within 4 minutes produces no detections.
+      # and leaves the top 30 within 4 minutes produces no detections. Plan 06
+      # Phase 4 step 22 found no such channel in 12 hours: the shortest
+      # unbroken appearance was 410 seconds, against a gate of 240.
       - DETECTION_BASELINE_SECONDS=300
       # The trigger, in standard deviations above the baseline mean.
       # DetectorConfig reads this into its field `k`. The variable keeps its
       # first name, because spec 002 FR-001b uses that name.
       #
-      # WARNING: 5.0 comes from the earlier formula. It has no meaning on the
-      # new scale. The earlier formula added a constant offset, and 5.0 sat
-      # just below the lowest displayed level of 7. Plan 06 Phase 3 removed
-      # that offset. Flat chat now scores approximately 0, and the highest
-      # value measured on the dev-slice corpus is 6.11. Phase 4 selects the
-      # correct value from the corpus distribution. The display levels of
-      # 7, 9 and 11 in the frontend need new numbers at the same time.
-      - DETECTION_STD_DEV_THRESHOLD=5.0
+      # Plan 06 Phase 4 step 18 set this value from the 12-hour corpus. 4.0 is
+      # the 99.71st percentile of 840,225 per-second readings. The tool took
+      # those readings with the trigger off, so nothing removed part of the
+      # distribution. The result is 516 detections in 12 hours. That is 2.2
+      # for each broadcaster-hour, across 61 of the 72 broadcasters. The
+      # median detection is a burst 6.4 times the resting rate of its channel.
+      # The earlier value of 5.0 came from the formula that Phase 3 deleted.
+      # See DetectorConfig in services/flink-job/spike_detector.py.
+      #
+      # This does NOT set the 7 / 9 / 11 display levels in the frontend, or
+      # DEFAULT_MIN_INTENSITY = 9.0 in api_frontend_service.py. On this scale
+      # 9.0 is the 99.99th percentile. That default filter thus hides almost
+      # every clip. Phase 6 must correct it.
+      - DETECTION_STD_DEV_THRESHOLD=4.0
       # The maximum length of one elevated period, before the detector reports
-      # a result. This value is a placeholder. Plan 06 Phase 4 step 19 sets it
-      # from the measured length of real spikes.
-      - DETECTION_HOLD_CAP_SECONDS=60
+      # a result. Plan 06 Phase 4 step 19 measured real periods with no cap.
+      # The median is 2 seconds, the 99th percentile is 14, and the longest in
+      # 12 hours is 24. A cap of 25 thus cuts short no period. Use the
+      # smallest cap that cuts short no period, and not a large one. The cap
+      # sets the maximum distance between the peak and the clip request. The
+      # earlier value of 60 was a placeholder.
+      - DETECTION_HOLD_CAP_SECONDS=25
       # How long the detector must watch a channel before it reports anything,
       # as a fraction of DETECTION_BASELINE_SECONDS. This gate measures elapsed
       # observation time, not how busy the channel is.
+      #
+      # Plan 06 Phase 4 step 22 measured it. 0.8 blocks 2.22% of the evaluated
+      # seconds. Each value from 0.5 to 0.9 stays within 5 detections of it.
+      # Do not set this to 1.0. observed_seconds reaches the full 300 only
+      # when a message is in the single oldest baseline second. 1.0 thus
+      # becomes a test of bucket density. It blocks 39.9% of the seconds,
+      # against 2.7% at 0.9. DetectorConfig rejects 1.0 at start-up.
       - DETECTION_MIN_BASELINE_FRACTION=0.8
+      # Plan 06 Phase 4 step 20 measured the interval between periods with
+      # this value at zero. 22.7% of the adjacent pairs are less than 3
+      # seconds apart. Each of those is one reaction that moves across the
+      # trigger more than one time. 61.2% are more than 300 seconds apart, and
+      # those are separate events. Only 2.7% are between 10 and 30, so 30
+      # removes few real events. The value stays at 30 on purpose. Plan 06
+      # keeps it at 30 for now, so that this phase changes one thing only.
       - DETECTION_COOLDOWN_SECONDS=30
-      - CLIP_INITIAL_DELAY_SECONDS=10
+      # How long to wait after a detection before the clip request. This was
+      # 10 seconds, which was correct for the earlier detector: that one
+      # reported at the start of a spike, and the wait moved the clip window
+      # forward onto the moment. Plan 06 Phase 3 moved the report to the end of
+      # the spike, so the same wait moved the window past the moment.
+      #
+      # Measured on the 12-hour corpus. At 10 seconds the clip covered -9.9 to
+      # +20.1 seconds around the report, and 6 of 516 clips did not contain
+      # their own peak. At 0 the clip covers -19.9 to +10.1 seconds, all 516
+      # contain their peak, and the median peak sits 60% through the clip
+      # instead of 26%. See ClipPolicy in services/flink-job/clip_attempt.py.
+      - CLIP_INITIAL_DELAY_SECONDS=0
       - CLIP_CREATE_RETRY_DELAYS=0,2,4
       - CLIP_METADATA_RETRY_DELAYS=5,10,15,30
     volumes:

@@ -75,6 +75,13 @@ class Evaluation:
     second: int
     emit: object  # spike_detector.Spike | None -- the peak, when an episode ended here
 
+    # Carried straight off Decision -- diagnostic only, and not part of what
+    # format_evaluation prints, so the determinism check's output is unchanged.
+    # tools/measure_corpus.py reads these to dump every second's reading for
+    # Plan 06 Phase 4; see the Decision fields of the same names.
+    measurement: object = None  # spike_detector.Spike | None -- this second's reading
+    observed_seconds: int = 0
+
 
 class EventTimeReplayer:
     """
@@ -181,7 +188,13 @@ class EventTimeReplayer:
         if decision.emit is not None:
             state.last_fire_second = second
 
-        return Evaluation(broadcaster_id=broadcaster_id, second=second, emit=decision.emit)
+        return Evaluation(
+            broadcaster_id=broadcaster_id,
+            second=second,
+            emit=decision.emit,
+            measurement=decision.measurement,
+            observed_seconds=decision.observed_seconds,
+        )
 
 
 def replay(lines: Iterable[str], config: DetectorConfig) -> Iterator[Evaluation]:

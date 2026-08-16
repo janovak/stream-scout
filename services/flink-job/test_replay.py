@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from spike_detector import DetectorConfig
-from tools.replay import EventTimeReplayer, replay
+from tools.replay import EventTimeReplayer, format_evaluation, replay
 
 # A short baseline so fixtures stay a readable length -- the shipped default is
 # 300s (see test_spike_detector.py::TestShippedDefaults). These tests are about
@@ -198,6 +198,39 @@ def test_no_spike_emitted_from_steady_traffic():
     """The regression that motivated Plan 06: a resting channel must be silent."""
     lines = steady_then_burst_lines(burst_seconds=())
     assert all(e.emit is None for e in replay(lines, CONFIG))
+
+
+def test_every_evaluation_carries_its_own_reading():
+    """Plan 06 Phase 4 step 17: tools/measure_corpus.py dumps one row per
+    evaluated second, so the harness has to pass Decision's diagnostic fields
+    through instead of only the rare `emit`."""
+    evaluations = list(replay(steady_then_burst_lines(), CONFIG))
+
+    measured = [e for e in evaluations if e.measurement is not None]
+    # Far more readings than firings -- that gap is exactly why step 17 needs
+    # the diagnostic path and cannot read the distribution off `emit`.
+    assert len(measured) > len([e for e in evaluations if e.emit is not None])
+    # Each reading belongs to the second it was reported on.
+    assert all(e.measurement.detected_at_seconds == e.second for e in measured)
+    # The burst is in there, and it is not the only thing in there.
+    assert max(e.measurement.intensity for e in measured) >= CONFIG.k
+    assert min(e.measurement.intensity for e in measured) < CONFIG.k
+
+    # observed_seconds grows with elapsed observation and stops at the
+    # baseline length -- what the warm-up gate compares (step 22).
+    for e in evaluations:
+        assert 0 <= e.observed_seconds <= CONFIG.baseline_seconds
+    assert evaluations[0].observed_seconds == 0
+    assert max(e.observed_seconds for e in evaluations) == CONFIG.baseline_seconds
+
+
+def test_printed_output_ignores_the_diagnostic_fields():
+    """format_evaluation is the determinism check's surface (Verification in
+    plans/06-detection-math.md). The step 17 fields must not appear in it, or
+    every prior replay transcript stops comparing."""
+    evaluations = list(replay(steady_then_burst_lines(), CONFIG))
+    quiet = next(e for e in evaluations if e.emit is None and e.measurement is not None)
+    assert format_evaluation(quiet) == f"{quiet.second} {quiet.broadcaster_id} no-spike"
 
 
 def test_replay_is_deterministic_on_repeat():
