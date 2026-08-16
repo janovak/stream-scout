@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
 """
-Dump every second's detector reading from a corpus, for Plan 06 Phase 4.
+Write the detector reading of every second from a corpus, for Plan 06 Phase 4.
 
-Step 17 asks for the true, uncensored intensity distribution. The detector's
-own output cannot give it. `Decision.emit` carries the peak of an elevation
-period that has already ended, so it reports one value per period and nothing
-at all for the quiet seconds in between -- which is most of them. Reading a
-distribution off that is the same mistake Plan 06's "Why" section describes
-for the old edge-triggered detector.
+Step 17 asks for the full intensity distribution. The output of the detector
+cannot give it. `Decision.emit` carries the peak of an elevation period that
+ended before it. It thus gives one value for each period, and no value for
+the quiet seconds between the periods. Those quiet seconds are most of them.
+A distribution from that data has the same fault that Plan 06 describes for
+the earlier edge-triggered detector.
 
 This tool therefore replays the corpus through tools/replay.py with the
-trigger disabled and writes one row per evaluated broadcaster-second, taken
-from `Decision.measurement`. That field is the detector's own arithmetic, not
-a second implementation of it, so the measured distribution cannot drift from
-the deployed one.
+trigger off. It writes one row for each evaluated broadcaster-second, from
+`Decision.measurement`. That field holds the arithmetic of the detector
+itself. It is not a second copy of that arithmetic. The measured
+distribution therefore agrees with the deployed detector.
 
-`intensity` does not depend on `k`, `hold_cap_seconds` or `cooldown_seconds`:
-those three only decide what the state machine does with a reading, never what
-the reading is. One run therefore serves every candidate value of all three,
-and tools/analyze_corpus.py reconstructs episodes from this dump instead of
-re-replaying the corpus per candidate.
+`intensity` does not depend on `k`, `hold_cap_seconds` or `cooldown_seconds`.
+Those three fields control what the state machine does with a reading. They
+do not control the reading. One run thus serves each candidate value of all
+three. tools/analyze_corpus.py builds the episodes again from this dump. It
+does not replay the corpus for each candidate.
 
-The warm-up gate is a different matter, because it decides whether a reading
-exists at all. Run it wide open (the default `--min-baseline-fraction`
-0.0001, i.e. 0 seconds of required observation) and every row carries its own
-`observed_seconds`, so any stricter fraction can be applied afterwards by
-filtering. Step 22 needs both sides of that filter.
+The warm-up gate is different, because it controls whether a reading exists.
+Run this tool with the gate open. The default `--min-baseline-fraction` of
+0.0001 gives a gate of 0 seconds. Each row then carries its own
+`observed_seconds`. A stricter fraction is thus a filter that you apply
+later. Step 22 needs the data on both sides of that filter.
 
 Usage:
     python tools/measure_corpus.py \\
@@ -35,6 +35,7 @@ Usage:
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -93,11 +94,15 @@ def build_config(args) -> DetectorConfig:
         window_seconds=args.window_seconds,
         baseline_seconds=args.baseline_seconds,
         k=args.k,
-        # Irrelevant to a run with the trigger disabled -- no period can open,
-        # so neither value is ever consulted. Left at the shipped defaults so
-        # the header records something honest rather than something invented.
-        hold_cap_seconds=DetectorConfig.hold_cap_seconds,
-        cooldown_seconds=DetectorConfig.cooldown_seconds,
+        # A run with the trigger off does not use these two values. No period
+        # can open, so the code does not read them. Use zero, and not the
+        # shipped default. DetectorConfig rejects a cap that is not shorter
+        # than baseline_seconds + window_seconds. The shipped cap of 25 would
+        # thus refuse `--baseline-seconds 10`. That is the usual way to test
+        # this tool. The caller did not set the cap, and the run never reads
+        # it, so it must not stop the run.
+        hold_cap_seconds=0,
+        cooldown_seconds=0,
         min_baseline_fraction=args.min_baseline_fraction,
     )
 
@@ -133,14 +138,18 @@ def main():
     started = time.monotonic()
 
     with open(args.out, "w") as out:
-        # A self-describing dump: analysis needs baseline_seconds to convert a
-        # candidate min_baseline_fraction into a number of seconds, and a
-        # reader needs to know the run was not a normal detector run.
+        # The dump describes itself. Analysis needs baseline_seconds, to
+        # change a candidate min_baseline_fraction into a number of seconds.
+        # A reader also needs to know that this was not a usual detector run.
         out.write("#" + json.dumps({
             "corpus": str(args.corpus),
             "window_seconds": config.window_seconds,
             "baseline_seconds": config.baseline_seconds,
-            "k": config.k,
+            # As a string when infinite. json.dumps would otherwise write the
+            # bare word Infinity, which Python reads back but no other JSON
+            # parser accepts. Nothing downstream reads this field; it is here
+            # so a reader can see that the trigger was off.
+            "k": "disabled" if math.isinf(config.k) else config.k,
             "min_baseline_fraction": config.min_baseline_fraction,
             "min_observed_seconds": min_observed_seconds,
         }) + "\n")

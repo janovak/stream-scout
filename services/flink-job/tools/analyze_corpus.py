@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Turn a tools/measure_corpus.py dump into the Plan 06 Phase 4 tables.
+Change a tools/measure_corpus.py dump into the Plan 06 Phase 4 tables.
 
-Steps 18-22 all read the same per-second dump, because `intensity` does not
-depend on `k`, `hold_cap_seconds` or `cooldown_seconds` -- those decide what
-the state machine does with a reading, never what the reading is. So every
-candidate value is priced by re-running the state machine over the recorded
-readings, not by replaying 635 MB of chat again.
+Steps 18 to 22 read the same per-second dump. `intensity` does not depend on
+`k`, `hold_cap_seconds` or `cooldown_seconds`. Those three fields control
+what the state machine does with a reading. They do not control the reading.
+This tool thus measures the cost of each candidate value. It runs the state
+machine again over the recorded readings. It does not replay 635 MB of chat
+one more time.
 
-The state machine here (`reconstruct`) mirrors spike_detector.evaluate()'s
-hold/cooldown/cap branches. It is a second implementation, so it can drift
-from the real one. `--verify` exists for that: it replays a corpus through
-the real detector at the same settings and asserts the episodes match, one
-for one. Run it before trusting a table.
+The state machine here is `reconstruct`. It agrees with the hold, cooldown
+and cap branches of spike_detector.evaluate(). But it is a second copy of
+that logic, so it can become different from the first. `--verify` is the
+control for that risk. It replays a corpus through the real detector at the
+same settings. Then it compares the episodes, one against one. Run it before
+you use a table below.
 
 Usage:
     python tools/analyze_corpus.py /tmp/readings.tsv
@@ -28,8 +30,6 @@ import sys
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 OK, WARMUP, FLAT = 0, 1, 2
 STATUS_CODES = {"ok": OK, "warmup": WARMUP, "flat": FLAT}
@@ -167,9 +167,7 @@ class Episode:
     fired_at: int        # the second the detector reported
     peak_at: int
     peak_intensity: float
-    peak_count: int
-    peak_mean: float
-    peak_std: float
+    peak_count: int      # messages in the peak second's window -- step 21's burst
     start_mean: float    # the baseline at started_at -- the pre-spike reference
     start_std: float
     capped: bool         # reported because the cap expired, not because it fell back
@@ -201,8 +199,6 @@ def reconstruct(readings, k, cap, cooldown, gate):
                 peak_at=series.second[peak_i],
                 peak_intensity=series.intensity[peak_i],
                 peak_count=series.count[peak_i],
-                peak_mean=series.mean[peak_i],
-                peak_std=series.std[peak_i],
                 start_mean=series.mean[start_i],
                 start_std=series.std[start_i],
                 capped=capped,
@@ -301,16 +297,25 @@ def appearances(readings):
 # step 17/18 -- the distribution, and k off a percentile
 
 
-def step_17_18(readings, gate, candidates):
+def step_17_18(readings, gate, cap, cooldown, candidates):
     heading("Step 17/18 -- the uncensored per-second distribution, and k")
 
+    # Test the gate first, then the spread. evaluate() uses that order. A
+    # second that fails both tests thus belongs to the gate. A different order
+    # gives a warm-up cost that disagrees with step 22 for the same dump.
+    #
+    # The order is also necessary for correctness. A row that the dump could
+    # not measure holds no intensity. The `else` branch would put that
+    # non-number into the distribution. main() also refuses a gate that is
+    # more open than the gate of the dump. That is the only condition that
+    # could let such a row get past the gate.
     measurable, warm, blocked, flat = [], 0, 0, 0
     for _, series in readings.rows():
         for i in range(len(series)):
-            if series.status[i] == FLAT:
-                flat += 1
-            elif series.observed[i] < gate:
+            if series.observed[i] < gate:
                 blocked += 1
+            elif series.status[i] != OK:
+                flat += 1
             else:
                 warm += 1
                 measurable.append(series.intensity[i])
@@ -336,15 +341,17 @@ def step_17_18(readings, gate, candidates):
     ))
 
     hours = readings.span_hours()
-    # Broadcaster-hours, not wall-clock hours: the rate a channel sees is what
-    # decides whether a threshold is reasonable, and the corpus watches about
-    # 19 channels at once.
+    # Use broadcaster-hours, and not clock hours. The rate at one channel is
+    # what shows whether a threshold is correct. The corpus watches
+    # approximately 19 channels at the same time.
     broadcaster_hours = total / 3600.0
     rows = []
     for k in candidates:
-        # Episodes at the shipped cap and cooldown -- the firing rate a
-        # percentile implies is what makes it decidable, not the percentile.
-        episodes = reconstruct(readings, k, cap=60, cooldown=30, gate=gate)
+        # Use the cap and the cooldown that this run received. Do not use
+        # fixed values. A fixed cap here measures each k against a config that
+        # the project does not ship. The cap also controls how many episodes
+        # one long elevation becomes.
+        episodes = reconstruct(readings, k, cap=cap, cooldown=cooldown, gate=gate)
         over = sum(1 for v in ordered if v >= k)
         # What the trigger means in chat, not in standard deviations: how many
         # times its own resting rate a channel has to reach to cross it.
@@ -365,20 +372,19 @@ def step_17_18(readings, gate, candidates):
             f"{len(per_broadcaster)}/{len(readings.by_broadcaster)}",
             f"{max(per_broadcaster.values()) / len(episodes):.0%}" if episodes else "-",
         ])
-    print("\nWhat each candidate k costs (cap 60, cooldown 30):\n")
+    print(f"\nWhat each candidate k costs (cap {cap}, cooldown {cooldown}):\n")
     print(table(
         ["k", "seconds >= k", "episodes/12h", "per broadcaster-hour", "clips/day",
          "median burst vs resting", "broadcasters firing", "busiest channel's share"],
         rows,
     ))
-    return ordered
 
 
 # --------------------------------------------------------------------------
 # step 19 -- hold_cap_seconds
 
 
-def step_19(readings, k, gate, caps):
+def step_19(readings, k, cooldown, gate, caps):
     heading(f"Step 19 -- hold_cap_seconds, from how long real spikes stay elevated (k={k})")
 
     runs = elevated_runs(readings, k, gate)
@@ -395,30 +401,50 @@ def step_19(readings, k, gate, caps):
           ("p99", 0.99), ("max", 1.0)]],
     ))
 
-    # A cap that lands before a run ends reports the highest value so far
-    # instead of the run's true peak. Price that loss directly.
+    # The table above measures the phenomenon. It is not the cap decision.
+    # elevated_runs() ends a run at a second the detector could not measure,
+    # and at a gap in evaluated seconds. evaluate() does neither: it keeps the
+    # hold across those seconds and counts the cap from hold.started_at. A
+    # channel that is elevated for 10s, blind for 1s, then elevated for 15s
+    # more is two runs here and one 26-second period there.
+    #
+    # Use the state machine of the detector itself. The code sets `capped`
+    # when the cap ended a period. It does not set `capped` when the reading
+    # fell below the trigger. `capped` thus counts the periods that this cap
+    # cut short.
     rows = []
     for cap in caps:
-        truncated = [r for r in runs if (r[2] - r[1] + 1) > cap]
+        episodes = reconstruct(readings, k, cap=cap, cooldown=cooldown, gate=gate)
+        capped = [e for e in episodes if e.capped]
         shortfalls = []
-        for broadcaster_id, start, _, true_peak in truncated:
-            series = readings.by_broadcaster[broadcaster_id]
-            first = series.index_of(start)
-            # The cap fires at started_at + cap, so the reported peak is the
-            # best reading in [started_at, started_at + cap]. Every second in
-            # that range is inside the run, so all of them measured.
-            best = max(series.intensity[i] for i in range(first, first + cap + 1))
-            shortfalls.append((true_peak - best) / true_peak)
+        for episode in capped:
+            series = readings.by_broadcaster[episode.broadcaster_id]
+            # What the period would have peaked at with no cap: the best
+            # reading from its onset until the intensity first falls back.
+            i = series.index_of(episode.started_at)
+            best = episode.peak_intensity
+            second = episode.started_at
+            while i is not None and i < len(series) and series.second[i] == second:
+                if series.status[i] != OK or series.observed[i] < gate:
+                    break
+                if series.intensity[i] < k:
+                    break
+                best = max(best, series.intensity[i])
+                i += 1
+                second += 1
+            shortfalls.append((best - episode.peak_intensity) / best if best > 0 else 0.0)
         rows.append([
             str(cap),
-            f"{len(truncated):,}",
-            f"{len(truncated) / len(runs):.2%}",
+            f"{len(capped):,}",
+            f"{len(capped) / len(episodes):.2%}" if episodes else "-",
             f"{percentile(sorted(shortfalls), 0.5):.2%}" if shortfalls else "-",
             f"{percentile(sorted(shortfalls), 0.95):.2%}" if shortfalls else "-",
         ])
-    print("\nWhat each cap truncates, and how much of the peak it loses:\n")
+    print(f"\nWhat each cap cuts short, from the detector's own state machine "
+          f"(cooldown {cooldown}), and how much of the peak that loses:\n")
     print(table(
-        ["cap (s)", "runs cut short", "share of runs", "median peak lost", "p95 peak lost"],
+        ["cap (s)", "periods cut short", "share of periods", "median peak lost",
+         "p95 peak lost"],
         rows,
     ))
 
@@ -562,31 +588,32 @@ def step_21(readings, k, cap, cooldown, gate, offsets):
           f"{readings.baseline_seconds + readings.window_seconds}s after it occurs "
           f"(baseline_seconds + window_seconds), which is where full recovery is due.")
 
-    # The curve above is a ratio. This turns it into a count of swallowed
-    # episodes, split by which half of the baseline did the swallowing --
-    # because only one half is a defect, and only one half is fixable.
+    # The table above gives a ratio. This code changes it into a count of the
+    # episodes that the baseline removed. It divides that count by cause. Only
+    # one cause is a defect, and only one cause has a possible correction.
     #
-    #   whole baseline frozen at onset: (window_mean - start_mean) / start_std
-    #     Everything the post-spike baseline cost. An upper bound, and not a
-    #     bug on its own: after a big moment the channel really is busier, and
-    #     a trailing baseline is supposed to follow that.
+    #   whole baseline held at onset: (window_mean - start_mean) / start_std
+    #     The full cost of the baseline after the spike. This is an upper
+    #     bound. It is not a defect by itself. The channel is truly more busy
+    #     after a large moment, and a trailing baseline must follow that.
     #
-    #   spread frozen, level current: (window_mean - mean_now) / start_std
-    #     What the higher standard deviation cost, all of it. This overstates
-    #     what any robust estimator gives back: most of that rise is the whole
-    #     distribution scaling with a busier channel, and the median absolute
-    #     deviation of a genuinely busier window rises with it.
+    #   spread held, level current: (window_mean - mean_now) / start_std
+    #     The full cost of the larger standard deviation. This value is too
+    #     high for a robust estimator. Most of the increase is the whole
+    #     distribution that grows with a more busy channel. The median
+    #     absolute deviation of a truly more busy window grows with it.
     #
     #   spread scaled with the level: divide by start_std x (mean_now /
-    #   start_mean), the deviation a channel with unchanged burstiness would
-    #     show at its new level. What remains is excess spread -- the spike's
-    #     own outlier buckets and nothing else -- so this is the honest
-    #     estimate of what a robust baseline (median/MAD, or excluding the
-    #     previous episode's buckets) could recover.
+    #     start_mean). That is the deviation of a channel with the same
+    #     burstiness at its new level. Only the additional spread stays. That
+    #     spread is the outlier buckets of the spike, and nothing else. This
+    #     is thus the correct estimate of what a robust baseline can recover.
+    #     A robust baseline uses the median and MAD, or removes the buckets of
+    #     the previous episode.
     #
-    # Seconds inside the cooldown are skipped: those were never going to fire,
-    # so counting them here would bill the cooldown's suppression to the
-    # baseline.
+    # The code ignores the seconds inside the cooldown. Those seconds could
+    # never report a spike. To count them here would charge the baseline for
+    # the suppression that the cooldown caused.
     horizon_seconds = readings.baseline_seconds + readings.window_seconds
     names = ("frozen", "spread", "excess")
     counts = {name: [0, 0] for name in names}  # name -> [runs, seconds]
@@ -634,7 +661,7 @@ def step_21(readings, k, cap, cooldown, gate, offsets):
 # step 22 -- min_baseline_fraction
 
 
-def step_22(readings, k, cap, cooldown, fractions):
+def step_22(readings, k, cap, cooldown, reference_fraction, fractions):
     heading("Step 22 -- min_baseline_fraction, the warm-up gate")
 
     baseline_seconds = readings.baseline_seconds
@@ -680,8 +707,11 @@ def step_22(readings, k, cap, cooldown, fractions):
     ))
 
     # The readings a looser gate lets through are the reason the gate exists.
-    print("\nIntensity of the readings each fraction admits that 0.80 does not:\n")
-    reference_gate = int(baseline_seconds * 0.8)
+    # Compare against the fraction this run was given, not a fixed 0.8, or the
+    # column silently describes a gate the caller did not ask about.
+    print(f"\nIntensity of the readings each fraction admits that "
+          f"{reference_fraction:.2f} does not:\n")
+    reference_gate = int(baseline_seconds * reference_fraction)
     rows = []
     for fraction in fractions:
         gate = int(baseline_seconds * fraction)
@@ -715,19 +745,36 @@ def verify(readings_path, corpus, k, cap, cooldown, fraction):
 
     reconstruct() is a second implementation of evaluate()'s state machine.
     Without this check every table below it is only as good as that copy.
+
+    The bucket geometry comes from the dump named on the command line, and
+    both sides are given it explicitly. replay.py reads every DETECTION_*
+    variable from the environment, and measure_corpus.py reads none of them,
+    so one exported DETECTION_BASELINE_SECONDS would otherwise run the two
+    sides at different baselines and report a MISMATCH that is not one.
     """
     flink_job = Path(__file__).resolve().parent.parent
+    geometry = load(readings_path).config
+    window_seconds = geometry["window_seconds"]
+    baseline_seconds = geometry["baseline_seconds"]
+
     dump = Path(readings_path).with_suffix(".verify.tsv")
-    subprocess.run(
-        [sys.executable, "tools/measure_corpus.py", "--corpus", str(corpus),
-         "--out", str(dump), "--progress-every", "0"],
-        cwd=flink_job, check=True, capture_output=True, text=True,
-    )
-    readings = load(dump)
+    try:
+        subprocess.run(
+            [sys.executable, "tools/measure_corpus.py", "--corpus", str(corpus),
+             "--out", str(dump), "--progress-every", "0",
+             "--window-seconds", str(window_seconds),
+             "--baseline-seconds", str(baseline_seconds)],
+            cwd=flink_job, check=True, capture_output=True, text=True,
+        )
+        readings = load(dump)
+    finally:
+        dump.unlink(missing_ok=True)
     expected = reconstruct(readings, k, cap, cooldown,
                            int(readings.baseline_seconds * fraction))
 
     environment = {
+        "DETECTION_WINDOW_SECONDS": str(window_seconds),
+        "DETECTION_BASELINE_SECONDS": str(baseline_seconds),
         "DETECTION_STD_DEV_THRESHOLD": str(k),
         "DETECTION_HOLD_CAP_SECONDS": str(cap),
         "DETECTION_COOLDOWN_SECONDS": str(cooldown),
@@ -755,18 +802,20 @@ def verify(readings_path, corpus, k, cap, cooldown, fraction):
 
     print(f"real detector: {len(actual):,} spikes; reconstruction: {len(mine):,} episodes")
 
-    # Which episodes, and which second each reported -- the state machine's
-    # whole output. Intensity is compared separately and loosely, because the
-    # two sides round differently, not because they compute differently:
-    # replay.py prints %.4f straight off the float, while these values have
-    # been through measure_corpus.py's %.6f and back. Double rounding moves
-    # the last printed digit by one on values that sit near a tie.
-    identity = lambda rows: [row[:3] for row in rows]  # noqa: E731
-    if identity(mine) != identity(actual):
+    # Compare the episodes and the second that each one reported. That is the
+    # full output of the state machine. Compare the intensity separately, and
+    # with a tolerance. The two sides round the value differently. They do not
+    # calculate it differently. replay.py prints %.4f from the float. These
+    # values went through the %.6f of measure_corpus.py and back. Two
+    # roundings can move the last printed digit by one.
+    mine_identity = [row[:3] for row in mine]
+    actual_identity = [row[:3] for row in actual]
+    if mine_identity != actual_identity:
         print("MISMATCH -- different episodes")
-        for row in [r for r in identity(actual) if r not in identity(mine)][:10]:
+        mine_set, actual_set = set(mine_identity), set(actual_identity)
+        for row in [r for r in actual_identity if r not in mine_set][:10]:
             print(f"  only the detector reported: {row}")
-        for row in [r for r in identity(mine) if r not in identity(actual)][:10]:
+        for row in [r for r in mine_identity if r not in actual_set][:10]:
             print(f"  only the reconstruction reported: {row}")
         return 1
 
@@ -810,19 +859,36 @@ def main():
 
     readings = load(args.readings)
     gate = int(readings.baseline_seconds * args.min_baseline_fraction)
+
+    # A dump only holds readings for the seconds its own gate admitted. Asking
+    # for a looser gate here cannot invent the ones it rejected, and every
+    # table would quietly describe a stricter gate than the one requested.
+    # Re-run measure_corpus.py with a lower --min-baseline-fraction instead.
+    dump_gate = readings.config["min_observed_seconds"]
+    if gate < dump_gate:
+        raise SystemExit(
+            f"{args.readings} was measured with a gate of {dump_gate}s "
+            f"(min_baseline_fraction {readings.config['min_baseline_fraction']}), so it "
+            f"holds no reading for a second under that. This run asks for {gate}s "
+            f"(--min-baseline-fraction {args.min_baseline_fraction}). Re-run "
+            f"tools/measure_corpus.py with a --min-baseline-fraction of "
+            f"{args.min_baseline_fraction} or lower."
+        )
+
     steps = args.step or [18, 19, 20, 21, 22]
 
     if 18 in steps:
-        step_17_18(readings, gate, candidates=[2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0])
+        step_17_18(readings, gate, args.cap, args.cooldown,
+                   candidates=[2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0])
     if 19 in steps:
-        step_19(readings, args.k, gate, caps=[5, 10, 15, 20, 25, 30, 45, 60])
+        step_19(readings, args.k, args.cooldown, gate, caps=[5, 10, 15, 20, 25, 30, 45, 60])
     if 20 in steps:
         step_20(readings, args.k, args.cap, gate, cooldowns=[0, 10, 20, 30, 60, 120])
     if 21 in steps:
         step_21(readings, args.k, args.cap, args.cooldown, gate,
                 offsets=[0, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 330])
     if 22 in steps:
-        step_22(readings, args.k, args.cap, args.cooldown,
+        step_22(readings, args.k, args.cap, args.cooldown, args.min_baseline_fraction,
                 fractions=[0.0, 0.1, 0.25, 0.5, 0.65, 0.8, 0.9, 1.0])
 
 

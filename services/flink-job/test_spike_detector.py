@@ -134,6 +134,19 @@ class TestShippedDefaults:
         with pytest.raises(ValueError):
             DetectorConfig(**kwargs)
 
+    def test_a_full_baseline_fraction_is_rejected(self):
+        """1.0 looks like "use the whole baseline". It does something else.
+
+        observed_seconds reaches baseline_seconds only when a message is in
+        the single oldest baseline second. The gate thus stops the measurement
+        of elapsed time and becomes a test of density. On the Plan 06 corpus
+        it blocks 39.9% of the seconds, against 2.7% at 0.9. Reject the value
+        when the object is built. Do not let a job run that way in silence.
+        """
+        with pytest.raises(ValueError, match="min_baseline_fraction"):
+            DetectorConfig(min_baseline_fraction=1.0)
+        assert DetectorConfig(min_baseline_fraction=0.99).min_baseline_fraction == 0.99
+
     def test_hold_cap_longer_than_the_retained_span_is_rejected(self):
         """A cap that outlives the buckets could never fire -- the operator's
         timer chain lapses once a key's last bucket expires."""

@@ -705,8 +705,8 @@ class AnomalyDetector(KeyedProcessFunction):
 
             # Keep the elevated period across seconds. Write only when the
             # value changes. The code reads an open hold every second, so an
-            # unconditional write would store the same value up to 60 times in
-            # one period.
+            # unconditional write would store the same value once per second
+            # of the period, up to hold_cap_seconds times.
             if decision.hold != hold:
                 if decision.hold is None:
                     self.hold.clear()
@@ -721,7 +721,7 @@ class AnomalyDetector(KeyedProcessFunction):
             #
             # The cap normally ends an open period long before this chain
             # stops. DetectorConfig keeps hold_cap_seconds below
-            # baseline_seconds + window_seconds (60 against 305 at the
+            # baseline_seconds + window_seconds (25 against 305 at the
             # defaults), and buckets stay for that full span after the last
             # message. One case can still stop the chain with a period open: a
             # watermark that stops, so no timer runs at all. The state TTL
