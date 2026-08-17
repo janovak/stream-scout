@@ -75,6 +75,57 @@ head -n 200000 ~/stream-scout-corpus/chat-corpus.jsonl > ~/stream-scout-corpus/d
 Pick a slice that actually contains spikes — check against `clips` rows whose `detected_at` falls in
 the captured window.
 
+## Capturing alongside live clipping, to explain clips later
+
+The capture above was cut for Plan 06 tuning, when nothing was clipping yet. Running it *while*
+the job clips gives something else: for any clip made during the window, the chat that produced it
+is on disk, so `tools/clip_anatomy.py` can redraw the moment second by second.
+
+Use a dated output file. The script appends, and mixing a pre-clipping corpus into a new one makes
+the replay meaningless:
+
+```bash
+docker run -d --name streamscout-corpus-capture \
+  --network stream-scout_streamscout \
+  -v ~/stream-scout/tools:/tools:ro \
+  -v ~/stream-scout-corpus:/corpus \
+  stream-scout-stream-monitoring \
+  python3 /tools/capture_corpus.py \
+    --output /corpus/chat-corpus-$(date +%F).jsonl \
+    --hours 14
+```
+
+### In the morning: draw a clip that looks wrong
+
+Pick a clip from the feed, then:
+
+```bash
+python3 tools/clip_anatomy.py \
+  --clip-id <clip_id> \
+  --corpus ~/stream-scout-corpus/chat-corpus-<date>.jsonl \
+  --out /tmp/anatomy.html
+```
+
+It prints a one-line verdict and writes a page showing chat volume, intensity, the baseline, and
+four markers: hold opens, peak, emit, clip requested. The shaded band is the 30 seconds the clip
+actually contains, so a clip that missed its moment shows the band sitting clear of the peak.
+
+`--broadcaster <id> --peak <unix_second>` replaces `--clip-id` for a spike that never became a clip.
+`--json <path>` dumps the reconstructed numbers for checking without the drawing code.
+
+Three limits worth knowing before trusting a page:
+
+- **The corpus must cover the clip, with lead.** The baseline is 300 seconds, so a clip needs
+  roughly seven minutes of capture before it. Clips from before the capture started cannot be
+  drawn at all — the tool says so rather than guessing.
+- **The request time is modelled**, as emit + watermark + clip delay. The true request time exists
+  only in the taskmanager log, which rotates. Everything else — the curve, the baseline, the hold,
+  the emit second — comes from `spike_detector.evaluate()` itself.
+- **Replayed intensity can differ slightly from the stored value** (6.02 against a stored 5.9 in
+  the first live check). The capture and the job consume the same topic independently, so their
+  per-second counts are not guaranteed identical. Treat a small gap as normal and a large one as
+  worth investigating.
+
 ## Safety notes
 
 - The consumer uses a **random group id** and never commits offsets. It cannot disturb the Flink job
