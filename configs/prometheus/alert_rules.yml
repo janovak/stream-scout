@@ -85,25 +85,55 @@ groups:
           summary: "High clip creation failure rate"
           description: "Clip creation failure rate is {{ $value | printf \"%.1f\" }}% in the last hour (threshold: 30%)"
 
-      # Anomaly detection stalled
+      # Anomaly detection stalled, system-wide
+      #
+      # A per-broadcaster or percent-of-broadcasters version of this check
+      # can't work: zero anomalies for one broadcaster (or even many) is
+      # normal on a quiet stream, not a sign of a broken detector. Only a
+      # true fleet-wide zero is a meaningful signal, since it's very
+      # unlikely every broadcaster goes quiet at once by chance.
+      #
+      # Gated on chat actually flowing (not active_stream_count): chat
+      # ingestion is a separate service (stream-monitoring) from the Flink
+      # detector, so chat can keep flowing while Flink itself hangs
+      # internally. Requiring chat > 0 here catches that silent-Flink-stall
+      # case, which neither NoChatMessagesProcessed (upstream ingestion
+      # only) nor ClipDetectorMetricsDown (whole-process death only) can see.
+      #
+      # `and on()`: sum() strips all labels from both sides, so on() forces
+      # a plain boolean match. Same fix as NoChatMessagesProcessed above.
       - alert: AnomalyDetectionStalled
-        expr: increase(anomalies_detected_total[24h]) == 0 and active_stream_count > 0
+        expr: |
+          sum(increase(anomalies_detected_total[24h])) == 0
+          and on() sum(rate(chat_messages_total[5m])) > 0
         for: 1h
         labels:
           severity: warning
         annotations:
-          summary: "No anomalies detected in 24 hours"
-          description: "No anomalies have been detected in the last 24 hours despite active streams"
+          summary: "No anomalies detected fleet-wide in 24 hours"
+          description: "Zero anomalies detected across all broadcasters in the last 24 hours despite chat actively flowing in. Check the Flink clip-detector job."
 
-      # No clips created in 24 hours
+      # No clips created in 24 hours, system-wide
+      #
+      # Global by design: fires only when at least half of the broadcasters
+      # that had anomalies in the last 24h produced zero successful clips,
+      # not when a single broadcaster is stuck. This also makes the alert
+      # naturally immune to one stale/ghost broadcaster series (e.g. after
+      # a Flink restart drops a broadcaster mid-stream) as long as the rest
+      # of the fleet is still producing clips normally.
       - alert: NoClipsCreated
-        expr: increase(clips_created_success_total[24h]) == 0 and increase(anomalies_detected_total[24h]) > 0
+        expr: |
+          (
+            count(increase(clips_created_success_total[24h]) == 0 and increase(anomalies_detected_total[24h]) > 0)
+            /
+            count(increase(anomalies_detected_total[24h]) > 0)
+          ) * 100 >= 50
         for: 1h
         labels:
           severity: warning
         annotations:
-          summary: "No clips created in 24 hours"
-          description: "No clips have been created in the last 24 hours despite anomalies being detected. Check Twitch API or token status."
+          summary: "No clips created for half or more of broadcasters with anomalies"
+          description: "{{ $value | printf \"%.0f\" }}% of broadcasters with anomalies in the last 24 hours have produced zero successful clips. Check Twitch API or token status."
 
       # Clip detector metrics endpoint down
       - alert: ClipDetectorMetricsDown
