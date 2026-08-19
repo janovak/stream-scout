@@ -383,6 +383,23 @@ def evaluate(
     # internal order of the map.
     expired_buckets.sort()
 
+    # A hold's peak must never be later than the cursor evaluating it. peak_at
+    # is always set to `second` at the moment a hold is opened or updated
+    # (HoldState.opened / with_peak), so peak_at > second can only mean the
+    # event-time cursor regressed between that write and this call -- this
+    # hold describes a moment this call cannot see yet. counts_as_of_now in
+    # clip_detector_job.py applies the same rule to baseline buckets. Reject
+    # at any magnitude, not only once the gap is large: unlike the cap below,
+    # this is not a question of how stale the hold is. It is an invalid
+    # state, and it must not be reused or re-emitted, however small the
+    # regression. (Plan 09: without this, `second - hold.peak_at` goes
+    # negative and can never exceed hold_cap_seconds, so the hold below never
+    # retired -- the same held peak re-reported once per second until the gap
+    # closed to cooldown_seconds on its own, producing a dozen+ duplicate
+    # clips from one spike.)
+    if hold is not None and hold.peak_at > second:
+        hold = None
+
     # Remove a hold whose peak is older than the cap. This rule applies to
     # every path below, so no reported peak is ever older than
     # hold_cap_seconds.

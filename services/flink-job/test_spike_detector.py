@@ -563,6 +563,79 @@ class TestPeakHold:
         assert beyond.emit is None
         assert beyond.hold is None
 
+    def test_a_hold_whose_peak_is_ahead_of_the_cursor_is_abandoned(self):
+        """Plan 09 / Issue 3: the mirror image of the test above.
+
+        peak_at is always set to `second` at the moment a hold is written
+        (HoldState.opened / with_peak), so peak_at > second can only mean the
+        event-time cursor regressed between that write and this call. The old
+        retirement check `(second - hold.peak_at) > hold_cap_seconds` can
+        never be true when the subtraction is negative, so a hold like this
+        was never retired -- it re-emitted the same peak once per second
+        until the gap narrowed to cooldown_seconds on its own. This is the
+        exact shape from the taskmanager log evidence in KNOWN_ISSUES.md: the
+        `(Ns ago)` field running negative from -58 to -30.
+        """
+        open_hold = HoldState(
+            started_at=NOW,
+            peak_intensity=9.5,
+            peak_at=NOW + 50,
+            peak_message_count=300,
+            peak_baseline_mean=10.0,
+            peak_baseline_std=1.0,
+        )
+        # Blind: unmeasurable regardless, so the only thing under test is
+        # whether the hold survives entry into evaluate() at all.
+        decision = evaluate_at({}, second=NOW, hold=open_hold)
+        assert decision.emit is None
+        assert decision.hold is None
+
+    def test_even_a_small_regression_is_rejected_not_just_a_large_one(self):
+        """Distinguishes this fix from a symmetric abs() cap check.
+
+        A symmetric `abs(second - hold.peak_at) > hold_cap_seconds` guard
+        would still miss this: 1 second ahead is nowhere near CONFIG's
+        10-second cap. But peak_at > second is invalid at any magnitude -- it
+        can only mean the cursor regressed, and a hold built on that must not
+        be trusted at all, not just once the gap is large.
+        """
+        open_hold = HoldState(
+            started_at=NOW,
+            peak_intensity=9.5,
+            peak_at=NOW + 1,
+            peak_message_count=300,
+            peak_baseline_mean=10.0,
+            peak_baseline_std=1.0,
+        )
+        decision = evaluate_at({}, second=NOW, hold=open_hold)
+        assert decision.hold is None
+
+    def test_a_regressing_cursor_never_produces_more_than_one_emit_for_the_same_peak(self):
+        """End to end: the production symptom from KNOWN_ISSUES.md Issue 3.
+
+        One real peak was reported a dozen-plus times, each carrying
+        identical intensity, counts, and baseline stats, because a stale
+        hold's peak_at stayed ahead of a cursor that kept re-evaluating it.
+        Simulate the cursor landing behind the hold's peak across many
+        consecutive calls and confirm it never re-emits the same peak.
+        """
+        stale_hold = HoldState(
+            started_at=NOW,
+            peak_intensity=90.0,
+            peak_at=NOW + 58,
+            peak_message_count=500,
+            peak_baseline_mean=10.0,
+            peak_baseline_std=1.0,
+        )
+        emits = []
+        hold = stale_hold
+        for second in range(NOW, NOW + 30):
+            decision = evaluate_at({}, second=second, hold=hold)
+            if decision.emit is not None:
+                emits.append(decision.emit)
+            hold = decision.hold
+        assert len(emits) == 0, "an invalid hold must be dropped, never emitted"
+
     def test_a_stale_hold_cannot_survive_a_blind_stretch_and_emit_later(self):
         """End to end: the peak from a blind stretch never reaches a clip."""
         counts = {ts: 10 + (1 if ts % 2 else -1) for ts in BASELINE}
