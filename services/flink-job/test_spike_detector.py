@@ -518,14 +518,7 @@ class TestPeakHold:
 
     def test_insufficient_baseline_mid_hold_passes_the_hold_through(self):
         """Nothing is measurable, so nothing is decided -- the hold survives."""
-        open_hold = HoldState(
-            started_at=NOW,
-            peak_intensity=9.5,
-            peak_at=NOW,
-            peak_message_count=300,
-            peak_baseline_mean=10.0,
-            peak_baseline_std=1.0,
-        )
+        open_hold = self.a_hold_peaking_at(NOW)
         counts = {ts: 5 for ts in range(990, 996)}  # far below the warm-up gate
         decision = evaluate_at(counts, second=NOW, hold=open_hold)
         assert decision.emit is None
@@ -541,14 +534,7 @@ class TestPeakHold:
         hold instead once its peak is older than the cap, so no emitted peak is
         ever staler than hold_cap_seconds.
         """
-        open_hold = HoldState(
-            started_at=NOW,
-            peak_intensity=9.5,
-            peak_at=NOW,
-            peak_message_count=300,
-            peak_baseline_mean=10.0,
-            peak_baseline_std=1.0,
-        )
+        open_hold = self.a_hold_peaking_at(NOW)
         # No buckets at all: unmeasurable at every second below, so the cap
         # never gets a chance to end the period on its own.
         blind = {}
@@ -562,6 +548,98 @@ class TestPeakHold:
         beyond = evaluate_at(blind, second=NOW + CONFIG.hold_cap_seconds + 1, hold=open_hold)
         assert beyond.emit is None
         assert beyond.hold is None
+
+    def a_hold_peaking_at(self, peak_at, peak_intensity=9.5):
+        """A hold whose only interesting field, for these tests, is peak_at."""
+        return HoldState(
+            started_at=NOW,
+            peak_intensity=peak_intensity,
+            peak_at=peak_at,
+            peak_message_count=300,
+            peak_baseline_mean=10.0,
+            peak_baseline_std=1.0,
+        )
+
+    def test_a_hold_whose_peak_is_ahead_of_the_cursor_passes_through_unchanged(self):
+        """Plan 09 / Issue 3: the mirror image of the "ages past the cap" test.
+
+        peak_at is always set to `second` at the moment a hold is written
+        (HoldState.opened / with_peak), so peak_at > second can only mean this
+        call is itself late or out of order relative to the hold's own
+        history -- see the long comment at the guard in spike_detector.py for
+        why. The old retirement check `(second - hold.peak_at) >
+        hold_cap_seconds` can never be true when the subtraction is negative,
+        so a hold like this was never retired -- it re-emitted the same peak
+        once per second until the gap narrowed to cooldown_seconds on its own.
+        This is the exact shape from the taskmanager log evidence in
+        KNOWN_ISSUES.md: the `(Ns ago)` field running negative from -58 to
+        -30.
+
+        The fix is pass-through, not drop-and-reopen: dropping the hold and
+        letting this call open a fresh one from its own (necessarily partial)
+        reading could silently downgrade an already-correct, further-
+        progressed peak to a smaller, earlier, wrong one. The hold must come
+        out of this call exactly as it went in.
+        """
+        open_hold = self.a_hold_peaking_at(NOW + 50)
+        # Blind: unmeasurable regardless, so the only thing under test is
+        # whether the hold survives entry into evaluate() untouched.
+        decision = evaluate_at({}, second=NOW, hold=open_hold)
+        assert decision.emit is None
+        assert decision.hold == open_hold
+        assert decision.hold_regressed is True
+
+    def test_even_a_small_regression_passes_through_not_just_a_large_one(self):
+        """Distinguishes this fix from a symmetric abs() cap check.
+
+        A symmetric `abs(second - hold.peak_at) > hold_cap_seconds` guard
+        would still miss this: 1 second ahead is nowhere near CONFIG's
+        10-second cap. But peak_at > second means this call cannot measure the
+        hold at any magnitude -- it can only mean the call is out of order,
+        and that is true whether the gap is 1 second or 50.
+        """
+        open_hold = self.a_hold_peaking_at(NOW + 1)
+        decision = evaluate_at({}, second=NOW, hold=open_hold)
+        assert decision.hold == open_hold
+        assert decision.hold_regressed is True
+
+    def test_hold_regressed_is_false_on_every_other_unmeasurable_path(self):
+        """hold_regressed is specific to this one cause, not a catch-all.
+
+        The warm-up gate and the no-spread case were already unmeasurable
+        before Plan 09; neither is a regressed hold, so neither should set
+        the new flag.
+        """
+        warming_up = {ts: 1000 for ts in WINDOW}
+        warming_up.update({ts: 5 for ts in range(981, 996)})  # 15s watched, gate needs 16
+        assert evaluate_at(warming_up).hold_regressed is False
+
+        no_spread = {ts: 5 for ts in BASELINE}
+        no_spread.update({ts: 5000 for ts in WINDOW})
+        assert evaluate_at(no_spread).hold_regressed is False
+
+    def test_a_regressing_cursor_never_produces_more_than_one_emit_for_the_same_peak(self):
+        """End to end: the production symptom from KNOWN_ISSUES.md Issue 3.
+
+        One real peak was reported a dozen-plus times, each carrying
+        identical intensity, counts, and baseline stats, because a stale
+        hold's peak_at stayed ahead of a cursor that kept re-evaluating it.
+        Simulate the cursor landing behind the hold's peak across many
+        consecutive calls: it must never re-emit the same peak, and the hold
+        itself must survive every one of those calls unchanged, ready for a
+        later, legitimate call to retire or extend it properly.
+        """
+        stale_hold = self.a_hold_peaking_at(NOW + 58, peak_intensity=90.0)
+        emits = []
+        hold = stale_hold
+        for second in range(NOW, NOW + 30):
+            decision = evaluate_at({}, second=second, hold=hold)
+            if decision.emit is not None:
+                emits.append(decision.emit)
+            assert decision.hold == stale_hold, "must pass through untouched, not be replaced"
+            hold = decision.hold
+        assert len(emits) == 0, "a regressed hold must never emit"
+        assert hold == stale_hold, "the true peak must survive for a later, legitimate call"
 
     def test_a_stale_hold_cannot_survive_a_blind_stretch_and_emit_later(self):
         """End to end: the peak from a blind stretch never reaches a clip."""

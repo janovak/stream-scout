@@ -176,11 +176,18 @@ class Episode:
 def reconstruct(readings, k, cap, cooldown, gate):
     """Every episode the detector would report at these settings.
 
-    Mirrors spike_detector.evaluate(): the hold survives an unmeasurable
-    second without changing, the cap is tested against both the peak's age
-    and the hold's start, and the cooldown blocks opening a period but never
-    ends one that is already open. `--verify` checks this against the real
-    detector.
+    Mirrors spike_detector.evaluate(): a hold whose peak sits ahead of the
+    current second passes through untouched (Plan 09), the hold survives an
+    unmeasurable second without changing, the cap is tested against both the
+    peak's age and the hold's start, and the cooldown blocks opening a period
+    but never ends one that is already open. `--verify` checks this against
+    the real detector.
+
+    `series.second` is ascending (the Series docstring states this), so the
+    peak-ahead-of-second check below cannot trigger on real input today --
+    unlike `evaluate()`, which a live Flink job can call out of order. It is
+    here so this function keeps matching `evaluate()` if that ever changes,
+    not because it changes today's output.
     """
     episodes = []
     for broadcaster_id, series in readings.rows():
@@ -206,6 +213,11 @@ def reconstruct(readings, k, cap, cooldown, gate):
 
         for i in range(len(series)):
             second = series.second[i]
+
+            # evaluate() (Plan 09): pass a hold through untouched, same as an
+            # unmeasurable reading, when its peak sits ahead of this second.
+            if hold is not None and series.second[hold[1]] > second:
+                continue
 
             # evaluate() drops a hold whose peak is older than the cap before
             # anything else, including the warm-up gate.
