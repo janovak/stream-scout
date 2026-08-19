@@ -341,17 +341,18 @@ class Decision:
     # of the gate at other fractions.
     observed_seconds: int = 0
 
-    # True when this call passed an open hold through unmeasured because its
-    # peak_at sat ahead of `second` (Plan 09 / KNOWN_ISSUES.md Issue 3). This
-    # can only mean the call is itself late or out of order: a message whose
-    # bucket predates a hold's already-recorded peak can still arrive and
-    # register its own event-time timer, which fires immediately once the
-    # watermark has passed it. AnomalyDetector.on_timer logs this -- the
-    # detector's own arithmetic must stay pure, so it cannot log itself. This
-    # is also the only production signal for the still-open follow-up ("why
-    # does the cursor regress"): the old bug's duplicate-clip symptom is gone,
-    # but so is the log evidence that made it visible, unless something reads
-    # this field.
+    # True when this call passed an open hold through, unmeasured. The cause
+    # is that peak_at sat ahead of second (Plan 09, KNOWN_ISSUES.md Issue 3).
+    # Only a late or out-of-order call can cause this. A chat message can
+    # arrive late, for a bucket behind an already-recorded peak. That message
+    # still registers a timer for its own bucket. The timer then fires as
+    # soon as the watermark passes it.
+    #
+    # AnomalyDetector.on_timer logs this event. evaluate() cannot log it,
+    # because evaluate() must stay pure. This field is also the only
+    # production signal for one open question: why does the cursor regress?
+    # The old bug made duplicate clips. That symptom is now gone. The log
+    # line that showed the bug is also gone. This field replaces it.
     hold_regressed: bool = False
 
 
@@ -396,47 +397,48 @@ def evaluate(
     # internal order of the map.
     expired_buckets.sort()
 
-    # observed_seconds is needed by the new-hold-regression guard below as
-    # well as by the warm-up gate further down, so compute it once, here.
+    # The hold-regression guard below and the warm-up gate further down both
+    # need observed_seconds. Compute it once, here.
     observed_seconds = (
         0 if oldest_baseline_bucket is None else window_start - oldest_baseline_bucket
     )
 
-    # A hold's peak must never be later than the cursor evaluating it. peak_at
-    # is always set to `second` at the moment a hold is opened or updated
-    # (HoldState.opened / with_peak), so peak_at > second can only mean this
-    # call is itself late or out of order relative to the hold's own history:
+    # A hold's peak must never be later than the cursor evaluating it. A hold
+    # sets peak_at to second at the moment it opens or updates
+    # (HoldState.opened, HoldState.with_peak). So peak_at can be greater than
+    # second only when this call itself is late or out of order.
+    #
     # process_element in clip_detector_job.py registers an event-time timer
-    # for every message's own bucket, unconditionally, so a message that
-    # arrives late for a bucket behind an already-recorded peak still
-    # registers a timer there -- and since the watermark has typically already
-    # passed that bucket, the timer fires on the next watermark advance,
-    # calling this function with a `second` behind the hold it is about to
-    # read.
+    # for every message's own bucket. It does this with no check on the
+    # bucket's age. A message can arrive late, for a bucket behind an
+    # already-recorded peak. That message still registers a timer for its own
+    # bucket. The watermark has usually already passed that bucket. So the
+    # timer fires on the next watermark advance. That call then reaches this
+    # function with a second behind the hold it is about to read.
     #
-    # Such a call cannot be trusted to touch this hold at all, in either
-    # direction. Its own counts are filtered to <= this call's `second`
-    # (clip_detector_job.py's counts_as_of_now), strictly less complete than
-    # what the legitimate, in-order call already saw when it wrote peak_at --
-    # so its own measurement of intensity is a partial reading, not a
-    # trustworthy comparison point. Emitting from the existing hold here would
-    # repeat an already-reported (or not-yet-legitimate) peak, exactly
-    # reproducing KNOWN_ISSUES.md Issue 3: `second - hold.peak_at` goes
-    # negative and can never exceed hold_cap_seconds, so the hold was never
-    # retired this way -- it re-reported once per second until the gap closed
-    # to cooldown_seconds on its own, producing a dozen+ duplicate clips from
-    # one spike. But *updating* the hold from this call's partial reading
-    # would be its own new bug: if this call's own (necessarily lower, because
-    # partial) intensity happened not to exceed the existing peak, with_peak()
-    # would silently no-op, which is safe -- but there is no guarantee of
-    # that, and a hold that legitimately peaked and is now declining could see
-    # this call's partial reading register as a "new maximum", silently
-    # replacing a correct, further-progressed peak with a smaller, earlier,
-    # and simply wrong one.
+    # Such a call cannot measure this hold, in either direction. Its own
+    # counts stop at second (clip_detector_job.py's counts_as_of_now). That
+    # window is less complete than the one the earlier, in-order call already
+    # saw when it wrote peak_at. So this call's own intensity is a partial
+    # reading. It is not a fair comparison against the hold's recorded peak.
     #
-    # So: pass the hold through completely untouched, exactly like the warm-up
-    # gate and no-spread cases below -- this call cannot measure it, in either
-    # the emit or the update direction. Only a later, legitimate call
+    # An emit from this hold would repeat an old peak, or report one too
+    # early. That is KNOWN_ISSUES.md Issue 3: second minus hold.peak_at goes
+    # negative, and can never exceed hold_cap_seconds. So the old code never
+    # retired the hold this way. It re-reported the same peak once per
+    # second, until the gap closed to cooldown_seconds on its own. One spike
+    # then produced a dozen or more duplicate clips.
+    #
+    # An update from this call would be a different bug. This call's own
+    # intensity is partial, so it is usually lower than the true peak. When
+    # that holds, with_peak() leaves the hold alone -- a safe no-op. But
+    # nothing guarantees that. A hold can peak, then decline. A late call's
+    # partial reading can then register as a new maximum. That would silently
+    # replace a correct, later peak with a smaller, earlier, and wrong one.
+    #
+    # So: pass the hold through, completely unchanged. Do this exactly as for
+    # the warm-up gate and the no-spread case below. This call cannot measure
+    # the hold, for an emit or for an update. Only a later, in-order call
     # (second >= peak_at) may retire, extend, or emit this hold.
     if hold is not None and hold.peak_at > second:
         return _unmeasurable(hold, expired_buckets, observed_seconds, hold_regressed=True)
@@ -541,8 +543,8 @@ def _unmeasurable(
     second from a second with a low intensity. `observed_seconds` still comes
     out. The warm-up gate is one of the two causes of an unmeasurable second,
     and step 22 must count how frequently it is the cause. `hold_regressed`
-    marks the third cause (Plan 09): a hold whose peak sits ahead of `second`,
-    which this call cannot measure in either the emit or the update direction.
+    marks a third cause (Plan 09). Here, a hold's peak sits ahead of `second`.
+    This call cannot measure that hold, for an emit or for an update.
     """
     return Decision(
         emit=None,

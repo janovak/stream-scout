@@ -518,14 +518,7 @@ class TestPeakHold:
 
     def test_insufficient_baseline_mid_hold_passes_the_hold_through(self):
         """Nothing is measurable, so nothing is decided -- the hold survives."""
-        open_hold = HoldState(
-            started_at=NOW,
-            peak_intensity=9.5,
-            peak_at=NOW,
-            peak_message_count=300,
-            peak_baseline_mean=10.0,
-            peak_baseline_std=1.0,
-        )
+        open_hold = self.a_hold_peaking_at(NOW)
         counts = {ts: 5 for ts in range(990, 996)}  # far below the warm-up gate
         decision = evaluate_at(counts, second=NOW, hold=open_hold)
         assert decision.emit is None
@@ -541,14 +534,7 @@ class TestPeakHold:
         hold instead once its peak is older than the cap, so no emitted peak is
         ever staler than hold_cap_seconds.
         """
-        open_hold = HoldState(
-            started_at=NOW,
-            peak_intensity=9.5,
-            peak_at=NOW,
-            peak_message_count=300,
-            peak_baseline_mean=10.0,
-            peak_baseline_std=1.0,
-        )
+        open_hold = self.a_hold_peaking_at(NOW)
         # No buckets at all: unmeasurable at every second below, so the cap
         # never gets a chance to end the period on its own.
         blind = {}
