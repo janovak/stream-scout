@@ -80,6 +80,7 @@ _anomalies_detected_total = None
 _clips_created_success_total = None
 _clips_created_failed_total = None
 _clip_creation_duration_seconds = None
+_hold_regressed_total = None
 
 
 def _init_metrics(subtask_index: int = 0):
@@ -93,7 +94,7 @@ def _init_metrics(subtask_index: int = 0):
     subtask_index gives every subtask its own port instead.
     """
     global _metrics_initialized, _anomalies_detected_total, _clips_created_success_total
-    global _clips_created_failed_total, _clip_creation_duration_seconds
+    global _clips_created_failed_total, _clip_creation_duration_seconds, _hold_regressed_total
 
     if _metrics_initialized:
         return
@@ -118,6 +119,12 @@ def _init_metrics(subtask_index: int = 0):
         _clips_created_success_total = get_or_create_counter("clips_created_success_total", "Total clips created successfully", ["broadcaster_id"])
         _clips_created_failed_total = get_or_create_counter("clips_created_failed_total", "Total clip creation failures", ["broadcaster_id", "reason"])
         _clip_creation_duration_seconds = get_or_create_gauge("clip_creation_duration_seconds", "Time taken to create last clip", ["broadcaster_id"])
+        # Plan 09 / KNOWN_ISSUES.md Issue 3: the guard that fixed the
+        # duplicate-clip bug also removed the log evidence that made the bug
+        # visible in the first place (a regressed hold no longer emits, so it
+        # no longer logs). This counter is now the only production signal for
+        # the still-open follow-up into why the cursor regresses at all.
+        _hold_regressed_total = get_or_create_counter("hold_regressed_total", "Total holds passed through unmeasured because their peak was ahead of the cursor", ["broadcaster_id"])
 
         # Start metrics server on a port unique to this subtask
         port = METRICS_PORT + subtask_index
@@ -702,6 +709,25 @@ class AnomalyDetector(KeyedProcessFunction):
             for expired_bucket in decision.expired_buckets:
                 self.message_counts.remove(expired_bucket)
                 all_counts.pop(expired_bucket, None)
+
+            # Plan 09 / KNOWN_ISSUES.md Issue 3: this call arrived out of
+            # order relative to `hold`'s own recorded peak (see the guard's
+            # comment in spike_detector.py). evaluate() passed the hold
+            # through untouched -- decision.hold == hold below, so no state
+            # write happens -- but that also means no ANOMALY DETECTED log
+            # fires here, which is exactly the evidence a future
+            # investigation into *why* the cursor regresses would want. Log
+            # and count it instead.
+            if decision.hold_regressed:
+                logger.warning(
+                    f"Hold for broadcaster {broadcaster_id} passed through unmeasured: "
+                    f"this call (second={now_seconds}) arrived behind the hold's own "
+                    f"recorded peak (peak_at={hold.peak_at}, {hold.peak_at - now_seconds}s "
+                    f"ahead) -- see KNOWN_ISSUES.md Issue 3 follow-up."
+                )
+                _init_metrics(self.subtask_index)
+                if _hold_regressed_total:
+                    _hold_regressed_total.labels(broadcaster_id=str(broadcaster_id)).inc()
 
             # Keep the elevated period across seconds. Write only when the
             # value changes. The code reads an open hold every second, so an
