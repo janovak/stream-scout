@@ -6,6 +6,7 @@ Tests token management, message processing, and service components.
 """
 
 import json
+import os
 import tempfile
 import threading
 import time
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import token_manager
 from token_manager import TokenRecord, TwitchCredentials
 
 
@@ -148,6 +150,77 @@ class TestTwitchCredentials:
 
         assert json.loads(token_file.read_text()) == original
         assert list(tmp_path.glob(".tmp-tokens-*")) == []
+
+    def test_persist_sets_group_and_permissions_before_replace(self, tmp_path):
+        """Issue 1 (KNOWN_ISSUES.md): mkstemp() always creates the temp file
+        at 0600 owned by whoever wrote it, which locks the other container
+        out on the very next read. Every write must chown the temp file to
+        TWITCH_TOKEN_GID and chmod it 0640 before the atomic replace, so a
+        write from either container's uid stays readable by the other."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "scopes": [],
+        }))
+        calls = []
+        real_replace = os.replace
+
+        def fake_chown(path, uid, gid):
+            calls.append(("chown", path, gid))
+
+        def fake_chmod(path, mode):
+            calls.append(("chmod", path, mode))
+
+        def fake_replace(src, dst):
+            calls.append(("replace", src, dst))
+            real_replace(src, dst)
+
+        with patch("token_manager.os.chown", side_effect=fake_chown), \
+             patch("token_manager.os.chmod", side_effect=fake_chmod), \
+             patch("token_manager.os.replace", side_effect=fake_replace):
+            TwitchCredentials(token_file).persist("new_access", "new_refresh")
+
+        kinds = [c[0] for c in calls]
+        assert kinds == ["chown", "chmod", "replace"], (
+            "chown and chmod must happen before the atomic replace, or the "
+            "published file is briefly at mkstemp's default 0600"
+        )
+        assert calls[0][2] == token_manager.TWITCH_TOKEN_GID
+        assert calls[1][2] == 0o640
+
+    @patch("token_manager.requests.post")
+    def test_refresh_sets_group_and_permissions_before_replace(self, mock_post, tmp_path):
+        """Same guarantee as persist(), for the refresh() write path -- this
+        is the one Flink's 401 handler calls directly."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "scopes": [],
+        }))
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {
+            "access_token": "new_access",
+            "refresh_token": "new_refresh",
+            "expires_in": 3600,
+        }
+        calls = []
+
+        def fake_chown(path, uid, gid):
+            calls.append(("chown", path, gid))
+
+        def fake_chmod(path, mode):
+            calls.append(("chmod", path, mode))
+
+        with patch("token_manager.os.chown", side_effect=fake_chown), \
+             patch("token_manager.os.chmod", side_effect=fake_chmod):
+            TwitchCredentials(token_file).refresh("client_id", "client_secret")
+
+        assert calls == [
+            ("chown", calls[0][1], token_manager.TWITCH_TOKEN_GID),
+            ("chmod", calls[1][1], 0o640),
+        ]
 
     @patch("token_manager.requests.post")
     def test_refresh_stores_rotated_refresh_token(self, mock_post, tmp_path):

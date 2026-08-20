@@ -26,6 +26,15 @@ logger = logging.getLogger("token_manager")
 
 TWITCH_TOKEN_ENDPOINT = "https://id.twitch.tv/oauth2/token"
 
+# stream-monitoring (root) and the Flink containers (uid 9999) all write this
+# file. mkstemp() always creates its temp file at 0600, owned by whichever
+# container wrote last, which locks the other containers out the moment they
+# need to reload it. Chowning every write to a group both sides belong to
+# closes that gap without touching the flock-based refresh lock. Defaults to
+# 9999, the Flink base image's baked-in gid, so a fresh checkout works with
+# no compose change -- override via env if that ever stops matching.
+TWITCH_TOKEN_GID = int(os.environ.get("TWITCH_TOKEN_GID", "9999"))
+
 
 @dataclass(frozen=True)
 class TokenRecord:
@@ -41,9 +50,11 @@ class TwitchCredentials:
 
     Three guarantees this class holds so callers don't have to:
     one record shape (scopes/created_at survive every write), atomic writes
-    (a reader never sees a torn file), and a cross-process lock across
+    (a reader never sees a torn file), a cross-process lock across
     read-refresh-write (two containers refreshing at once can't leave either
-    holding a dead token -- Twitch rotates the refresh token on use).
+    holding a dead token -- Twitch rotates the refresh token on use), and
+    cross-container read access (every write lands group-readable by
+    TWITCH_TOKEN_GID, regardless of which container's uid wrote it).
     """
 
     def __init__(self, token_file: Path):
@@ -166,6 +177,20 @@ class TwitchCredentials:
                     f,
                     indent=2,
                 )
+            try:
+                os.chown(tmp_path, -1, TWITCH_TOKEN_GID)
+            except PermissionError:
+                # Only the containers (root, or uid 9999 already in this
+                # group) ever need this to succeed. An unprivileged local
+                # run -- e.g. the host venv this test suite normally runs
+                # under -- isn't part of any cross-container race, so it's
+                # fine for the file to keep the process's own default gid.
+                logger.warning(
+                    "Could not chown %s to gid %d; not running with the "
+                    "privilege this needs outside a container",
+                    tmp_path, TWITCH_TOKEN_GID,
+                )
+            os.chmod(tmp_path, 0o640)
             os.replace(tmp_path, self.token_file)
         except BaseException:
             os.unlink(tmp_path)

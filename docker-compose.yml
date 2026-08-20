@@ -128,6 +128,7 @@ services:
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+      - TWITCH_TOKEN_GID=9999
       - DETECTION_WINDOW_SECONDS=5
       # Back to the first design value of 5 minutes (Plan 06 step 12). Commit
       # c7afdab was a frontend change. It decreased this to 10 and did not
@@ -234,6 +235,7 @@ services:
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
+      - TWITCH_TOKEN_GID=9999
       - METRICS_PORT=9250
       - DETECTION_WINDOW_SECONDS=5
       # Back to the first design value of 5 minutes (Plan 06 step 12). Commit
@@ -340,6 +342,7 @@ services:
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/app/secrets/twitch_user_tokens.json
+      - TWITCH_TOKEN_GID=9999
       - PROMETHEUS_PORT=9100
       - HEALTH_CHECK_PORT=8080
       - LOG_LEVEL=INFO
