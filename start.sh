@@ -66,8 +66,15 @@ echo "[5/5] Waiting for the job to reach RUNNING..."
 # rebuild can leave it still registering task slots after
 # flink-jobmanager already reports healthy. The bound below allows for
 # that: up to a minute.
+# EXIT_CODE stays 0 only if the job is confirmed RUNNING. The diagnostic
+# banner below still prints either way, so a human sees what is up and
+# what is not. The exit code is what an automated caller checks. It must
+# reflect a real failure here, not just the container-level success from
+# the steps above.
+EXIT_CODE=0
 if [ -z "$JOB_ID" ]; then
     echo "WARNING: could not read a JobID from the submission output above. Skipping the RUNNING check. Run 'flink list' by hand." >&2
+    EXIT_CODE=1
 else
     JOB_RUNNING=0
     for attempt in $(seq 1 30); do
@@ -87,6 +94,7 @@ else
     done
     if [ "$JOB_RUNNING" -ne 1 ]; then
         echo "WARNING: job did not reach RUNNING within about a minute. Check 'flink list' by hand." >&2
+        EXIT_CODE=1
     fi
 fi
 
@@ -104,3 +112,4 @@ echo "  Frontend:  http://localhost:5000"
 echo "  Flink UI:  http://localhost:8081"
 echo "  Grafana:   http://localhost:3000 (admin/admin)"
 echo ""
+exit $EXIT_CODE
