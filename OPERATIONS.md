@@ -38,18 +38,30 @@ The normal way to restart is the script:
 cd ~/stream-scout
 ./start.sh
 ```
-This runs `docker compose down`, then `up -d`, waits 60 seconds, submits the Flink job, and waits 15 seconds. It takes about 80 seconds in total. The jobmanager container only starts the JobManager itself; `start.sh` is the sole place that submits the job, so a normal run of this script should produce exactly one "Clip Detector Job".
+The script does these steps, in order:
+1. Stop all containers.
+2. Rebuild images and start all containers.
+3. Wait for services to start.
+4. Wait for the Flink JobManager to respond.
+5. Submit the Flink job.
+6. Wait for the job to start.
+
+The full sequence takes about 80 seconds.
+
+The rebuild step matters. `docker-entrypoint-job.sh` is baked into the flink-jobmanager image at build time, not bind-mounted. A plain `docker compose up -d` would reuse the old image and skip any change to that file.
+
+The jobmanager container starts the JobManager only. It does not submit a job. `start.sh` is the only thing that submits the job. A normal run of this script produces exactly one "Clip Detector Job".
 
 **After it finishes, confirm exactly one Flink job is running:**
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
-Should show one "Clip Detector Job (RUNNING)". If you see none, submission may have run before the JobManager was ready -- submit manually (see "Flink job" below).
+This should show one "Clip Detector Job (RUNNING)". If you see none, submit the job by hand (see "Flink job" below).
 
 **If `start.sh` is not available**, run the same steps manually:
 ```bash
 docker compose down
-docker compose up -d
+docker compose up -d --build
 sleep 60
 docker exec streamscout-flink-jobmanager flink list
 ```
@@ -211,12 +223,11 @@ docker logs -t streamscout-stream-monitoring --tail 20 # with timestamps
 ## Part 6: Common problems
 
 ### "No running jobs" in Flink
-The jobmanager container never auto-submits a job on its own -- not on a
-normal `start.sh` restart, and not if the container crashes and Docker
-restarts it unattended (`restart: unless-stopped` in `docker-compose.yml`
-brings the container back, but an empty JobManager, not a running job). If
-you land here after an unexpected container restart rather than a manual
-one, that's expected; submit the job:
+The jobmanager container never submits a job by itself. This is true for a
+normal `start.sh` restart. It is also true if the container crashes and
+Docker restarts it on its own. Compose's `restart: unless-stopped` policy
+brings the container back, but with an empty JobManager and no job. In
+both cases, submit the job:
 ```bash
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```

@@ -7,9 +7,9 @@ cd ~/stream-scout
 ./start.sh
 ```
 
-Wait about 80 seconds. The script stops all containers, starts them again, and submits the Flink job.
+Wait about 80 seconds. The script stops all containers, rebuilds images, starts the containers again, and submits the Flink job.
 
-## Check for a duplicate Flink job
+## Check the Flink job
 
 Run this after the script ends:
 
@@ -17,13 +17,7 @@ Run this after the script ends:
 docker exec streamscout-flink-jobmanager flink list
 ```
 
-Look for two "Clip Detector Job" entries. If you see two, cancel the older job:
-
-```bash
-docker exec streamscout-flink-jobmanager flink cancel <older-job-id>
-```
-
-**Why this happens:** the script does not check for a recovered job before it submits a new one. A recovered job appears after a restart if the jobmanager kept a checkpoint from before.
+This should show exactly one "Clip Detector Job (RUNNING)". If you see none, submit the job by hand. See "Flink job" in `OPERATIONS.md`.
 
 ## Things start.sh does not control
 

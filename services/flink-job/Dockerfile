@@ -29,8 +29,8 @@ COPY test_clip_detector.py /opt/flink/usrlib/
 COPY test_clip_attempt.py /opt/flink/usrlib/
 COPY test_spike_detector.py /opt/flink/usrlib/
 
-# Copy custom entrypoint (starts the JobManager only -- job submission
-# happens from start.sh, not from this script)
+# Copy the custom entrypoint. It starts the JobManager only. start.sh
+# submits the job.
 COPY docker-entrypoint-job.sh /opt/flink/
 RUN chmod +x /opt/flink/docker-entrypoint-job.sh
 
