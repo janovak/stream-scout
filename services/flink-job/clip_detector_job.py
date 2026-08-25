@@ -45,6 +45,7 @@ from spike_detector import (
     WATERMARK_OUT_OF_ORDERNESS_SECONDS,
     evaluate,
     is_command,
+    next_chain_timer,
 )
 from token_manager import TwitchCredentials
 
@@ -753,8 +754,16 @@ class AnomalyDetector(KeyedProcessFunction):
             # watermark that stops, so no timer runs at all. The state TTL
             # above covers it. evaluate() covers the other case itself, by
             # removing a hold whose peak is older than the cap.
+            #
+            # next_chain_timer(), not timestamp + 1000 directly: KNOWN_ISSUES.md
+            # Issue 4 ("Change B") -- registering blindly replayed a whole
+            # backlog of already-fired timers once per watermark tick after a
+            # jump. See that function's docstring for the full mechanism.
             if all_counts:
-                ctx.timer_service().register_event_time_timer(timestamp + 1000)
+                watermark = ctx.timer_service().current_watermark()
+                ctx.timer_service().register_event_time_timer(
+                    next_chain_timer(timestamp, watermark)
+                )
 
             if decision.emit is not None:
                 spike = decision.emit

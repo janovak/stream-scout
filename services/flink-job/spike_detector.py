@@ -58,6 +58,10 @@ from typing import List, Mapping, Optional, Tuple
 # readiness in the same way.
 WATERMARK_OUT_OF_ORDERNESS_SECONDS = 5
 
+# Flink sends this as the watermark on job shutdown. Guards the arithmetic in
+# next_chain_timer() below from overflowing a Java long on that one call.
+MAX_WATERMARK = 9223372036854775807
+
 # The code removes command messages (messages that start with "!") before they
 # reach the detector. This regex is pure. clip_detector_job.py's CommandFilter
 # and tools/replay.py share it, so the harness sees what the operator sees.
@@ -66,6 +70,41 @@ COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
 
 def is_command(text: str) -> bool:
     return bool(COMMAND_PATTERN.match(text))
+
+
+def next_chain_timer(timestamp: int, watermark: int) -> int:
+    """KNOWN_ISSUES.md Issue 4, "Change B": where clip_detector_job.py's
+    per-second chain timer (on_timer, ~line 757) should register its own
+    successor next.
+
+    The naive answer, timestamp + 1000, is what caused the bug: after a
+    watermark jump, one advanceWatermark sweep fires a whole backlog of
+    timers in ascending order, and each of those calls' re-registration
+    lands after the sweep (a PyFlink/Beam bundle-boundary effect, confirmed
+    by a local MiniCluster probe -- see KNOWN_ISSUES.md). The next watermark
+    tick then replays the entire block again, once per tick, each round
+    losing only its lowest timer -- proven by production logs matching
+    triangular numbers exactly (KNOWN_ISSUES.md "Stage 2").
+
+    The fix: only register a timer ahead of the current watermark.
+    current_watermark() is confirmed (source trace + MiniCluster probe) to
+    return the value that sweep is advancing to, shared by every timer that
+    fires in it -- not each timer's own timestamp -- so every call in a
+    replaying sweep sees the same watermark and computes the same answer,
+    which collapses back to one registration (Flink dedupes same key +
+    timestamp).
+
+    A plain `if next_ts <= watermark: return None` (skip registering)
+    was the first draft and is wrong: measured on the probe, it let the
+    whole chain lapse rather than just skip stale rounds, silently starving
+    a broadcaster's hold until its next chat message. Resuming at the first
+    second after the watermark instead keeps the chain alive with exactly
+    one timer, matching steady-state behavior once the jump is absorbed.
+    """
+    next_ts = timestamp + 1000
+    if watermark < MAX_WATERMARK and next_ts <= watermark:
+        next_ts = watermark - (watermark % 1000) + 1000
+    return next_ts
 
 
 @dataclass(frozen=True)
