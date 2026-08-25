@@ -29,7 +29,7 @@ echo "[3/5] Starting all services..."
 # This is the same mechanism Kafka, Postgres, and Redis already use in
 # this file, so submission below only runs once the JobManager is
 # actually answering, not after a fixed guess at how long that takes.
-docker compose up -d --wait --wait-timeout 200
+docker compose up -d --wait --wait-timeout 240
 
 echo ""
 echo "[4/5] Submitting Flink job..."
