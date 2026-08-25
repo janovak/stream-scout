@@ -40,13 +40,18 @@ cd ~/stream-scout
 ```
 The script does these steps, in order:
 1. Stop all containers.
-2. Rebuild images and start all containers.
-3. Wait for services to start.
-4. Wait for the Flink JobManager to respond.
-5. Submit the Flink job.
-6. Wait for the job to start.
+2. Rebuild the Flink images.
+3. Start all containers.
+4. Wait for services to start (60 seconds).
+5. Wait for the Flink JobManager to respond (up to 180 seconds).
+6. Submit the Flink job.
+7. Wait for the job to start (15 seconds).
 
-The full sequence takes about 80 seconds.
+In the common case, step 5 finds the JobManager ready almost at once, and
+the full sequence takes about 80 seconds. It can take longer if the Flink
+images need a real rebuild, or if the JobManager is slow to start. The
+script stops with an error if the JobManager is not ready after 180
+seconds, rather than wait forever.
 
 The rebuild step matters. `docker-entrypoint-job.sh` is baked into the flink-jobmanager image at build time, not bind-mounted. A plain `docker compose up -d` would reuse the old image and skip any change to that file.
 
@@ -61,7 +66,8 @@ This should show one "Clip Detector Job (RUNNING)". If you see none, submit the 
 **If `start.sh` is not available**, run the same steps manually:
 ```bash
 docker compose down
-docker compose up -d --build
+docker compose build flink-jobmanager flink-taskmanager
+docker compose up -d
 sleep 60
 docker exec streamscout-flink-jobmanager flink list
 ```
