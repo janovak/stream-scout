@@ -54,7 +54,7 @@ echo "[4/5] Submitting Flink job..."
 # the job. The jobmanager container's own entrypoint does not submit a job.
 SUBMIT_OUTPUT=$(docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d)
 echo "$SUBMIT_OUTPUT"
-JOB_ID=$(echo "$SUBMIT_OUTPUT" | grep -oP 'JobID \K[0-9a-f]+')
+JOB_ID=$(echo "$SUBMIT_OUTPUT" | grep -oP 'JobID \K[0-9a-f]+' || true)
 
 echo ""
 echo "[5/5] Waiting for the job to reach RUNNING..."
