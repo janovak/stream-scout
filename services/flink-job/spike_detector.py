@@ -100,10 +100,18 @@ def next_chain_timer(timestamp: int, watermark: int) -> int:
     a broadcaster's hold until its next chat message. Resuming at the first
     second after the watermark instead keeps the chain alive with exactly
     one timer, matching steady-state behavior once the jump is absorbed.
+
+    Checks the *computed* resume point against MAX_WATERMARK, not the raw
+    watermark value: watermark == MAX_WATERMARK is the only value Flink
+    actually sends, but the rounding-up arithmetic overflows past it for
+    any watermark in the last three digits below it too, and a check on
+    the input alone wouldn't catch that band.
     """
     next_ts = timestamp + 1000
-    if watermark < MAX_WATERMARK and next_ts <= watermark:
-        next_ts = watermark - (watermark % 1000) + 1000
+    if next_ts <= watermark:
+        resumed = watermark - (watermark % 1000) + 1000
+        if resumed <= MAX_WATERMARK:
+            next_ts = resumed
     return next_ts
 
 

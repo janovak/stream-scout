@@ -114,6 +114,15 @@ class TestNextChainTimer:
         identical to the pre-fix code."""
         assert next_chain_timer(timestamp=1000, watermark=MAX_WATERMARK) == 2000
 
+    def test_near_max_watermark_does_not_overflow(self):
+        """A watermark just below MAX_WATERMARK also overflows the rounding
+        arithmetic (round up past the last 1000 lands above Long.MAX_VALUE),
+        not only the exact sentinel value. Code review caught this: checking
+        the raw watermark against MAX_WATERMARK misses this whole band, since
+        it isn't the input that overflows, it's the computed resume point."""
+        near_max = MAX_WATERMARK - 307
+        assert next_chain_timer(timestamp=1000, watermark=near_max) == 2000
+
 
 class TestShippedDefaults:
     """The defaults are the Plan 06 Phase 3 decisions; pin them."""
