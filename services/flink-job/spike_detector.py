@@ -70,6 +70,10 @@ WATERMARK_OUT_OF_ORDERNESS_SECONDS = 5
 # concept to model.
 WATERMARK_IDLENESS_SECONDS = 10
 
+# Flink sends this as the watermark on job shutdown. Guards the arithmetic in
+# next_chain_timer() below from overflowing a Java long on that one call.
+MAX_WATERMARK = 9223372036854775807
+
 # The code removes command messages (messages that start with "!") before they
 # reach the detector. This regex is pure. clip_detector_job.py's CommandFilter
 # and tools/replay.py share it, so the harness sees what the operator sees.
@@ -78,6 +82,49 @@ COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
 
 def is_command(text: str) -> bool:
     return bool(COMMAND_PATTERN.match(text))
+
+
+def next_chain_timer(timestamp: int, watermark: int) -> int:
+    """KNOWN_ISSUES.md Issue 4, "Change B": where clip_detector_job.py's
+    per-second chain timer (on_timer, ~line 757) should register its own
+    successor next.
+
+    The naive answer, timestamp + 1000, is what caused the bug: after a
+    watermark jump, one advanceWatermark sweep fires a whole backlog of
+    timers in ascending order, and each of those calls' re-registration
+    lands after the sweep (a PyFlink/Beam bundle-boundary effect, confirmed
+    by a local MiniCluster probe -- see KNOWN_ISSUES.md). The next watermark
+    tick then replays the entire block again, once per tick, each round
+    losing only its lowest timer -- proven by production logs matching
+    triangular numbers exactly (KNOWN_ISSUES.md "Stage 2").
+
+    The fix: only register a timer ahead of the current watermark.
+    current_watermark() is confirmed (source trace + MiniCluster probe) to
+    return the value that sweep is advancing to, shared by every timer that
+    fires in it -- not each timer's own timestamp -- so every call in a
+    replaying sweep sees the same watermark and computes the same answer,
+    which collapses back to one registration (Flink dedupes same key +
+    timestamp).
+
+    A plain `if next_ts <= watermark: return None` (skip registering)
+    was the first draft and is wrong: measured on the probe, it let the
+    whole chain lapse rather than just skip stale rounds, silently starving
+    a broadcaster's hold until its next chat message. Resuming at the first
+    second after the watermark instead keeps the chain alive with exactly
+    one timer, matching steady-state behavior once the jump is absorbed.
+
+    Checks the *computed* resume point against MAX_WATERMARK, not the raw
+    watermark value: watermark == MAX_WATERMARK is the only value Flink
+    actually sends, but the rounding-up arithmetic overflows past it for
+    any watermark in the last three digits below it too, and a check on
+    the input alone wouldn't catch that band.
+    """
+    next_ts = timestamp + 1000
+    if next_ts <= watermark:
+        resumed = watermark - (watermark % 1000) + 1000
+        if resumed <= MAX_WATERMARK:
+            next_ts = resumed
+    return next_ts
 
 
 @dataclass(frozen=True)

@@ -4,7 +4,15 @@ from dataclasses import replace
 
 import pytest
 
-from spike_detector import DetectorConfig, HoldState, Spike, evaluate, is_command
+from spike_detector import (
+    MAX_WATERMARK,
+    DetectorConfig,
+    HoldState,
+    Spike,
+    evaluate,
+    is_command,
+    next_chain_timer,
+)
 
 # A deliberately small baseline so fixtures stay readable. The shipped
 # defaults (300s baseline) are asserted separately in TestShippedDefaults --
@@ -62,6 +70,58 @@ class TestCommandFilter:
         assert not is_command("hello world")
         assert not is_command("")
         assert not is_command("? not a command")
+
+
+class TestNextChainTimer:
+    """KNOWN_ISSUES.md Issue 4, "Change B". next_chain_timer() decides where
+    clip_detector_job.py's per-second chain timer registers its own
+    successor. The naive answer (timestamp + 1000, unconditionally) is what
+    caused the bug: after a watermark jump, PyFlink replays a whole backlog
+    of already-fired timers once per watermark tick. These pin the corrected
+    arithmetic, including the case a first draft of this fix got wrong (see
+    the "chain lapses" test below)."""
+
+    def test_steady_state_unchanged(self):
+        """The watermark trails the newest message by
+        WATERMARK_OUT_OF_ORDERNESS_SECONDS or more in normal operation, so
+        the head of any sweep sits comfortably below it. Behavior here must
+        match the pre-fix timestamp + 1000."""
+        assert next_chain_timer(timestamp=24000, watermark=24999) == 25000
+
+    def test_next_second_exactly_at_watermark_still_resumes(self):
+        """A timer for exactly the current watermark fires in this same
+        sweep -- re-registering it would replay a timer that just ran. `<=`,
+        not `<`, is the correct boundary."""
+        assert next_chain_timer(timestamp=28999, watermark=29999) == 30000
+
+    def test_deep_replay_resumes_after_watermark_instead_of_lapsing(self):
+        """The bug this guards against: a first draft of this fix simply
+        skipped registering when timestamp + 1000 was stale, which measured
+        as the whole chain dying until the broadcaster's next chat message --
+        a silent hold-tracking gap, not just a suppressed replay. Resuming at
+        the first second after the watermark keeps exactly one timer alive."""
+        assert next_chain_timer(timestamp=20000, watermark=29999) == 30000
+
+    def test_resume_point_rounds_up_to_the_next_full_second(self):
+        """Real watermarks are epoch milliseconds and are not multiples of
+        1000. The resume point must still land on a whole second."""
+        assert next_chain_timer(timestamp=1000, watermark=30500) == 31000
+
+    def test_shutdown_watermark_does_not_overflow(self):
+        """Flink sends Long.MAX_VALUE as the watermark on job shutdown.
+        MAX_WATERMARK must guard the modulo/subtraction from running at all
+        on that value, not just from overflowing -- shutdown behavior stays
+        identical to the pre-fix code."""
+        assert next_chain_timer(timestamp=1000, watermark=MAX_WATERMARK) == 2000
+
+    def test_near_max_watermark_does_not_overflow(self):
+        """A watermark just below MAX_WATERMARK also overflows the rounding
+        arithmetic (round up past the last 1000 lands above Long.MAX_VALUE),
+        not only the exact sentinel value. Code review caught this: checking
+        the raw watermark against MAX_WATERMARK misses this whole band, since
+        it isn't the input that overflows, it's the computed resume point."""
+        near_max = MAX_WATERMARK - 307
+        assert next_chain_timer(timestamp=1000, watermark=near_max) == 2000
 
 
 class TestShippedDefaults:
