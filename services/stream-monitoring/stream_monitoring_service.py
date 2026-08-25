@@ -207,7 +207,13 @@ class StreamMonitoringService:
 
         if self.chat is not None:
             try:
-                await self.chat.stop()
+                # Chat.stop() is synchronous -- it blocks internally via
+                # run_coroutine_threadsafe(...).result() until its teardown
+                # coroutine finishes on the chat's own thread. `await`ing its
+                # (None) return value used to raise a TypeError that this
+                # except swallowed silently after the real stop had already
+                # completed.
+                self.chat.stop()
             except Exception as e:
                 logger.warning("Error stopping chat client", extra={"error": str(e)})
 
@@ -349,6 +355,25 @@ class StreamMonitoringService:
         - This prevents thrashing and preserves Flink baseline data
         """
         disabled_logins = disabled_logins or set()
+
+        # pyTwitchAPI's reconnect logic gives up for good after exhausting a
+        # bounded backoff list (~4.25 minutes total) and never retries again.
+        # From that point, join_room()/leave_room() keep failing forever with
+        # "Cannot write to closing transport" against the dead socket, while
+        # everything else about the process (health check, scheduler, DB)
+        # still looks healthy. is_connected() reliably reports this dead
+        # state, so recreate the client instead of hammering a corpse.
+        if self.chat is not None and not self.chat.is_connected():
+            logger.warning("Chat connection is dead, recreating client")
+            try:
+                self.chat.stop()
+            except Exception as e:
+                logger.warning("Error stopping dead chat client", extra={"error": str(e)})
+            self.chat = None
+            # The old room list no longer reflects reality: the socket that
+            # held those joins is gone, so every currently-eligible channel
+            # needs a fresh join_room() against the new client below.
+            self.joined_channels.clear()
 
         # Join channels for streamers who entered top JOIN_THRESHOLD
         channels_to_join = join_eligible - self.joined_channels
