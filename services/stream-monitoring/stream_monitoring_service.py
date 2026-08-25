@@ -70,6 +70,15 @@ POLL_INTERVAL_SECONDS = 120  # Poll every 2 minutes
 # patches/twitchapi_leave_room_timeout.py -- not with a wrapper here.
 GET_STREAMS_TIMEOUT_SECONDS = 10
 
+# pyTwitchAPI's Chat.is_connected() also reads False for the entire span of a
+# still-in-progress reconnect (it only reassigns the connection on success),
+# not just after the library has permanently given up. Its own retry budget
+# (reconnect_delay_steps) sums to 255s. Requiring the connection to look dead
+# across this many consecutive 120s polls (240s+ of continuous non-connected
+# readings) keeps us from tearing down a client that's still mid-recovery in
+# the common case, without adding a wall-clock timer of our own.
+DEAD_CHAT_CONFIRMATION_POLLS = 3
+
 # Logging setup
 logger = logging.getLogger("stream_monitoring")
 logger.setLevel(getattr(logging, LOG_LEVEL.upper()))
@@ -102,6 +111,7 @@ class StreamMonitoringService:
         self.running = True
         self.joined_channels: Set[str] = set()
         self.broadcaster_ids: Dict[str, int] = {}  # login -> id mapping
+        self._consecutive_dead_chat_polls = 0
 
     async def _on_token_refresh(self, access_token: str, refresh_token: str):
         """Callback invoked when tokens are refreshed by pyTwitchAPI."""
@@ -207,7 +217,13 @@ class StreamMonitoringService:
 
         if self.chat is not None:
             try:
-                await self.chat.stop()
+                # Chat.stop() is synchronous -- it blocks internally via
+                # run_coroutine_threadsafe(...).result() until its teardown
+                # coroutine finishes on the chat's own thread. `await`ing its
+                # (None) return value used to raise a TypeError that this
+                # except swallowed silently after the real stop had already
+                # completed.
+                self.chat.stop()
             except Exception as e:
                 logger.warning("Error stopping chat client", extra={"error": str(e)})
 
@@ -323,11 +339,16 @@ class StreamMonitoringService:
                             "broadcaster_id": broadcaster_id
                         })
 
-            # Update metrics (count of streamers we're actively monitoring)
-            active_stream_count.set(len(self.joined_channels))
-
             # Manage chat connections with hysteresis
             await self._manage_chat_connections(top_join_streamers, top_leave_streamers, disabled_logins)
+
+            # Update metrics (count of streamers we're actively monitoring). Must
+            # run after _manage_chat_connections, not before: a dead-connection
+            # recovery there can swing self.joined_channels by the entire
+            # monitored set within this same poll, and reading the gauge first
+            # would report a value that's already stale by the time this poll
+            # returns.
+            active_stream_count.set(len(self.joined_channels))
 
         except Exception as e:
             logger.error("Error polling streams", extra={"error": str(e)})
@@ -349,6 +370,38 @@ class StreamMonitoringService:
         - This prevents thrashing and preserves Flink baseline data
         """
         disabled_logins = disabled_logins or set()
+
+        # pyTwitchAPI's reconnect logic gives up for good after exhausting a
+        # bounded backoff list (~4.25 minutes total) and never retries again.
+        # From that point, join_room()/leave_room() keep failing forever with
+        # "Cannot write to closing transport" against the dead socket, while
+        # everything else about the process (health check, scheduler, DB)
+        # still looks healthy. is_connected() reports this, but also reads
+        # False during a still-in-progress reconnect the library would have
+        # completed on its own -- see DEAD_CHAT_CONFIRMATION_POLLS -- so we
+        # only act once it has looked dead for several consecutive polls.
+        if self.chat is not None and not self.chat.is_connected():
+            self._consecutive_dead_chat_polls += 1
+        else:
+            self._consecutive_dead_chat_polls = 0
+
+        if self.chat is not None and self._consecutive_dead_chat_polls >= DEAD_CHAT_CONFIRMATION_POLLS:
+            logger.warning("Chat connection is dead, recreating client", extra={
+                "consecutive_dead_polls": self._consecutive_dead_chat_polls
+            })
+            try:
+                self.chat.stop()
+            except Exception as e:
+                logger.warning("Error stopping dead chat client", extra={"error": str(e)})
+            self.chat = None
+            self._consecutive_dead_chat_polls = 0
+            # The dead socket already dropped every room it held. Rejoin
+            # everything hysteresis says should still be joined -- the
+            # surviving 16-30 band too, not just newly-JOIN_THRESHOLD-eligible
+            # channels -- or recovery would silently narrow coverage from
+            # top-LEAVE_THRESHOLD down to top-JOIN_THRESHOLD on every outage.
+            join_eligible = join_eligible | (self.joined_channels & leave_eligible)
+            self.joined_channels = set()
 
         # Join channels for streamers who entered top JOIN_THRESHOLD
         channels_to_join = join_eligible - self.joined_channels

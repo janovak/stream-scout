@@ -5,6 +5,7 @@ Unit tests for Stream Monitoring Service
 Tests token management, message processing, and service components.
 """
 
+import asyncio
 import json
 import os
 import tempfile
@@ -16,7 +17,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import stream_monitoring_service
 import token_manager
+from stream_monitoring_service import StreamMonitoringService
 from token_manager import TokenRecord, TwitchCredentials
 
 
@@ -433,6 +436,146 @@ class TestChatRoomManagement:
         assert broadcaster_ids.get("ninja") == 19571641
         assert broadcaster_ids.get("shroud") == 37402112
         assert broadcaster_ids.get("nonexistent") is None
+
+
+class TestChatConnectionRecovery:
+    """Tests for recreating a chat client whose underlying connection died
+    for good. pyTwitchAPI's Chat gives up reconnecting after exhausting a
+    bounded backoff list and never retries again; from that point
+    join_room()/leave_room() fail forever against the dead socket with no
+    other symptom, so _manage_chat_connections must detect and recover from
+    it rather than trust that self.chat existing means it still works.
+
+    is_connected() also reads False for the whole span of a still-in-progress
+    reconnect the library would complete on its own, so recreation only fires
+    after DEAD_CHAT_CONFIRMATION_POLLS consecutive dead readings."""
+
+    @staticmethod
+    def _make_dead_chat():
+        dead_chat = MagicMock()
+        dead_chat.is_connected.return_value = False
+        dead_chat.join_room = AsyncMock()
+        dead_chat.leave_room = AsyncMock()
+        return dead_chat
+
+    @staticmethod
+    def _make_fresh_chat():
+        fresh_chat = MagicMock()
+        fresh_chat.register_event = MagicMock()
+        fresh_chat.start = MagicMock()
+        fresh_chat.join_room = AsyncMock()
+        fresh_chat.leave_room = AsyncMock()
+        return fresh_chat
+
+    def test_does_not_recreate_before_confirmation_threshold(self):
+        """A dead reading alone isn't enough -- it could still be a
+        still-in-progress reconnect the library would finish on its own."""
+        service = StreamMonitoringService()
+        service.twitch = MagicMock()
+        dead_chat = self._make_dead_chat()
+        service.chat = dead_chat
+        service.joined_channels = {"stalechannel"}
+
+        for _ in range(stream_monitoring_service.DEAD_CHAT_CONFIRMATION_POLLS - 1):
+            asyncio.run(service._manage_chat_connections(
+                join_eligible={"stalechannel"},
+                leave_eligible={"stalechannel"},
+            ))
+
+        dead_chat.stop.assert_not_called()
+        assert service.chat is dead_chat
+
+    def test_recreates_chat_after_confirmation_threshold(self):
+        """Once the connection has looked dead for DEAD_CHAT_CONFIRMATION_POLLS
+        consecutive polls, the dead chat is stopped, replaced, and the stale
+        room list is dropped so no leave_room() is attempted against the new
+        client for channels the old, gone socket used to hold."""
+        service = StreamMonitoringService()
+        service.twitch = MagicMock()
+        dead_chat = self._make_dead_chat()
+        service.chat = dead_chat
+        service.joined_channels = {"stalechannel"}
+        fresh_chat = self._make_fresh_chat()
+
+        with patch("stream_monitoring_service.Chat", AsyncMock(return_value=fresh_chat)):
+            for _ in range(stream_monitoring_service.DEAD_CHAT_CONFIRMATION_POLLS):
+                asyncio.run(service._manage_chat_connections(
+                    join_eligible={"newchannel"},
+                    leave_eligible={"newchannel"},
+                ))
+
+        dead_chat.stop.assert_called_once()
+        assert service.chat is fresh_chat
+        fresh_chat.leave_room.assert_not_awaited()
+        fresh_chat.join_room.assert_awaited_once_with("newchannel")
+        assert service.joined_channels == {"newchannel"}
+        assert service._consecutive_dead_chat_polls == 0
+
+    def test_recreate_preserves_hysteresis_band_not_just_join_eligible(self):
+        """Recovery must rejoin the whole surviving LEAVE_THRESHOLD band, not
+        just the narrower JOIN_THRESHOLD set -- otherwise every outage
+        silently shrinks coverage from top-30 to top-15 and never restores
+        it, defeating the point of the hysteresis band."""
+        service = StreamMonitoringService()
+        service.twitch = MagicMock()
+        dead_chat = self._make_dead_chat()
+        service.chat = dead_chat
+        # "midbandchannel" is joined and still within the wider leave-eligible
+        # band, but is NOT in join_eligible (it's not freshly entering the
+        # top-JOIN_THRESHOLD set) -- exactly the rank-16-30 case.
+        service.joined_channels = {"midbandchannel"}
+        fresh_chat = self._make_fresh_chat()
+
+        with patch("stream_monitoring_service.Chat", AsyncMock(return_value=fresh_chat)):
+            for _ in range(stream_monitoring_service.DEAD_CHAT_CONFIRMATION_POLLS):
+                asyncio.run(service._manage_chat_connections(
+                    join_eligible={"topchannel"},
+                    leave_eligible={"topchannel", "midbandchannel"},
+                ))
+
+        fresh_chat.join_room.assert_any_await("midbandchannel")
+        fresh_chat.join_room.assert_any_await("topchannel")
+        assert service.joined_channels == {"topchannel", "midbandchannel"}
+
+    def test_reconnect_before_threshold_resets_the_counter(self):
+        """A dead reading followed by a healthy one must not carry over --
+        otherwise a couple of isolated blips days apart could eventually
+        accumulate past the threshold and trigger a bogus recreate."""
+        service = StreamMonitoringService()
+        service.twitch = MagicMock()
+        flaky_chat = self._make_dead_chat()
+        service.chat = flaky_chat
+
+        asyncio.run(service._manage_chat_connections(join_eligible=set(), leave_eligible=set()))
+        assert service._consecutive_dead_chat_polls == 1
+
+        flaky_chat.is_connected.return_value = True
+        asyncio.run(service._manage_chat_connections(join_eligible=set(), leave_eligible=set()))
+        assert service._consecutive_dead_chat_polls == 0
+        assert service.chat is flaky_chat
+        flaky_chat.stop.assert_not_called()
+
+    def test_leaves_healthy_chat_untouched(self):
+        """A connected chat is reused as-is; no stop/recreate happens."""
+        service = StreamMonitoringService()
+        service.twitch = MagicMock()
+
+        healthy_chat = MagicMock()
+        healthy_chat.is_connected.return_value = True
+        healthy_chat.join_room = AsyncMock()
+        healthy_chat.leave_room = AsyncMock()
+        service.chat = healthy_chat
+        service.joined_channels = {"existingchannel"}
+
+        asyncio.run(service._manage_chat_connections(
+            join_eligible={"existingchannel"},
+            leave_eligible={"existingchannel"},
+        ))
+
+        healthy_chat.stop.assert_not_called()
+        assert service.chat is healthy_chat
+        healthy_chat.join_room.assert_not_awaited()
+        healthy_chat.leave_room.assert_not_awaited()
 
 
 class TestRedisKeyManagement:
