@@ -54,22 +54,31 @@ echo "[4/5] Submitting Flink job..."
 # the job. The jobmanager container's own entrypoint does not submit a job.
 SUBMIT_OUTPUT=$(docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d)
 echo "$SUBMIT_OUTPUT"
-JOB_ID=$(echo "$SUBMIT_OUTPUT" | grep -oE 'JobID [0-9a-f]+' | awk '{print $2}')
+JOB_ID=$(echo "$SUBMIT_OUTPUT" | grep -oP 'JobID \K[0-9a-f]+')
 
 echo ""
 echo "[5/5] Waiting for the job to reach RUNNING..."
 # A fixed sleep here would be a guess, the same problem step 3 already
-# fixed. Poll instead, bounded at 30 seconds.
-JOB_RUNNING=0
-for attempt in $(seq 1 15); do
-    if docker exec streamscout-flink-jobmanager flink list 2>/dev/null | grep -q "$JOB_ID.*RUNNING"; then
-        JOB_RUNNING=1
-        break
+# fixed. Poll instead. flink-taskmanager has no health check of its own,
+# so a cold rebuild can leave it still registering task slots after
+# flink-jobmanager already reports healthy. The bound below allows for
+# that: up to a minute.
+if [ -z "$JOB_ID" ]; then
+    echo "WARNING: could not read a JobID from the submission output above. Skipping the RUNNING check. Run 'flink list' by hand." >&2
+else
+    JOB_RUNNING=0
+    for attempt in $(seq 1 30); do
+        if ! LIST_OUTPUT=$(docker exec streamscout-flink-jobmanager flink list 2>&1); then
+            echo "  'flink list' failed: $LIST_OUTPUT" >&2
+        elif echo "$LIST_OUTPUT" | grep -q "$JOB_ID.*RUNNING"; then
+            JOB_RUNNING=1
+            break
+        fi
+        sleep 2
+    done
+    if [ "$JOB_RUNNING" -ne 1 ]; then
+        echo "WARNING: job did not reach RUNNING within about a minute. Check 'flink list' by hand." >&2
     fi
-    sleep 2
-done
-if [ "$JOB_RUNNING" -ne 1 ]; then
-    echo "WARNING: job did not reach RUNNING within 30 seconds. Check 'flink list' by hand." >&2
 fi
 
 echo ""
