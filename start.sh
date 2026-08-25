@@ -22,6 +22,12 @@ sleep 60
 
 echo ""
 echo "[4/5] Submitting Flink job..."
+# -pyFiles ships spike_detector.py, token_manager.py, and clip_attempt.py to
+# the SDK harness workers -- they don't inherit sys.path from
+# clip_detector_job.py's own directory, so without this the job crashes at
+# runtime with "ModuleNotFoundError: No module named 'spike_detector'" (or
+# 'token_manager', or 'clip_attempt'). This is the only place that submits
+# the job -- the jobmanager container's own entrypoint does not.
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 
 echo ""

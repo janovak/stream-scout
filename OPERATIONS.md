@@ -38,7 +38,7 @@ The normal way to restart is the script:
 cd ~/stream-scout
 ./start.sh
 ```
-This runs `docker compose down`, then `up -d`, waits 60 seconds, submits the Flink job, and waits 15 seconds. It takes about 80 seconds in total. The jobmanager container only starts the JobManager itself; `start.sh` is the sole place that submits the job (see KNOWN_ISSUES.md Issue 2), so a normal run of this script should produce exactly one "Clip Detector Job".
+This runs `docker compose down`, then `up -d`, waits 60 seconds, submits the Flink job, and waits 15 seconds. It takes about 80 seconds in total. The jobmanager container only starts the JobManager itself; `start.sh` is the sole place that submits the job, so a normal run of this script should produce exactly one "Clip Detector Job".
 
 **After it finishes, confirm exactly one Flink job is running:**
 ```bash
@@ -132,8 +132,7 @@ Expect to see: `Stream Monitoring Service started`, `Polling for top streams`, `
    docker compose restart flink-jobmanager flink-taskmanager
    sleep 30
    ```
-4. The jobmanager container does not auto-submit a job (see KNOWN_ISSUES.md
-   Issue 2), so submit one:
+4. The jobmanager container does not auto-submit a job, so submit one:
    ```bash
    docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
    ```
@@ -212,7 +211,12 @@ docker logs -t streamscout-stream-monitoring --tail 20 # with timestamps
 ## Part 6: Common problems
 
 ### "No running jobs" in Flink
-Submit the job:
+The jobmanager container never auto-submits a job on its own -- not on a
+normal `start.sh` restart, and not if the container crashes and Docker
+restarts it unattended (`restart: unless-stopped` in `docker-compose.yml`
+brings the container back, but an empty JobManager, not a running job). If
+you land here after an unexpected container restart rather than a manual
+one, that's expected; submit the job:
 ```bash
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
