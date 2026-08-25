@@ -42,6 +42,7 @@ from clip_attempt import ClipAttempt, ClipPolicy, RealClock
 from spike_detector import (
     DetectorConfig,
     HoldState,
+    WATERMARK_IDLENESS_SECONDS,
     WATERMARK_OUT_OF_ORDERNESS_SECONDS,
     evaluate,
     is_command,
@@ -1007,9 +1008,13 @@ def main():
     # per-second timers ride on this, not on our ingestion timestamp or
     # wall-clock time. WATERMARK_OUT_OF_ORDERNESS_SECONDS is shared with
     # tools/replay.py so the harness simulates the same allowed lateness.
+    # WATERMARK_IDLENESS_SECONDS (KNOWN_ISSUES.md Issue 4): the topic has more
+    # partitions than this job has parallelism, so a split can go quiet for a
+    # long stretch and freeze the operator watermark -- the minimum across
+    # every split -- until this timeout releases it.
     watermark_strategy = WatermarkStrategy \
         .for_bounded_out_of_orderness(Duration.of_seconds(WATERMARK_OUT_OF_ORDERNESS_SECONDS)) \
-        .with_idleness(Duration.of_minutes(1)) \
+        .with_idleness(Duration.of_seconds(WATERMARK_IDLENESS_SECONDS)) \
         .with_timestamp_assigner(SentAtTimestampAssigner())
 
     # Build the pipeline
