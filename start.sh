@@ -52,7 +52,13 @@ echo "[4/5] Submitting Flink job..."
 # runtime with "ModuleNotFoundError: No module named 'spike_detector'" (or
 # 'token_manager', or 'clip_attempt'). This is the only place that submits
 # the job. The jobmanager container's own entrypoint does not submit a job.
-SUBMIT_OUTPUT=$(docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d 2>&1)
+# "|| true" here matters. Without it, a submission failure would make
+# this assignment itself fail. Under "set -e" that kills the script
+# right here, before the echo below ever runs, and the operator would
+# see no explanation at all. Letting it continue means the diagnostic
+# output below still prints, and the empty-JOB_ID branch further down
+# still catches the failure and sets a non-zero exit code.
+SUBMIT_OUTPUT=$(docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d 2>&1 || true)
 echo "$SUBMIT_OUTPUT"
 JOB_ID=$(echo "$SUBMIT_OUTPUT" | grep -oP 'JobID \K[0-9a-f]+' || true)
 
@@ -77,8 +83,17 @@ if [ -z "$JOB_ID" ]; then
     EXIT_CODE=1
 else
     JOB_RUNNING=0
+    JOB_TERMINAL_FAILURE=0
     for attempt in $(seq 1 30); do
-        JOB_STATE=$(curl -s "http://localhost:8081/jobs/$JOB_ID" | grep -oP '"state":"\K[A-Z]+' || true)
+        # python3 reads the "state" field the same way OPERATIONS.md's own
+        # examples already parse JSON elsewhere in this project. A field
+        # lookup survives a harmless change to key order or whitespace in
+        # the response; a regex against the raw text would not.
+        JOB_STATE=$(curl -s "http://localhost:8081/jobs/$JOB_ID" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("state", ""))
+except ValueError:
+    pass' 2>/dev/null || true)
         if [ "$JOB_STATE" = "RUNNING" ]; then
             JOB_RUNNING=1
             break
@@ -87,13 +102,16 @@ else
             FAILED|CANCELED|FINISHED)
                 echo "ERROR: job $JOB_ID entered state $JOB_STATE instead of RUNNING." >&2
                 echo "Check: docker logs streamscout-flink-taskmanager" >&2
+                JOB_TERMINAL_FAILURE=1
                 break
                 ;;
         esac
         sleep 2
     done
     if [ "$JOB_RUNNING" -ne 1 ]; then
-        echo "WARNING: job did not reach RUNNING within about a minute. Check 'flink list' by hand." >&2
+        if [ "$JOB_TERMINAL_FAILURE" -ne 1 ]; then
+            echo "WARNING: job did not reach RUNNING within about a minute. Check 'flink list' by hand." >&2
+        fi
         EXIT_CODE=1
     fi
 fi
