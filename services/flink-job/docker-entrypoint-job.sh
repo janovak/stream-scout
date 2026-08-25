@@ -9,10 +9,10 @@
 # start.sh's submission. Now only one script submits the job.
 #
 # Before this change, this script had its own copy of the -pyFiles
-# argument, baked into the image at build time. That copy went stale if a
-# new module was added and the image was not rebuilt. Removing it fixes
-# that only for the automatic restart path. OPERATIONS.md still has its
-# own copies of the same -pyFiles argument, for manual recovery. Keep
+# argument, baked into the image at build time. Adding a new module
+# without rebuilding the image made that copy stale. Removing it fixes
+# that only for the automatic restart path. OPERATIONS.md still carries
+# its own copies of the same -pyFiles argument, for manual recovery. Keep
 # those in sync by hand when the argument changes.
 #
 # Trade-off: if this container crashes, Docker restarts it on its own

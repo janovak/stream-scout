@@ -19,7 +19,7 @@ Run this after the script ends:
 docker exec streamscout-flink-jobmanager flink list
 ```
 
-This should show exactly one "Clip Detector Job (RUNNING)". If you see none, submit the job by hand. See "Flink job" in `OPERATIONS.md`. If you see two, cancel one:
+This should show exactly one "Clip Detector Job (RUNNING)". If you see none, submit the job by hand. See "Flink job" in `OPERATIONS.md`. If you see two, check which one is actually healthy before cancelling — do not assume the newer or the older one is the broken one. See `OPERATIONS.md` Part 1.
 
 ```bash
 docker exec streamscout-flink-jobmanager flink cancel <JOB_ID>

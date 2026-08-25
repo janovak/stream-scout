@@ -72,7 +72,7 @@ The jobmanager container starts the JobManager only. It does not submit a job. `
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
-This should show one "Clip Detector Job (RUNNING)". If you see none, submit the job by hand (see "Flink job" below). If you see two, cancel one of them:
+This should show one "Clip Detector Job (RUNNING)". If you see none, submit the job by hand (see "Flink job" below). If you see two, check which one is actually healthy first. Do not assume the newer or the older job is the broken one — start-time ordering is not a reliable signal. Check task health instead: `flink list` marks a broken job FAILED or shows failed tasks, or check `docker logs streamscout-flink-taskmanager` for errors. Cancel the broken one:
 ```bash
 docker exec streamscout-flink-jobmanager flink cancel <JOB_ID>
 ```
@@ -109,7 +109,7 @@ All listed services should show `running`.
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
-This should show one "Clip Detector Job (RUNNING)". Zero jobs is expected after an unattended container restart, such as a crash. It is not expected after a normal `start.sh` run. See "No running jobs" in Flink, in Part 6. Two jobs means something submitted twice. Cancel the extra one.
+This should show one "Clip Detector Job (RUNNING)". Zero jobs is expected after an unattended container restart, such as a crash. It is not expected after a normal `start.sh` run. See "No running jobs" in Flink, in Part 6. Two jobs means something submitted twice. Check which one is actually healthy before cancelling — see Part 1's note on this. Do not assume the newer or the older job is the broken one.
 
 ```bash
 curl -s "http://localhost:5000/v1.0/clip?limit=5" | python3 -m json.tool
