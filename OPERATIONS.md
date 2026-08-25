@@ -118,9 +118,10 @@ docker exec streamscout-kafka kafka-topics --bootstrap-server localhost:9092 --l
 ```
 Should list `chat-messages` and `stream-lifecycle`.
 
-**After a Kafka restart, also restart these** — they hold open connections to Kafka that do not reconnect on their own:
+**After a Kafka restart, also restart these** — they hold open connections to Kafka that do not reconnect on their own. `docker compose up -d` alone would not touch them: their container config has not changed, so compose would leave the old, dead connections running. Use `restart`, then wait for flink-jobmanager to report healthy again:
 ```bash
-docker compose up -d --wait --wait-timeout 200 stream-monitoring flink-jobmanager flink-taskmanager
+docker compose restart stream-monitoring flink-jobmanager flink-taskmanager
+docker compose up -d --wait --wait-timeout 200 flink-jobmanager
 ```
 Then resubmit the Flink job (see "Flink job" below).
 
@@ -146,10 +147,13 @@ Expect to see: `Stream Monitoring Service started`, `Polling for top streams`, `
    ```bash
    docker exec streamscout-flink-jobmanager flink cancel <JOB_ID>
    ```
-3. Restart both Flink containers and wait for flink-jobmanager to report
-   healthy:
+3. Restart both Flink containers, then wait for flink-jobmanager to
+   report healthy. `docker compose up -d` alone would not restart
+   already-running containers with no config change, so use `restart`
+   first:
    ```bash
-   docker compose up -d --wait --wait-timeout 200 flink-jobmanager flink-taskmanager
+   docker compose restart flink-jobmanager flink-taskmanager
+   docker compose up -d --wait --wait-timeout 200 flink-jobmanager
    ```
 4. The jobmanager container does not auto-submit a job, so submit one:
    ```bash
@@ -241,7 +245,8 @@ docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_de
 
 ### Flink job fails with "heartbeat timeout"
 ```bash
-docker compose up -d --wait --wait-timeout 200 flink-jobmanager flink-taskmanager
+docker compose restart flink-jobmanager flink-taskmanager
+docker compose up -d --wait --wait-timeout 200 flink-jobmanager
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
 
@@ -251,7 +256,8 @@ ls -la ./secrets/twitch_user_tokens.json
 ```
 If missing, run `python seed_twitch_tokens.py`, then restart Flink and resubmit the job:
 ```bash
-docker compose up -d --wait --wait-timeout 200 flink-jobmanager flink-taskmanager
+docker compose restart flink-jobmanager flink-taskmanager
+docker compose up -d --wait --wait-timeout 200 flink-jobmanager
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
 

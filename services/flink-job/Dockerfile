@@ -20,9 +20,9 @@ RUN pip3 install --no-cache-dir -r /opt/flink/requirements.txt
 # of which change often. Placing them here keeps their cache valid when a
 # routine job-code change (below) invalidates the layers under it -- so a
 # rebuild of this image does not re-download every JAR from the network
-# just because clip_detector_job.py changed. start.sh now rebuilds this
-# image on every restart (see KNOWN_ISSUES.md Issue 2), which is what
-# makes this ordering matter in practice, not just in theory.
+# just because clip_detector_job.py changed. start.sh rebuilds this image
+# on every restart, which is what makes this ordering matter in practice,
+# not just in theory.
 
 # Download Kafka connector
 RUN wget -P /opt/flink/lib/ https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.0.2-1.18/flink-sql-connector-kafka-3.0.2-1.18.jar

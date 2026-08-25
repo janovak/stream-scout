@@ -106,6 +106,7 @@ services:
     build:
       context: ./services/flink-job
       dockerfile: Dockerfile
+    image: stream-scout-flink-job:latest
     container_name: streamscout-flink-jobmanager
     restart: unless-stopped
     command: /opt/flink/docker-entrypoint-job.sh
@@ -214,6 +215,7 @@ services:
     build:
       context: ./services/flink-job
       dockerfile: Dockerfile
+    image: stream-scout-flink-job:latest
     container_name: streamscout-flink-taskmanager
     restart: unless-stopped
     command: taskmanager
