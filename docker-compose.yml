@@ -201,6 +201,12 @@ services:
         required: false
       kafka:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
     networks:
       - streamscout
 

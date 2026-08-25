@@ -7,7 +7,7 @@ cd ~/stream-scout
 ./start.sh
 ```
 
-Wait about 80 seconds. The script stops all containers, rebuilds images, starts the containers again, and submits the Flink job.
+This usually takes under a minute. The script rebuilds the Flink images, stops all containers, starts them again, waits for the JobManager to answer, and submits the Flink job. It can take longer if the Flink images need a real rebuild, or if the JobManager is slow to start.
 
 ## Check the Flink job
 
