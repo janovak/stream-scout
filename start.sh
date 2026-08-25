@@ -34,14 +34,16 @@ echo "[3/5] Starting all services..."
 # that takes.
 #
 # flink-jobmanager also waits on kafka's own health check before its
-# container even starts (see depends_on in docker-compose.yml). Compose
-# fails as soon as any one watched container reports unhealthy. It does
-# not wait for the full timeout below in that case. kafka's health check
-# gives up after about 150 seconds. flink-jobmanager's gives up after
-# about 210 seconds. flink-jobmanager's own clock does not start until
-# kafka is already healthy. The 400-second value below is an outer limit
-# only. It covers both waits together, with margin. It is there in case a
-# container stays in "starting" longer than its own check would suggest.
+# container even starts, and on kafka-init finishing (creating the
+# chat-messages and stream-lifecycle topics) (see depends_on in
+# docker-compose.yml). Compose fails as soon as any one watched container
+# reports unhealthy. It does not wait for the full timeout below in that
+# case. kafka's health check gives up after about 150 seconds.
+# flink-jobmanager's gives up after about 210 seconds. flink-jobmanager's
+# own clock does not start until kafka is healthy and kafka-init has
+# finished. The 400-second value below is an outer limit only. It covers
+# all of that together, with margin. It is there in case a container
+# stays in "starting" longer than its own check would suggest.
 docker compose up -d --wait --wait-timeout 400
 
 echo ""
@@ -120,10 +122,15 @@ echo ""
 echo "=== Startup Complete ==="
 echo ""
 echo "Services running:"
-docker compose ps --format "table {{.Name}}\t{{.Status}}"
+# "|| true" on these two: they are diagnostic output only, not part of
+# the pass/fail decision. Without it, a broken JobManager could fail one
+# of them and exit the script here, under set -e, before reaching "exit
+# $EXIT_CODE" below -- silently dropping the exit code this step was
+# added to get right.
+docker compose ps --format "table {{.Name}}\t{{.Status}}" || true
 echo ""
 echo "Flink job status:"
-docker exec streamscout-flink-jobmanager flink list
+docker exec streamscout-flink-jobmanager flink list || true
 echo ""
 echo "URLs:"
 echo "  Frontend:  http://localhost:5000"

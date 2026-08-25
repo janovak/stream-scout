@@ -52,13 +52,15 @@ seconds. The full sequence then takes well under a minute. It can take
 longer if the Flink images need a real rebuild. It can also take longer
 if the JobManager is slow to start. It can also take longer if Kafka is
 slow to start. The JobManager container waits on Kafka's own health
-check. It does not even start until Kafka is healthy.
+check, and on `kafka-init` finishing (it creates the `chat-messages` and
+`stream-lifecycle` topics). It does not even start until both are done.
 
 The script stops with an error as soon as any one container's own health
 check gives up. For Kafka, that is about 150 seconds. For
 flink-jobmanager, that is about 210 seconds. flink-jobmanager's own
-clock does not start until Kafka is already healthy. The script also has
-an outer limit of 400 seconds. This covers a container that stays stuck
+clock does not start until Kafka is healthy and `kafka-init` has
+finished. The script also has an outer limit of 400 seconds. This covers
+a container that stays stuck
 in "starting" longer than its own check would suggest. The script does
 not wait forever.
 
