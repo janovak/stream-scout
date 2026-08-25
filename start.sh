@@ -34,10 +34,14 @@ echo "[3/5] Starting all services..."
 # that takes.
 #
 # flink-jobmanager also waits on kafka's own health check before its
-# container even starts (see depends_on in docker-compose.yml). The
-# timeout below covers both waits together: kafka's health check budget
-# (up to 150 seconds) plus flink-jobmanager's own (up to 210 seconds),
-# with margin.
+# container even starts (see depends_on in docker-compose.yml). Compose
+# fails as soon as any one watched container reports unhealthy. It does
+# not wait for the full timeout below in that case. kafka's health check
+# gives up after about 150 seconds. flink-jobmanager's gives up after
+# about 210 seconds, and its own clock does not start until kafka is
+# already healthy. The 400-second value below is an outer limit only. It
+# covers both waits together, with margin, in case a container stays in
+# "starting" longer than its own check would suggest.
 docker compose up -d --wait --wait-timeout 400
 
 echo ""
@@ -48,11 +52,25 @@ echo "[4/5] Submitting Flink job..."
 # runtime with "ModuleNotFoundError: No module named 'spike_detector'" (or
 # 'token_manager', or 'clip_attempt'). This is the only place that submits
 # the job. The jobmanager container's own entrypoint does not submit a job.
-docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
+SUBMIT_OUTPUT=$(docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d)
+echo "$SUBMIT_OUTPUT"
+JOB_ID=$(echo "$SUBMIT_OUTPUT" | grep -oE 'JobID [0-9a-f]+' | awk '{print $2}')
 
 echo ""
-echo "[5/5] Waiting 15 seconds for job to start..."
-sleep 15
+echo "[5/5] Waiting for the job to reach RUNNING..."
+# A fixed sleep here would be a guess, the same problem step 3 already
+# fixed. Poll instead, bounded at 30 seconds.
+JOB_RUNNING=0
+for attempt in $(seq 1 15); do
+    if docker exec streamscout-flink-jobmanager flink list 2>/dev/null | grep -q "$JOB_ID.*RUNNING"; then
+        JOB_RUNNING=1
+        break
+    fi
+    sleep 2
+done
+if [ "$JOB_RUNNING" -ne 1 ]; then
+    echo "WARNING: job did not reach RUNNING within 30 seconds. Check 'flink list' by hand." >&2
+fi
 
 echo ""
 echo "=== Startup Complete ==="

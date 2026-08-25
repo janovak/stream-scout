@@ -43,17 +43,21 @@ The script does these steps, in order:
    has been stopped yet.
 2. Stop all containers.
 3. Start all containers. Wait for every container with a health check to
-   report healthy, flink-jobmanager included (up to 400 seconds).
+   report healthy, flink-jobmanager included.
 4. Submit the Flink job.
-5. Wait for the job to start (15 seconds).
+5. Wait for the job to reach RUNNING.
 
 In the common case, step 3 finds every container healthy within a few
 seconds. The full sequence then takes well under a minute. It can take
 longer if the Flink images need a real rebuild. It can also take longer
 if the JobManager is slow to start, or if Kafka is slow to start (the
 JobManager container waits on Kafka's own health check before it even
-starts). The script stops with an error if a container is not healthy
-after 400 seconds. It does not wait forever.
+starts). The script stops with an error as soon as any one container's
+own health check gives up: about 150 seconds for Kafka, about 210
+seconds for flink-jobmanager (whose own clock does not start until
+Kafka is already healthy). It also has an outer limit of 400 seconds,
+for the case where a container stays stuck in "starting" longer than
+its own check would suggest. It does not wait forever.
 
 The rebuild step matters. `docker-entrypoint-job.sh` is baked into the flink-jobmanager image at build time. It is not bind-mounted. A plain `docker compose up -d` would reuse the old image. It would skip any change to that file.
 
@@ -63,7 +67,10 @@ The jobmanager container starts the JobManager only. It does not submit a job. `
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
-This should show one "Clip Detector Job (RUNNING)". If you see none, submit the job by hand (see "Flink job" below).
+This should show one "Clip Detector Job (RUNNING)". If you see none, submit the job by hand (see "Flink job" below). If you see two, cancel one of them:
+```bash
+docker exec streamscout-flink-jobmanager flink cancel <JOB_ID>
+```
 
 **If `start.sh` is not available**, run the same steps manually:
 ```bash
