@@ -43,17 +43,19 @@ The script does these steps, in order:
    has been stopped yet.
 2. Stop all containers.
 3. Start all containers. Wait for every container with a health check to
-   report healthy, flink-jobmanager included (up to 240 seconds).
+   report healthy, flink-jobmanager included (up to 400 seconds).
 4. Submit the Flink job.
 5. Wait for the job to start (15 seconds).
 
 In the common case, step 3 finds every container healthy within a few
-seconds, and the full sequence takes well under a minute. It can take
-longer if the Flink images need a real rebuild, or if the JobManager is
-slow to start. The script stops with an error if a container is not
-healthy after 240 seconds, rather than wait forever.
+seconds. The full sequence then takes well under a minute. It can take
+longer if the Flink images need a real rebuild. It can also take longer
+if the JobManager is slow to start, or if Kafka is slow to start (the
+JobManager container waits on Kafka's own health check before it even
+starts). The script stops with an error if a container is not healthy
+after 400 seconds. It does not wait forever.
 
-The rebuild step matters. `docker-entrypoint-job.sh` is baked into the flink-jobmanager image at build time, not bind-mounted. A plain `docker compose up -d` would reuse the old image and skip any change to that file.
+The rebuild step matters. `docker-entrypoint-job.sh` is baked into the flink-jobmanager image at build time. It is not bind-mounted. A plain `docker compose up -d` would reuse the old image. It would skip any change to that file.
 
 The jobmanager container starts the JobManager only. It does not submit a job. `start.sh` is the only thing that submits the job. A normal run of this script produces exactly one "Clip Detector Job".
 
@@ -67,7 +69,7 @@ This should show one "Clip Detector Job (RUNNING)". If you see none, submit the 
 ```bash
 docker compose build flink-jobmanager flink-taskmanager
 docker compose down
-docker compose up -d --wait --wait-timeout 240
+docker compose up -d --wait --wait-timeout 400
 docker exec streamscout-flink-jobmanager flink list
 ```
 `--wait` blocks until flink-jobmanager is healthy, so this command does not return until the JobManager can accept a submission.
@@ -121,7 +123,7 @@ Should list `chat-messages` and `stream-lifecycle`.
 **After a Kafka restart, also restart these** — they hold open connections to Kafka that do not reconnect on their own. `docker compose up -d` alone would not touch them: their container config has not changed, so compose would leave the old, dead connections running. Use `restart`, then wait for flink-jobmanager to report healthy again:
 ```bash
 docker compose restart stream-monitoring flink-jobmanager flink-taskmanager
-docker compose up -d --wait --wait-timeout 240 flink-jobmanager
+docker compose up -d --wait --wait-timeout 400 flink-jobmanager
 ```
 Then resubmit the Flink job (see "Flink job" below).
 
@@ -153,7 +155,7 @@ Expect to see: `Stream Monitoring Service started`, `Polling for top streams`, `
    first:
    ```bash
    docker compose restart flink-jobmanager flink-taskmanager
-   docker compose up -d --wait --wait-timeout 240 flink-jobmanager
+   docker compose up -d --wait --wait-timeout 400 flink-jobmanager
    ```
 4. The jobmanager container does not auto-submit a job, so submit one:
    ```bash
@@ -246,7 +248,7 @@ docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_de
 ### Flink job fails with "heartbeat timeout"
 ```bash
 docker compose restart flink-jobmanager flink-taskmanager
-docker compose up -d --wait --wait-timeout 240 flink-jobmanager
+docker compose up -d --wait --wait-timeout 400 flink-jobmanager
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
 
@@ -257,7 +259,7 @@ ls -la ./secrets/twitch_user_tokens.json
 If missing, run `python seed_twitch_tokens.py`, then restart Flink and resubmit the job:
 ```bash
 docker compose restart flink-jobmanager flink-taskmanager
-docker compose up -d --wait --wait-timeout 240 flink-jobmanager
+docker compose up -d --wait --wait-timeout 400 flink-jobmanager
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
 

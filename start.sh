@@ -10,12 +10,14 @@ echo ""
 
 echo "[1/5] Building the Flink images..."
 # docker-entrypoint-job.sh is baked into the flink-jobmanager image at
-# build time, not bind-mounted. A plain "up -d" would reuse the old image
-# and skip any change to that file. Build only the two Flink services --
-# they share one Dockerfile -- and leave the other services' images
-# alone. This step runs before anything is stopped. If the build fails
-# (for example, a network problem downloading a JAR), the running stack
-# is left untouched instead of stopped with nothing rebuilt.
+# build time. It is not bind-mounted. A plain "up -d" would reuse the old
+# image. It would skip any change to that file. This command builds only
+# the two Flink services. They share one Dockerfile. It leaves the other
+# services' images alone.
+#
+# This step runs before anything is stopped. Example: the build fails
+# because of a network problem downloading a JAR. The running stack stays
+# untouched. Nothing gets stopped with the rebuild incomplete.
 docker compose build flink-jobmanager flink-taskmanager
 
 echo ""
@@ -24,12 +26,19 @@ docker compose down
 
 echo ""
 echo "[3/5] Starting all services..."
-# --wait blocks until every service with a health check reports healthy,
-# flink-jobmanager included (see its health check in docker-compose.yml).
-# This is the same mechanism Kafka, Postgres, and Redis already use in
-# this file, so submission below only runs once the JobManager is
-# actually answering, not after a fixed guess at how long that takes.
-docker compose up -d --wait --wait-timeout 240
+# --wait blocks until every service with a health check reports healthy.
+# flink-jobmanager is one of them (see its health check in
+# docker-compose.yml). Kafka, Postgres, and Redis already use this same
+# mechanism in this file. Submission below then only runs once the
+# JobManager is actually answering, not after a fixed guess at how long
+# that takes.
+#
+# flink-jobmanager also waits on kafka's own health check before its
+# container even starts (see depends_on in docker-compose.yml). The
+# timeout below covers both waits together: kafka's health check budget
+# (up to 150 seconds) plus flink-jobmanager's own (up to 210 seconds),
+# with margin.
+docker compose up -d --wait --wait-timeout 400
 
 echo ""
 echo "[4/5] Submitting Flink job..."
