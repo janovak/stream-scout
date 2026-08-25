@@ -7,7 +7,9 @@ cd ~/stream-scout
 ./start.sh
 ```
 
-This usually takes under a minute. The script rebuilds the Flink images, stops all containers, starts them again, waits for the JobManager to answer, and submits the Flink job. It can take longer if the Flink images need a real rebuild, or if the JobManager is slow to start.
+This usually takes under a minute. The script rebuilds the Flink images, stops all containers, starts them again, waits for the JobManager to answer, submits the Flink job, and waits for the job to reach RUNNING. It can take longer if the Flink images need a real rebuild, or if the JobManager or the job itself is slow to start.
+
+The script's exit code reflects whether the job actually reached RUNNING, not just whether the containers started. A script or cron job that checks `$?` sees a real failure signal, not just "the containers came up."
 
 ## Check the Flink job
 

@@ -127,7 +127,7 @@ Use these steps when one component fails. Skip Postgres and Redis — see "Impor
 **When:** connection errors, or messages not flowing.
 ```bash
 docker compose restart kafka
-sleep 30
+docker compose up -d --wait --wait-timeout 180 kafka
 docker exec streamscout-kafka kafka-topics --bootstrap-server localhost:9092 --list
 ```
 Should list `chat-messages` and `stream-lifecycle`.
@@ -256,6 +256,7 @@ both cases, submit the job:
 ```bash
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
+`--wait` above only confirms flink-jobmanager itself is healthy. flink-taskmanager has no health check of its own, and can still be registering task slots for a few seconds after that. Wait a few seconds, then confirm: `docker exec streamscout-flink-jobmanager flink list` should show it RUNNING, not stuck.
 
 ### Flink job fails with "heartbeat timeout"
 ```bash
@@ -263,6 +264,7 @@ docker compose restart flink-jobmanager flink-taskmanager
 docker compose up -d --wait --wait-timeout 400 flink-jobmanager
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
+Wait a few seconds, then confirm: `docker exec streamscout-flink-jobmanager flink list` should show it RUNNING, not stuck.
 
 ### "Token file not found" in Flink logs
 ```bash
@@ -274,6 +276,7 @@ docker compose restart flink-jobmanager flink-taskmanager
 docker compose up -d --wait --wait-timeout 400 flink-jobmanager
 docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
 ```
+Wait a few seconds, then confirm: `docker exec streamscout-flink-jobmanager flink list` should show it RUNNING, not stuck.
 
 ### Stream monitoring is not joining any chat rooms
 ```bash

@@ -33,12 +33,13 @@ echo "[3/5] Starting all services..."
 # JobManager is actually answering, not after a fixed guess at how long
 # that takes.
 #
-# flink-jobmanager also waits on kafka's own health check before its
-# container even starts, and on kafka-init finishing (creating the
-# chat-messages and stream-lifecycle topics) (see depends_on in
-# docker-compose.yml). Compose fails as soon as any one watched container
-# reports unhealthy. It does not wait for the full timeout below in that
-# case. kafka's health check gives up after about 150 seconds.
+# flink-jobmanager also waits before its own container even starts. It
+# waits on kafka's own health check. It also waits on kafka-init
+# finishing (see depends_on in docker-compose.yml). kafka-init creates
+# the chat-messages and stream-lifecycle topics. Compose fails as soon as
+# any one watched container reports unhealthy. It does not wait for the
+# full timeout below in that case. kafka's health check gives up after
+# about 150 seconds.
 # flink-jobmanager's gives up after about 210 seconds. flink-jobmanager's
 # own clock does not start until kafka is healthy and kafka-init has
 # finished. The 400-second value below is an outer limit only. It covers
@@ -101,7 +102,11 @@ except ValueError:
             break
         fi
         case "$JOB_STATE" in
-            FAILED|CANCELED|FINISHED)
+            FAILED|FAILING|CANCELED|FINISHED)
+                # No restart strategy is configured for this job (and none
+                # applies with checkpointing off), so FAILING always settles
+                # into FAILED. Catching it here saves the remaining poll
+                # budget instead of waiting for that settle.
                 echo "ERROR: job $JOB_ID entered state $JOB_STATE instead of RUNNING." >&2
                 echo "Check: docker logs streamscout-flink-taskmanager" >&2
                 JOB_TERMINAL_FAILURE=1
