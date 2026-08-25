@@ -38,10 +38,10 @@ echo "[3/5] Starting all services..."
 # fails as soon as any one watched container reports unhealthy. It does
 # not wait for the full timeout below in that case. kafka's health check
 # gives up after about 150 seconds. flink-jobmanager's gives up after
-# about 210 seconds, and its own clock does not start until kafka is
-# already healthy. The 400-second value below is an outer limit only. It
-# covers both waits together, with margin, in case a container stays in
-# "starting" longer than its own check would suggest.
+# about 210 seconds. flink-jobmanager's own clock does not start until
+# kafka is already healthy. The 400-second value below is an outer limit
+# only. It covers both waits together, with margin. It is there in case a
+# container stays in "starting" longer than its own check would suggest.
 docker compose up -d --wait --wait-timeout 400
 
 echo ""
@@ -52,15 +52,18 @@ echo "[4/5] Submitting Flink job..."
 # runtime with "ModuleNotFoundError: No module named 'spike_detector'" (or
 # 'token_manager', or 'clip_attempt'). This is the only place that submits
 # the job. The jobmanager container's own entrypoint does not submit a job.
-SUBMIT_OUTPUT=$(docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d)
+SUBMIT_OUTPUT=$(docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d 2>&1)
 echo "$SUBMIT_OUTPUT"
 JOB_ID=$(echo "$SUBMIT_OUTPUT" | grep -oP 'JobID \K[0-9a-f]+' || true)
 
 echo ""
 echo "[5/5] Waiting for the job to reach RUNNING..."
 # A fixed sleep here would be a guess, the same problem step 3 already
-# fixed. Poll instead. flink-taskmanager has no health check of its own,
-# so a cold rebuild can leave it still registering task slots after
+# fixed. Poll the REST API instead of "flink list". The REST API reports
+# the job's exact state. A job that fails right after submission is
+# caught right away, instead of the poll running out its full budget
+# first. flink-taskmanager has no health check of its own. A cold
+# rebuild can leave it still registering task slots after
 # flink-jobmanager already reports healthy. The bound below allows for
 # that: up to a minute.
 if [ -z "$JOB_ID" ]; then
@@ -68,12 +71,18 @@ if [ -z "$JOB_ID" ]; then
 else
     JOB_RUNNING=0
     for attempt in $(seq 1 30); do
-        if ! LIST_OUTPUT=$(docker exec streamscout-flink-jobmanager flink list 2>&1); then
-            echo "  'flink list' failed: $LIST_OUTPUT" >&2
-        elif echo "$LIST_OUTPUT" | grep -q "$JOB_ID.*RUNNING"; then
+        JOB_STATE=$(curl -s "http://localhost:8081/jobs/$JOB_ID" | grep -oP '"state":"\K[A-Z]+' || true)
+        if [ "$JOB_STATE" = "RUNNING" ]; then
             JOB_RUNNING=1
             break
         fi
+        case "$JOB_STATE" in
+            FAILED|CANCELED|FINISHED)
+                echo "ERROR: job $JOB_ID entered state $JOB_STATE instead of RUNNING." >&2
+                echo "Check: docker logs streamscout-flink-taskmanager" >&2
+                break
+                ;;
+        esac
         sleep 2
     done
     if [ "$JOB_RUNNING" -ne 1 ]; then

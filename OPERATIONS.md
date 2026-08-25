@@ -50,14 +50,17 @@ The script does these steps, in order:
 In the common case, step 3 finds every container healthy within a few
 seconds. The full sequence then takes well under a minute. It can take
 longer if the Flink images need a real rebuild. It can also take longer
-if the JobManager is slow to start, or if Kafka is slow to start (the
-JobManager container waits on Kafka's own health check before it even
-starts). The script stops with an error as soon as any one container's
-own health check gives up: about 150 seconds for Kafka, about 210
-seconds for flink-jobmanager (whose own clock does not start until
-Kafka is already healthy). It also has an outer limit of 400 seconds,
-for the case where a container stays stuck in "starting" longer than
-its own check would suggest. It does not wait forever.
+if the JobManager is slow to start. It can also take longer if Kafka is
+slow to start. The JobManager container waits on Kafka's own health
+check. It does not even start until Kafka is healthy.
+
+The script stops with an error as soon as any one container's own health
+check gives up. For Kafka, that is about 150 seconds. For
+flink-jobmanager, that is about 210 seconds. flink-jobmanager's own
+clock does not start until Kafka is already healthy. The script also has
+an outer limit of 400 seconds. This covers a container that stays stuck
+in "starting" longer than its own check would suggest. The script does
+not wait forever.
 
 The rebuild step matters. `docker-entrypoint-job.sh` is baked into the flink-jobmanager image at build time. It is not bind-mounted. A plain `docker compose up -d` would reuse the old image. It would skip any change to that file.
 
