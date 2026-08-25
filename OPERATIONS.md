@@ -94,7 +94,7 @@ All listed services should show `running`.
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
-Should show one "Clip Detector Job (RUNNING)" — not two.
+Should show one "Clip Detector Job (RUNNING)". Zero jobs is expected after an unattended container restart (a crash, not a normal `start.sh` run) — see "No running jobs" in Flink, in Part 6. Two jobs means something submitted twice; cancel the extra one.
 
 ```bash
 curl -s "http://localhost:5000/v1.0/clip?limit=5" | python3 -m json.tool

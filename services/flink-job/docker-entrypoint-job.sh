@@ -6,12 +6,14 @@
 #
 # This script used to submit the job too. That caused two "Clip Detector
 # Job" entries on every restart: this script's own submission raced
-# start.sh's submission. Now only one script submits the job. This gives
-# the -pyFiles argument one source of truth: start.sh, which runs on the
-# host and always matches the checked-out repo. Before this change, this
-# script had its own copy of the -pyFiles argument, baked into the image
-# at build time. That copy went stale if a new module was added and the
-# image was not rebuilt.
+# start.sh's submission. Now only one script submits the job.
+#
+# Before this change, this script had its own copy of the -pyFiles
+# argument, baked into the image at build time. That copy went stale if a
+# new module was added and the image was not rebuilt. Removing it fixes
+# that only for the automatic restart path. OPERATIONS.md still has its
+# own copies of the same -pyFiles argument, for manual recovery. Keep
+# those in sync by hand when the argument changes.
 #
 # Trade-off: if this container crashes, Docker restarts it on its own
 # (compose's `restart: unless-stopped`). Before this change, the restarted
