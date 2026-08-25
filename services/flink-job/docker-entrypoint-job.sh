@@ -1,32 +1,19 @@
 #!/bin/bash
 
 # Custom entrypoint for PyFlink standalone-job mode
-# Starts the JobManager and automatically submits the PyFlink job
+# Starts the JobManager only. Job submission is start.sh's job (or the
+# manual steps in OPERATIONS.md) -- see KNOWN_ISSUES.md Issue 2. This
+# entrypoint used to also submit the job itself, which produced two
+# "Clip Detector Job" entries on every restart: this auto-submission plus
+# start.sh's own submission, racing each other. Submitting only from the
+# host-side script also means the -pyFiles list has one source of truth,
+# always current with the checked-out repo -- not a second copy baked into
+# the image that goes stale if the image isn't rebuilt after a new module
+# is added.
 
 set -e
 
-# Start the JobManager in the background
+# Start the JobManager in the foreground. This keeps the container running;
+# no `wait` is needed.
 echo "Starting Flink JobManager..."
-/docker-entrypoint.sh jobmanager &
-
-# Wait for JobManager to be ready
-echo "Waiting for JobManager to be ready..."
-until curl -s http://localhost:8081/overview > /dev/null 2>&1; do
-    echo "  JobManager not ready yet, waiting..."
-    sleep 2
-done
-echo "JobManager is ready!"
-
-# Submit the PyFlink job
-# -pyFiles ships spike_detector.py, token_manager.py, and clip_attempt.py to
-# the SDK harness workers -- they don't inherit sys.path from
-# clip_detector_job.py's own directory, so without this the job crashes at
-# runtime with "ModuleNotFoundError: No module named 'spike_detector'" (or
-# 'token_manager', or 'clip_attempt').
-echo "Submitting PyFlink job..."
-flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
-
-echo "Job submitted successfully!"
-
-# Keep the container running by waiting on the JobManager process
-wait
+exec /docker-entrypoint.sh jobmanager

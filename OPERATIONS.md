@@ -38,17 +38,13 @@ The normal way to restart is the script:
 cd ~/stream-scout
 ./start.sh
 ```
-This runs `docker compose down`, then `up -d`, waits 60 seconds, submits the Flink job, and waits 15 seconds. It takes about 80 seconds in total.
+This runs `docker compose down`, then `up -d`, waits 60 seconds, submits the Flink job, and waits 15 seconds. It takes about 80 seconds in total. The jobmanager container only starts the JobManager itself; `start.sh` is the sole place that submits the job (see KNOWN_ISSUES.md Issue 2), so a normal run of this script should produce exactly one "Clip Detector Job".
 
-**After it finishes, check for a duplicate Flink job:**
+**After it finishes, confirm exactly one Flink job is running:**
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
-If two "Clip Detector Job" entries appear, cancel the older one:
-```bash
-docker exec streamscout-flink-jobmanager flink cancel <older-job-id>
-```
-The script does not check for a job recovered from checkpoint before it submits a new one. This produces two jobs that both read the same Kafka topic.
+Should show one "Clip Detector Job (RUNNING)". If you see none, submission may have run before the JobManager was ready -- submit manually (see "Flink job" below).
 
 **If `start.sh` is not available**, run the same steps manually:
 ```bash
@@ -136,7 +132,8 @@ Expect to see: `Stream Monitoring Service started`, `Polling for top streams`, `
    docker compose restart flink-jobmanager flink-taskmanager
    sleep 30
    ```
-4. Check whether a job auto-started. If not, submit one:
+4. The jobmanager container does not auto-submit a job (see KNOWN_ISSUES.md
+   Issue 2), so submit one:
    ```bash
    docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
    ```
