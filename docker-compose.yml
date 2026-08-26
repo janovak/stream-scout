@@ -130,10 +130,18 @@ services:
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
       - TWITCH_TOKEN_GID=9999
       # The -pyFiles argument for `flink run`, read by
-      # docker-entrypoint-job.sh. Kept here, not hardcoded in that script,
-      # so a new module only needs a `docker compose up -d` (which picks up
-      # an environment change immediately) rather than an image rebuild.
-      # See KNOWN_ISSUES.md Issue 2.
+      # docker-entrypoint-job.sh. It is not hardcoded in that script.
+      # Editing this value and running `docker compose up -d` picks it up
+      # right away. No image rebuild is needed for that.
+      #
+      # Adding a genuinely new module needs one more step, not just this
+      # line. Each file listed here must already exist at that exact path
+      # inside both the flink-jobmanager and flink-taskmanager containers.
+      # The four files above get there through the bind mounts below, in
+      # this same service's `volumes:` (and flink-taskmanager has the
+      # identical four). A new module needs its own bind-mount line added
+      # to both services the same way, or the path will not exist and
+      # `flink run` will fail.
       - FLINK_PYFILES=/opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py
       - DETECTION_WINDOW_SECONDS=5
       # Back to the first design value of 5 minutes (Plan 06 step 12). Commit

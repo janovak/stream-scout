@@ -16,13 +16,19 @@ This guide covers the full restart procedure, per-service restart steps, and tro
 
 ## How the Flink job gets submitted
 
-The `flink-jobmanager` container submits the Clip Detector job itself, automatically, every time it starts. `docker-entrypoint-job.sh` does this: it starts the JobManager, waits for its REST API to answer, then submits the job. This runs on a normal `start.sh` restart, and also on an unattended restart from Docker's own `restart: unless-stopped` policy after a crash — both start a brand-new JobManager process with no prior job (checkpointing is disabled), so there is nothing else to do first.
+The `flink-jobmanager` container submits the Clip Detector job itself, automatically, every time it starts. `docker-entrypoint-job.sh` does this. It starts the JobManager. It waits for the JobManager's REST API to answer. Then it submits the job.
+
+This runs on a normal `start.sh` restart. It also runs on an unattended restart, from Docker's own `restart: unless-stopped` policy after a crash. Both cases start a brand-new JobManager process. Checkpointing is disabled, so neither case has a prior job to worry about.
 
 Nothing else submits the job. If you need to submit it by hand, run:
 ```bash
 docker exec streamscout-flink-jobmanager sh -c 'flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d'
 ```
-`$FLINK_PYFILES` is read inside the container, from the `FLINK_PYFILES` environment variable set in `docker-compose.yml`. That is the one place this list lives. If a new Python module is ever added to the job, update it there — no image rebuild needed for that change to take effect, just `docker compose up -d`.
+`$FLINK_PYFILES` is read inside the container, from the `FLINK_PYFILES` environment variable set in `docker-compose.yml`. That is the one place this list lives.
+
+**Changing an existing entry** in that list needs no rebuild — edit `docker-compose.yml`, then `docker compose up -d`.
+
+**Adding a genuinely new module** needs one more step. Each file in the list must already exist at that exact path inside both the flink-jobmanager and flink-taskmanager containers. The current four files get there through bind mounts in each service's `volumes:` section in `docker-compose.yml`. Add a matching bind-mount line for the new file, to both services, the same way — otherwise the path will not exist and submission will fail.
 
 ---
 
@@ -50,7 +56,9 @@ The normal way to restart is the script:
 cd ~/stream-scout
 ./start.sh
 ```
-This stops all containers, starts them again, and waits for every container with a health check to report healthy (flink-jobmanager included). It takes well under a minute in the common case. It can take longer if a container is slow to start; Kafka's own health check allows up to about 150 seconds, and flink-jobmanager's up to about 210 seconds on top of that, since its container does not even start until Kafka is healthy.
+This stops all containers, starts them again, and waits for every container with a health check to report healthy. flink-jobmanager is one of them. It takes well under a minute in the common case.
+
+It can take longer if a container is slow to start. Kafka's own health check allows up to about 150 seconds. flink-jobmanager's health check allows up to about 210 seconds on top of that, because its container does not even start until Kafka is healthy and `kafka-init` has finished creating the Kafka topics.
 
 The script does not submit the Flink job. The flink-jobmanager container does that itself on startup — see "How the Flink job gets submitted" above.
 
@@ -69,7 +77,7 @@ docker compose down
 docker compose up -d --wait --wait-timeout 400
 docker exec streamscout-flink-jobmanager flink list
 ```
-`--wait` blocks until flink-jobmanager is healthy. The job should already be running by the time this returns.
+`--wait` blocks until flink-jobmanager's REST API answers. That is not the same as the job being RUNNING — submission happens after that point, and can still fail. If `flink list` above shows none, wait a few seconds and check again, or see "How the Flink job gets submitted" above.
 
 **Then verify:**
 ```bash

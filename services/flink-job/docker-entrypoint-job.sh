@@ -1,23 +1,23 @@
 #!/bin/bash
 
 # Custom entrypoint for PyFlink standalone-job mode.
-# Starts the JobManager, waits for its REST API to answer, then submits
-# the Clip Detector job. This runs on every container start: a normal
-# start.sh restart, and an unattended restart from Docker's own
-# `restart: unless-stopped` policy after a crash. Both cases produce a
-# brand-new JobManager process with no prior job state -- checkpointing
-# is disabled (see flink-conf.yaml) and no HA store is configured -- so
-# there is never a pre-existing job here to collide with. This script is
-# the only thing that ever submits the job. start.sh does not. There is
-# no race between two submitters to guard against. See KNOWN_ISSUES.md
-# Issue 2 for the incident this replaces.
+#
+# Starts the JobManager. Waits for its REST API to answer. Then submits
+# the Clip Detector job. This runs on every container start. That
+# includes a normal start.sh restart. It also includes an unattended
+# restart from Docker's own `restart: unless-stopped` policy after a
+# crash. Both cases produce a brand-new JobManager process with no prior
+# job state. Checkpointing is disabled (see flink-conf.yaml) and no HA
+# store is configured, so there is never a pre-existing job here to
+# collide with. This script is the only thing that ever submits the job.
+# start.sh does not. There is no race between two submitters to guard
+# against.
 #
 # -pyFiles comes from the FLINK_PYFILES environment variable, set in
 # docker-compose.yml. It is not hardcoded here. Editing docker-compose.yml
 # and running "docker compose up -d" picks up a change immediately. No
-# image rebuild is needed. A copy hardcoded in this script would need a
-# rebuild every time a module is added -- that is what caused the
-# original "No module named 'token_manager'" failure.
+# image rebuild is needed for that. A copy hardcoded in this script would
+# need a rebuild every time a module is added.
 
 set -e
 
