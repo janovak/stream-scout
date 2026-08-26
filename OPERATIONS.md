@@ -18,7 +18,9 @@ This guide covers the full restart procedure, per-service restart steps, and tro
 
 The Clip Detector job runs under Flink Application Mode. There is no separate "submit the job" step, ever. The job's code runs as part of the `flink-jobmanager` container's own startup — starting that container **is** starting the job. `docker-entrypoint-job.sh` does this by launching `standalone-job.sh` with `--job-classname org.apache.flink.client.python.PythonDriver`, Flink's own entry point for running a Python job this way.
 
-This has one important consequence: **the job's lifecycle and the container's lifecycle are the same thing.** If the job fails to start, the whole `flink-jobmanager` container exits — it does not stay up in a broken state. If the job later reaches any terminal state (cancelled, finished, or failed for good), the container exits then too. Docker's `restart: unless-stopped` policy brings the container back afterward, which starts the job fresh. This is true whether the container exits because of a crash or because someone ran `flink cancel` — cancelling the job restarts the whole container, not just the job.
+This has one important consequence: **the job's lifecycle and the container's lifecycle are the same thing.** If the job fails to start, the whole `flink-jobmanager` container exits — it does not stay up in a broken state. If the job later reaches any terminal state (cancelled, finished, or failed for good), the container exits then too. Docker's `restart: unless-stopped` policy brings the container back afterward, which starts the job fresh.
+
+This applies to a manual `flink cancel` too, not just a crash. Cancelling the job restarts the whole container, not just the job.
 
 There is nothing to submit by hand and no `-pyFiles` command to run. To restart the job, restart the container:
 ```bash
@@ -68,7 +70,7 @@ This should show one "Clip Detector Job (RUNNING)". If flink-jobmanager did not 
 **If `start.sh` is not available**, run the same steps manually:
 ```bash
 docker compose down
-docker compose up -d --wait --wait-timeout 400
+docker compose up -d --wait --wait-timeout 500
 docker exec streamscout-flink-jobmanager flink list
 ```
 
@@ -122,7 +124,7 @@ Should list `chat-messages` and `stream-lifecycle`.
 **After a Kafka restart, also restart these** — they hold open connections to Kafka that do not reconnect on their own:
 ```bash
 docker compose restart stream-monitoring flink-jobmanager
-docker compose up -d --wait --wait-timeout 400 flink-jobmanager
+docker compose up -d --wait --wait-timeout 500 flink-jobmanager
 ```
 Restarting flink-jobmanager runs the job fresh — see "How the Flink job runs" above. Confirm: `docker exec streamscout-flink-jobmanager flink list`.
 
@@ -143,7 +145,7 @@ Expect to see: `Stream Monitoring Service started`, `Polling for top streams`, `
 There is no separate job to cancel and resubmit — restarting flink-jobmanager restarts the job:
 ```bash
 docker compose restart flink-jobmanager flink-taskmanager
-docker compose up -d --wait --wait-timeout 400 flink-jobmanager
+docker compose up -d --wait --wait-timeout 500 flink-jobmanager
 ```
 Confirm it is running, then check that it is processing:
 ```bash
@@ -233,7 +235,7 @@ docker compose restart flink-jobmanager
 ### Flink job fails with "heartbeat timeout"
 ```bash
 docker compose restart flink-jobmanager flink-taskmanager
-docker compose up -d --wait --wait-timeout 400 flink-jobmanager
+docker compose up -d --wait --wait-timeout 500 flink-jobmanager
 ```
 
 ### "Token file not found" in Flink logs
@@ -243,7 +245,7 @@ ls -la ./secrets/twitch_user_tokens.json
 If missing, run `python seed_twitch_tokens.py`, then restart Flink:
 ```bash
 docker compose restart flink-jobmanager
-docker compose up -d --wait --wait-timeout 400 flink-jobmanager
+docker compose up -d --wait --wait-timeout 500 flink-jobmanager
 ```
 
 ### Adding a new Python module

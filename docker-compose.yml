@@ -330,7 +330,8 @@ services:
       - ./services/flink-job/spike_detector.py:/opt/flink/usrlib/spike_detector.py:ro
       - ./services/flink-job/token_manager.py:/opt/flink/usrlib/token_manager.py:ro
     depends_on:
-      - flink-jobmanager
+      flink-jobmanager:
+        condition: service_healthy
     networks:
       - streamscout
 

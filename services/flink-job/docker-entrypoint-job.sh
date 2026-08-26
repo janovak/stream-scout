@@ -14,10 +14,18 @@
 # container and a fresh attempt. There is nothing to duplicate, because
 # there is no second command that could ever race this one.
 #
-# -pyFiles comes from the FLINK_PYFILES environment variable, set in
-# docker-compose.yml. Editing docker-compose.yml and running
-# "docker compose up -d" picks up a change immediately. No image rebuild
-# is needed for that.
+# -pyFiles (below, -pyfs) comes from the FLINK_PYFILES environment
+# variable, set in docker-compose.yml. It currently lists spike_detector.py,
+# token_manager.py, and clip_attempt.py. clip_detector_job.py imports all
+# three, and they do not inherit sys.path from clip_detector_job.py's own
+# directory -- without each one listed here, the job fails at runtime
+# with "ModuleNotFoundError: No module named 'spike_detector'" (or
+# 'token_manager', or 'clip_attempt'), not at this check below. The
+# check below only catches the variable being unset entirely, not an
+# incomplete list.
+#
+# Editing docker-compose.yml and running "docker compose up -d" picks up
+# a change immediately. No image rebuild is needed for that.
 
 set -e
 

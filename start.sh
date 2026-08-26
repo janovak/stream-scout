@@ -23,10 +23,10 @@ echo "[2/2] Starting all services..."
 # never reports healthy in the first place, and this command fails here
 # rather than reporting a false success.
 CONTAINERS_UP=1
-if ! docker compose up -d --wait --wait-timeout 400; then
+if ! docker compose up -d --wait --wait-timeout 500; then
     CONTAINERS_UP=0
     echo "" >&2
-    echo "ERROR: not every container reported healthy within 400 seconds." >&2
+    echo "ERROR: not every container reported healthy within 500 seconds." >&2
 fi
 
 echo ""
