@@ -62,7 +62,17 @@ except ValueError:
 done
 
 echo ""
-echo "=== Startup Complete ==="
+if [ "$JOB_RUNNING" -eq 1 ]; then
+    EXIT_CODE=0
+    echo "=== Startup Complete ==="
+else
+    EXIT_CODE=1
+    echo "=== Startup Finished, BUT THE FLINK JOB IS NOT RUNNING ==="
+    echo ""
+    echo "WARNING: the Flink job did not reach RUNNING within 60 seconds." >&2
+    echo "Check 'docker logs streamscout-flink-jobmanager' for an ERROR" >&2
+    echo "line -- see OPERATIONS.md Part 1." >&2
+fi
 echo ""
 echo "Services running:"
 docker compose ps --format "table {{.Name}}\t{{.Status}}" || true
@@ -72,15 +82,6 @@ if ! FLINK_LIST=$(docker exec streamscout-flink-jobmanager flink list 2>&1); the
     echo "Could not check: $FLINK_LIST" >&2
 else
     echo "$FLINK_LIST"
-fi
-if [ "$JOB_RUNNING" -eq 1 ]; then
-    EXIT_CODE=0
-else
-    echo "" >&2
-    echo "WARNING: the Flink job did not reach RUNNING within 60 seconds." >&2
-    echo "Check 'docker logs streamscout-flink-jobmanager' for an ERROR" >&2
-    echo "line -- see OPERATIONS.md Part 1." >&2
-    EXIT_CODE=1
 fi
 echo ""
 echo "URLs:"

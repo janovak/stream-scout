@@ -58,7 +58,7 @@ cd ~/stream-scout
 ```
 This stops all containers, starts them again, and waits for every container with a health check to report healthy. flink-jobmanager is one of them. It takes well under a minute in the common case.
 
-It can take longer if a container is slow to start. Kafka's own health check allows up to about 150 seconds. flink-jobmanager's health check allows up to about 210 seconds on top of that, because its container does not even start until Kafka is healthy and `kafka-init` has finished creating the Kafka topics.
+It can take longer if a container is slow to start. Kafka's own health check allows up to about 150 seconds. flink-jobmanager's container does not even start until Kafka is healthy. It also waits for `kafka-init` to finish creating the Kafka topics. Once flink-jobmanager's container does start, its own health check allows up to about 210 more seconds.
 
 The script does not submit the Flink job. The flink-jobmanager container does that itself on startup — see "How the Flink job gets submitted" above.
 
@@ -66,7 +66,11 @@ The script does not submit the Flink job. The flink-jobmanager container does th
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
-This should show one "Clip Detector Job (RUNNING)". If you see none, the submission likely failed — check `docker logs streamscout-flink-jobmanager` for an `ERROR: job submission failed` line and the Flink error above it, fix the cause, then submit by hand (see "How the Flink job gets submitted"). If you see two, check which one is actually healthy before cancelling either — do not assume the newer or the older one is the broken one:
+This should show one "Clip Detector Job (RUNNING)".
+
+If you see none, the submission likely failed. Check `docker logs streamscout-flink-jobmanager` for an `ERROR: job submission failed` line and the Flink error above it. Fix the cause. Then submit by hand (see "How the Flink job gets submitted").
+
+If you see two, do not assume the newer or the older one is the broken one. Start-time ordering has been wrong before — see `KNOWN_ISSUES.md` Issue 2 for the incident this comes from. Check http://localhost:8081 in a browser instead: each job's own page shows its task status and any exceptions. There is no state to lose either way (checkpointing is disabled), so if you cannot tell which is healthy, the simplest safe move is to cancel both, then submit one fresh job by hand (see "How the Flink job gets submitted"):
 ```bash
 docker exec streamscout-flink-jobmanager flink cancel <JOB_ID>
 ```

@@ -340,8 +340,14 @@ services:
       - ./services/flink-job/spike_detector.py:/opt/flink/usrlib/spike_detector.py:ro
       - ./services/flink-job/token_manager.py:/opt/flink/usrlib/token_manager.py:ro
     depends_on:
-      flink-jobmanager:
-        condition: service_healthy
+      # Only ordering, not condition: service_healthy. TaskManagers are
+      # built to retry connecting to the JobManager on their own if it
+      # isn't ready yet. Gating this container's own start on
+      # flink-jobmanager's full health check (which can take up to
+      # ~210s) delayed task-slot registration for no benefit, and made
+      # start.sh's own job-RUNNING poll race against a later starting
+      # point than it needs to.
+      - flink-jobmanager
     networks:
       - streamscout
 

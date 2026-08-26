@@ -31,46 +31,58 @@ until curl -sf http://localhost:8081/overview > /dev/null 2>&1; do
 done
 echo "JobManager is ready!"
 
-echo "Submitting Clip Detector Job..."
-# A few attempts, a short wait apart, before giving up. A submission can
-# fail only because something it depends on is not quite ready yet, even
-# though its own health check already passed. Kafka is one example: a
-# leader election can still be settling. Retrying gives that kind of
-# failure a chance to clear on its own.
-#
-# A submission failure must not bring this script down, and so must not
-# bring the container down either. Under `restart: unless-stopped`, an
-# unguarded exit here would crash-loop the container forever on a
-# submission that keeps failing for a real reason, such as bad code or a
-# bad module path, not just a transient one. Retry a bounded number of
-# times, then log it and keep the JobManager running. That lets an
-# operator inspect and fix it by hand.
-#
-# Before each retry, check whether a job is already running. `flink run`
-# can report failure on the client side after the JobManager already
-# accepted the job -- the client process killed partway through, for
-# example. Retrying blindly in that case would submit a second, duplicate
-# job: the exact bug this script exists to prevent.
-SUBMIT_OK=0
-for attempt in 1 2 3; do
-    if flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d; then
-        SUBMIT_OK=1
-        break
+if [ -z "$FLINK_PYFILES" ]; then
+    echo "ERROR: FLINK_PYFILES is not set. Not attempting to submit." >&2
+    echo "Set it in docker-compose.yml, then restart this container." >&2
+else
+    echo "Submitting Clip Detector Job..."
+    # A few attempts, a short wait apart, before giving up. A submission
+    # can fail only because something it depends on is not quite ready
+    # yet, even though its own health check already passed. Kafka is one
+    # example: a leader election can still be settling. Retrying gives
+    # that kind of failure a chance to clear on its own.
+    #
+    # A submission failure must not bring this script down, and so must
+    # not bring the container down either. Under `restart: unless-stopped`,
+    # an unguarded exit here would crash-loop the container forever on a
+    # submission that keeps failing for a real reason, such as bad code or
+    # a bad module path, not just a transient one. Retry a bounded number
+    # of times, then log it and keep the JobManager running. That lets an
+    # operator inspect and fix it by hand.
+    #
+    # Before each retry, check whether a job already exists. `flink run`
+    # can report failure on the client side after the JobManager already
+    # accepted the job -- the client process killed partway through, for
+    # example. A newly-accepted job is not necessarily RUNNING yet; it can
+    # sit briefly in CREATED or SCHEDULED first. Checking for RUNNING only
+    # would miss it in that window and retry anyway. `flink list`, with no
+    # flags, only ever lists non-terminal jobs -- CREATED, RUNNING,
+    # RESTARTING, and so on. A failed or cancelled job never appears
+    # there. So the job's name showing up in this output at all, in any
+    # state, is enough: retrying blindly past that point would submit a
+    # second, duplicate job, which is the exact bug this script exists to
+    # prevent.
+    SUBMIT_OK=0
+    for attempt in 1 2 3; do
+        if flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d; then
+            SUBMIT_OK=1
+            break
+        fi
+        if flink list 2>/dev/null | grep -q "Clip Detector Job"; then
+            echo "  Submission reported failure, but a Clip Detector Job already exists. Not retrying." >&2
+            SUBMIT_OK=1
+            break
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            echo "  Submission attempt $attempt failed. Retrying in 5 seconds..." >&2
+            sleep 5
+        fi
+    done
+    if [ "$SUBMIT_OK" -ne 1 ]; then
+        echo "ERROR: job submission failed after 3 attempts. The JobManager is still running." >&2
+        echo "Check the error above. Fix it. Then submit by hand:" >&2
+        echo '  docker exec streamscout-flink-jobmanager sh -c '"'"'flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d'"'"'' >&2
     fi
-    if flink list 2>/dev/null | grep -q "Clip Detector Job.*RUNNING"; then
-        echo "  Submission reported failure, but a Clip Detector Job is already running. Not retrying." >&2
-        SUBMIT_OK=1
-        break
-    fi
-    if [ "$attempt" -lt 3 ]; then
-        echo "  Submission attempt $attempt failed. Retrying in 5 seconds..." >&2
-        sleep 5
-    fi
-done
-if [ "$SUBMIT_OK" -ne 1 ]; then
-    echo "ERROR: job submission failed after 3 attempts. The JobManager is still running." >&2
-    echo "Check the error above. Fix it. Then submit by hand:" >&2
-    echo '  docker exec streamscout-flink-jobmanager sh -c '"'"'flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d'"'"'' >&2
 fi
 
 # Keep the container running by waiting on the JobManager process.

@@ -21,7 +21,7 @@ Should show exactly one "Clip Detector Job (RUNNING)". The flink-jobmanager cont
 docker exec streamscout-flink-jobmanager sh -c 'flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d'
 ```
 
-If you see two, check which one is actually healthy before cancelling — do not assume the newer or the older one is the broken one.
+If you see two, do not assume the newer or the older one is the broken one — check http://localhost:8081 instead. See "Confirm the Flink job is running" in `OPERATIONS.md` Part 1 for the full guidance.
 
 ## Things start.sh does not control
 
