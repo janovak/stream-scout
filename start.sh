@@ -30,14 +30,35 @@ echo "[3/3] Waiting for the Flink job to register..."
 # after that check already passes, inside docker-entrypoint-job.sh,
 # which can itself retry up to 3 times a few seconds apart. Poll instead
 # of guessing a fixed wait, bounded at 60 seconds.
+#
+# The REST API (queried directly, port 8081 is published to the host) is
+# used for this check, not `flink list`'s text output. The text format is
+# meant for a human, not a stable interface, and a Flink version bump
+# could reformat it without warning.
 JOB_RUNNING=0
 for attempt in $(seq 1 12); do
-    FLINK_LIST=$(docker exec streamscout-flink-jobmanager flink list 2>&1 || true)
-    if echo "$FLINK_LIST" | grep -q "Clip Detector Job.*RUNNING"; then
-        JOB_RUNNING=1
-        break
+    if ! OVERVIEW=$(curl -sf http://localhost:8081/jobs/overview 2>&1); then
+        echo "  Could not reach the Flink REST API: $OVERVIEW" >&2
+    else
+        JOB_STATE=$(echo "$OVERVIEW" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for job in data.get("jobs", []):
+        if job.get("name") == "Clip Detector Job" and job.get("state") == "RUNNING":
+            print("RUNNING")
+            break
+except ValueError:
+    pass
+' 2>/dev/null || true)
+        if [ "$JOB_STATE" = "RUNNING" ]; then
+            JOB_RUNNING=1
+            break
+        fi
     fi
-    sleep 5
+    if [ "$attempt" -lt 12 ]; then
+        sleep 5
+    fi
 done
 
 echo ""
@@ -47,7 +68,11 @@ echo "Services running:"
 docker compose ps --format "table {{.Name}}\t{{.Status}}" || true
 echo ""
 echo "Flink job status:"
-echo "$FLINK_LIST"
+if ! FLINK_LIST=$(docker exec streamscout-flink-jobmanager flink list 2>&1); then
+    echo "Could not check: $FLINK_LIST" >&2
+else
+    echo "$FLINK_LIST"
+fi
 if [ "$JOB_RUNNING" -eq 1 ]; then
     EXIT_CODE=0
 else

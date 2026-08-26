@@ -18,7 +18,7 @@ This guide covers the full restart procedure, per-service restart steps, and tro
 
 The `flink-jobmanager` container submits the Clip Detector job itself, automatically, every time it starts. `docker-entrypoint-job.sh` does this. It starts the JobManager. It waits for the JobManager's REST API to answer. Then it submits the job.
 
-This runs on a normal `start.sh` restart. It also runs on an unattended restart, from Docker's own `restart: unless-stopped` policy after a crash. Both cases start a brand-new JobManager process. Checkpointing is disabled, so neither case has a prior job to worry about.
+This runs on a normal `start.sh` restart. It also runs on an unattended restart, from Docker's own `restart: unless-stopped` policy after a crash. Both cases start a brand-new JobManager process. The job does not use checkpointing, so neither case has a prior job to recover.
 
 Nothing else submits the job. If you need to submit it by hand, run:
 ```bash

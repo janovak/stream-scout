@@ -32,19 +32,33 @@ done
 echo "JobManager is ready!"
 
 echo "Submitting Clip Detector Job..."
-# A few attempts, a short wait apart, before giving up. This covers a
-# submission that fails only because something it depends on (Kafka, for
-# example) is not quite ready yet, even though its own health check
-# already passed -- a leader election still settling, and similar. A
-# submission failure must not bring this script, and so the container,
-# down after that. Under `restart: unless-stopped`, an unguarded exit
-# here would crash-loop the container forever on a submission that keeps
-# failing for a real reason (bad code, a bad module path), not just a
-# transient one. Retry a bounded number of times, then log it and keep
-# the JobManager running, so an operator can inspect and fix it by hand.
+# A few attempts, a short wait apart, before giving up. A submission can
+# fail only because something it depends on is not quite ready yet, even
+# though its own health check already passed. Kafka is one example: a
+# leader election can still be settling. Retrying gives that kind of
+# failure a chance to clear on its own.
+#
+# A submission failure must not bring this script down, and so must not
+# bring the container down either. Under `restart: unless-stopped`, an
+# unguarded exit here would crash-loop the container forever on a
+# submission that keeps failing for a real reason, such as bad code or a
+# bad module path, not just a transient one. Retry a bounded number of
+# times, then log it and keep the JobManager running. That lets an
+# operator inspect and fix it by hand.
+#
+# Before each retry, check whether a job is already running. `flink run`
+# can report failure on the client side after the JobManager already
+# accepted the job -- the client process killed partway through, for
+# example. Retrying blindly in that case would submit a second, duplicate
+# job: the exact bug this script exists to prevent.
 SUBMIT_OK=0
 for attempt in 1 2 3; do
     if flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d; then
+        SUBMIT_OK=1
+        break
+    fi
+    if flink list 2>/dev/null | grep -q "Clip Detector Job.*RUNNING"; then
+        echo "  Submission reported failure, but a Clip Detector Job is already running. Not retrying." >&2
         SUBMIT_OK=1
         break
     fi
