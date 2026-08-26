@@ -32,13 +32,29 @@ done
 echo "JobManager is ready!"
 
 echo "Submitting Clip Detector Job..."
-# A submission failure here must not bring this script -- and so the
-# container -- down. Under `restart: unless-stopped`, an exit here would
-# crash-loop the container, retrying the same broken submission forever.
-# Log it and keep the JobManager running instead, so an operator can
-# inspect and fix it by hand.
-if ! flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d; then
-    echo "ERROR: job submission failed. The JobManager is still running." >&2
+# A few attempts, a short wait apart, before giving up. This covers a
+# submission that fails only because something it depends on (Kafka, for
+# example) is not quite ready yet, even though its own health check
+# already passed -- a leader election still settling, and similar. A
+# submission failure must not bring this script, and so the container,
+# down after that. Under `restart: unless-stopped`, an unguarded exit
+# here would crash-loop the container forever on a submission that keeps
+# failing for a real reason (bad code, a bad module path), not just a
+# transient one. Retry a bounded number of times, then log it and keep
+# the JobManager running, so an operator can inspect and fix it by hand.
+SUBMIT_OK=0
+for attempt in 1 2 3; do
+    if flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d; then
+        SUBMIT_OK=1
+        break
+    fi
+    if [ "$attempt" -lt 3 ]; then
+        echo "  Submission attempt $attempt failed. Retrying in 5 seconds..." >&2
+        sleep 5
+    fi
+done
+if [ "$SUBMIT_OK" -ne 1 ]; then
+    echo "ERROR: job submission failed after 3 attempts. The JobManager is still running." >&2
     echo "Check the error above. Fix it. Then submit by hand:" >&2
     echo '  docker exec streamscout-flink-jobmanager sh -c '"'"'flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d'"'"'' >&2
 fi
