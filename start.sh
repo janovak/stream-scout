@@ -8,24 +8,23 @@ set -e
 echo "=== Stream Scout Startup ==="
 echo ""
 
-# Stop any existing containers
-echo "[1/5] Stopping existing containers..."
+echo "[1/3] Stopping existing containers..."
 docker compose down
 
 echo ""
-echo "[2/5] Starting all services..."
-docker compose up -d
+echo "[2/3] Starting all services..."
+# --wait blocks until every service with a health check reports healthy,
+# flink-jobmanager included (see its health check in docker-compose.yml).
+# This replaces a fixed sleep with a real readiness check, the same
+# mechanism Kafka, Postgres, and Redis already use in this file.
+#
+# The flink-jobmanager container submits the Flink job itself, once its
+# own JobManager is ready (see docker-entrypoint-job.sh). This script
+# does not submit it.
+docker compose up -d --wait --wait-timeout 400
 
 echo ""
-echo "[3/5] Waiting 60 seconds for services to initialize..."
-sleep 60
-
-echo ""
-echo "[4/5] Submitting Flink job..."
-docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
-
-echo ""
-echo "[5/5] Waiting 15 seconds for job to start..."
+echo "[3/3] Waiting 15 seconds for the job to register..."
 sleep 15
 
 echo ""

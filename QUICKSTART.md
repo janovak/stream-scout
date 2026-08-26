@@ -7,29 +7,28 @@ cd ~/stream-scout
 ./start.sh
 ```
 
-Wait about 80 seconds. The script stops all containers, starts them again, and submits the Flink job.
+This usually takes under a minute. The script stops all containers, starts them again, and waits for every health-checked container (including flink-jobmanager) to report healthy. It can take longer if a container is slow to start.
 
-## Check for a duplicate Flink job
-
-Run this after the script ends:
+## Check the Flink job
 
 ```bash
 docker exec streamscout-flink-jobmanager flink list
 ```
 
-Look for two "Clip Detector Job" entries. If you see two, cancel the older job:
+Should show exactly one "Clip Detector Job (RUNNING)". The flink-jobmanager container submits this job itself on startup — `start.sh` does not. If you see none, submission failed; check `docker logs streamscout-flink-jobmanager` for an `ERROR: job submission failed` line, fix the cause, and submit by hand:
 
 ```bash
-docker exec streamscout-flink-jobmanager flink cancel <older-job-id>
+docker exec streamscout-flink-jobmanager sh -c 'flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d'
 ```
 
-**Why this happens:** the script does not check for a recovered job before it submits a new one. A recovered job appears after a restart if the jobmanager kept a checkpoint from before.
+If you see two, check which one is actually healthy before cancelling — do not assume the newer or the older one is the broken one.
 
 ## Things start.sh does not control
 
 - **Postgres and Redis run on a different machine** (Tailscale host `streamer-summaries-api`, 100.112.97.111). The script does not start, stop, or check them. Local containers named `postgres16` and `redis` also run on this machine, but they belong to a different project — Stream Scout does not use them.
 - **A code change to `stream_monitoring_service.py` needs only a container restart** (bind mount): `docker compose restart stream-monitoring`.
 - **A change under `services/stream-monitoring/patches/` needs a rebuild first:** `docker compose build stream-monitoring`, then `docker compose up -d`.
+- **A change to `docker-entrypoint-job.sh`, the Flink Dockerfile, or `flink-conf.yaml` needs a rebuild first** (these are baked into the image, not bind-mounted): `docker compose build flink-jobmanager flink-taskmanager`, then `./start.sh`. The four Flink `.py` job files and `secrets/` are bind-mounted, so those need only a restart.
 
 ## Check system health
 

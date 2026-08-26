@@ -129,6 +129,12 @@ services:
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
       - TWITCH_TOKEN_GID=9999
+      # The -pyFiles argument for `flink run`, read by
+      # docker-entrypoint-job.sh. Kept here, not hardcoded in that script,
+      # so a new module only needs a `docker compose up -d` (which picks up
+      # an environment change immediately) rather than an image rebuild.
+      # See KNOWN_ISSUES.md Issue 2.
+      - FLINK_PYFILES=/opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py
       - DETECTION_WINDOW_SECONDS=5
       # Back to the first design value of 5 minutes (Plan 06 step 12). Commit
       # c7afdab was a frontend change. It decreased this to 10 and did not
@@ -201,6 +207,14 @@ services:
         required: false
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
     networks:
       - streamscout
 
