@@ -70,7 +70,11 @@ This should show one "Clip Detector Job (RUNNING)".
 
 If you see none, the submission likely failed. Check `docker logs streamscout-flink-jobmanager` for an `ERROR: job submission failed` line and the Flink error above it. Fix the cause. Then submit by hand (see "How the Flink job gets submitted").
 
-If you see two, do not assume the newer or the older one is the broken one. Start-time ordering has been wrong before — see `KNOWN_ISSUES.md` Issue 2 for the incident this comes from. Check http://localhost:8081 in a browser instead: each job's own page shows its task status and any exceptions. There is no state to lose either way (checkpointing is disabled), so if you cannot tell which is healthy, the simplest safe move is to cancel both, then submit one fresh job by hand (see "How the Flink job gets submitted"):
+If you see two, do not assume the newer or the older one is the broken one. Start-time ordering has been wrong before — see `KNOWN_ISSUES.md` Issue 2 for the incident this comes from.
+
+Check http://localhost:8081 in a browser instead. Each job's own page shows its task status and any exceptions.
+
+Checkpointing is disabled, so there is no state to lose either way. If you cannot tell which job is healthy, the simplest safe move is to cancel both. Then submit one fresh job by hand (see "How the Flink job gets submitted"):
 ```bash
 docker exec streamscout-flink-jobmanager flink cancel <JOB_ID>
 ```

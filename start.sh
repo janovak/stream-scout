@@ -42,15 +42,16 @@ if [ "$CONTAINERS_UP" -eq 1 ]; then
     # flink-jobmanager's health check only proves its REST API answers.
     # It does not prove the job itself reached RUNNING: submission
     # happens after that check already passes, inside
-    # docker-entrypoint-job.sh, which can itself retry up to 3 times a
-    # few seconds apart. Poll instead of guessing a fixed wait, bounded
-    # at 60 seconds.
+    # docker-entrypoint-job.sh, which can itself retry up to 5 times, 10
+    # seconds apart, before giving up (about a minute, plus however long
+    # each attempt itself takes). Poll instead of guessing a fixed wait.
+    # 150 seconds gives comfortable room beyond that worst case.
     #
     # The REST API (queried directly, port 8081 is published to the
     # host) is used for this check, not `flink list`'s text output. The
     # text format is meant for a human, not a stable interface, and a
     # Flink version bump could reformat it without warning.
-    for attempt in $(seq 1 12); do
+    for attempt in $(seq 1 30); do
         if ! OVERVIEW=$(curl -sf http://localhost:8081/jobs/overview 2>&1); then
             echo "  Could not reach the Flink REST API: $OVERVIEW" >&2
         else
@@ -62,7 +63,7 @@ try:
         if job.get("name") == "Clip Detector Job" and job.get("state") == "RUNNING":
             print("RUNNING")
             break
-except ValueError:
+except Exception:
     pass
 ' 2>/dev/null || true)
             if [ "$JOB_STATE" = "RUNNING" ]; then
@@ -70,7 +71,7 @@ except ValueError:
                 break
             fi
         fi
-        if [ "$attempt" -lt 12 ]; then
+        if [ "$attempt" -lt 30 ]; then
             sleep 5
         fi
     done
@@ -90,7 +91,7 @@ else
     EXIT_CODE=1
     echo "=== Startup Finished, BUT THE FLINK JOB IS NOT RUNNING ==="
     echo ""
-    echo "WARNING: the Flink job did not reach RUNNING within 60 seconds." >&2
+    echo "WARNING: the Flink job did not reach RUNNING within 150 seconds." >&2
     echo "Check 'docker logs streamscout-flink-jobmanager' for an ERROR" >&2
     echo "line -- see OPERATIONS.md Part 1." >&2
 fi
@@ -99,10 +100,17 @@ echo "Services running:"
 docker compose ps --format "table {{.Name}}\t{{.Status}}" || true
 echo ""
 echo "Flink job status:"
+# This re-checks even when the poll above already found the job RUNNING.
+# The poll's result is a snapshot from a moment ago; this is the actual
+# state EXIT_CODE reflects on the way out.
 if ! FLINK_LIST=$(docker exec streamscout-flink-jobmanager flink list 2>&1); then
     echo "Could not check: $FLINK_LIST" >&2
+    EXIT_CODE=1
 else
     echo "$FLINK_LIST"
+    if ! echo "$FLINK_LIST" | grep -q "Clip Detector Job"; then
+        EXIT_CODE=1
+    fi
 fi
 echo ""
 echo "URLs:"

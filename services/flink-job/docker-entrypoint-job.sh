@@ -36,11 +36,12 @@ if [ -z "$FLINK_PYFILES" ]; then
     echo "Set it in docker-compose.yml, then restart this container." >&2
 else
     echo "Submitting Clip Detector Job..."
-    # A few attempts, a short wait apart, before giving up. A submission
-    # can fail only because something it depends on is not quite ready
-    # yet, even though its own health check already passed. Kafka is one
+    # A few attempts, a wait apart, before giving up. A submission can
+    # fail only because something it depends on is not quite ready yet,
+    # even though its own health check already passed. Kafka is one
     # example: a leader election can still be settling. Retrying gives
-    # that kind of failure a chance to clear on its own.
+    # that kind of failure a chance to clear on its own. 5 attempts, 10
+    # seconds apart, give this about a minute of margin.
     #
     # A submission failure must not bring this script down, and so must
     # not bring the container down either. Under `restart: unless-stopped`,
@@ -62,24 +63,36 @@ else
     # state, is enough: retrying blindly past that point would submit a
     # second, duplicate job, which is the exact bug this script exists to
     # prevent.
+    #
+    # If the `flink list` check itself fails, do not treat that the same
+    # as "no job found." A job could exist and the check could simply be
+    # unable to confirm it right now. Guessing wrong in that direction
+    # risks the exact duplicate this whole guard exists to prevent, so
+    # stop and ask for a human instead of retrying blind.
     SUBMIT_OK=0
-    for attempt in 1 2 3; do
+    for attempt in 1 2 3 4 5; do
         if flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d; then
             SUBMIT_OK=1
             break
         fi
-        if flink list 2>/dev/null | grep -q "Clip Detector Job"; then
-            echo "  Submission reported failure, but a Clip Detector Job already exists. Not retrying." >&2
-            SUBMIT_OK=1
+        if CHECK_OUTPUT=$(flink list 2>&1); then
+            if echo "$CHECK_OUTPUT" | grep -q "Clip Detector Job"; then
+                echo "  Submission reported failure, but a Clip Detector Job already exists. Not retrying." >&2
+                SUBMIT_OK=1
+                break
+            fi
+        else
+            echo "  Submission reported failure, and 'flink list' itself failed: $CHECK_OUTPUT" >&2
+            echo "  Not retrying -- cannot confirm a job doesn't already exist. Check by hand." >&2
             break
         fi
-        if [ "$attempt" -lt 3 ]; then
-            echo "  Submission attempt $attempt failed. Retrying in 5 seconds..." >&2
-            sleep 5
+        if [ "$attempt" -lt 5 ]; then
+            echo "  Submission attempt $attempt failed. Retrying in 10 seconds..." >&2
+            sleep 10
         fi
     done
     if [ "$SUBMIT_OK" -ne 1 ]; then
-        echo "ERROR: job submission failed after 3 attempts. The JobManager is still running." >&2
+        echo "ERROR: job submission did not succeed. The JobManager is still running." >&2
         echo "Check the error above. Fix it. Then submit by hand:" >&2
         echo '  docker exec streamscout-flink-jobmanager sh -c '"'"'flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles "$FLINK_PYFILES" -d'"'"'' >&2
     fi
