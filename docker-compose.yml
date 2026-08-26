@@ -208,15 +208,27 @@ services:
       kafka-init:
         condition: service_completed_successfully
     healthcheck:
-      # Checks for the job by name in /jobs/overview, not just that the
-      # REST endpoint answers. Those are not the same thing: Flink's REST
-      # server starts as part of general cluster bootstrap, before
+      # Checks that the job is RUNNING, not just that the REST endpoint
+      # answers. Those are not the same thing: Flink's REST server starts
+      # as part of general cluster bootstrap, before
       # ApplicationDispatcherBootstrap runs the job's own main(). Checking
       # /overview alone could report healthy in the gap between those two
       # events, or in the instant after the job fails and before the
-      # container exits. Checking for the job's name closes most of that
-      # gap -- it only appears once the job is actually registered.
-      test: ["CMD-SHELL", "curl -sf http://localhost:8081/jobs/overview | grep -q 'Clip Detector Job'"]
+      # container exits.
+      #
+      # Checking for the job's name is not enough either -- a FAILED or
+      # CANCELED job still appears in /jobs/overview under its own name.
+      # python3 (already in this image) parses the state field directly,
+      # rather than a grep pattern that would also need to assume a field
+      # order the REST API does not guarantee.
+      test:
+        - "CMD-SHELL"
+        - |
+          curl -sf http://localhost:8081/jobs/overview | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          sys.exit(0 if any(j.get('name') == 'Clip Detector Job' and j.get('state') == 'RUNNING' for j in d.get('jobs', [])) else 1)
+          "
       interval: 5s
       timeout: 5s
       retries: 36

@@ -38,6 +38,23 @@ else
     echo "$FLINK_LIST"
 fi
 
+# The line above is for display. This is the actual check: the health
+# check gates --wait on the job being RUNNING already, but that was a
+# moment ago -- re-check now, immediately before reporting to the
+# operator, the same way the health check itself does (job name and
+# state both, not just that the job appears at all in some state).
+JOB_STATE=$(curl -sf http://localhost:8081/jobs/overview 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print("RUNNING" if any(j.get("name") == "Clip Detector Job" and j.get("state") == "RUNNING" for j in d.get("jobs", [])) else "NOT_RUNNING")
+except Exception:
+    print("NOT_RUNNING")
+' 2>/dev/null || echo "NOT_RUNNING")
+if [ "$JOB_STATE" != "RUNNING" ]; then
+    CONTAINERS_UP=0
+fi
+
 # The banner below reflects CONTAINERS_UP's final value -- after both
 # checks above, not just the first one. Printing it any earlier risked
 # showing "Startup Complete" and then having a later check silently
