@@ -84,7 +84,7 @@ Open http://localhost:8081 for the Flink dashboard, and http://localhost:3000 (`
 ```bash
 docker compose build flink-jobmanager flink-taskmanager
 ```
-The four `.py` job files and `secrets/` are bind-mounted (see the `volumes:` section for `flink-jobmanager` in `docker-compose.yml`), so editing those needs only a restart, not a rebuild.
+The four `.py` job files and `secrets/` are bind-mounted instead. See the `volumes:` section for `flink-jobmanager` in `docker-compose.yml`. Editing those needs only a restart, not a rebuild.
 
 ---
 
