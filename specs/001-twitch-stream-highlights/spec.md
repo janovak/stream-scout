@@ -177,8 +177,8 @@ Note: We no longer store individual chat messages in Postgres. They are only use
 ## Debugging & Operational Notes
 
 **Flink Job Submission**:
-- The Flink job must be manually submitted after the cluster starts
-- Submit command: `docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d`
+- The job runs under Flink Application Mode. Starting the `flink-jobmanager` container starts the job; there is no separate submit step. Do not run `flink run` manually against this cluster — it would create a second job reading the same Kafka topic. See `OPERATIONS.md`, "How the Flink job runs."
+- To restart the job, restart the container: `docker compose restart flink-jobmanager`
 - The job requires ~5 minutes to build baseline data before detecting anomalies
 
 ## Observability

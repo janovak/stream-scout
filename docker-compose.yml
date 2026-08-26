@@ -129,6 +129,10 @@ services:
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
       - TWITCH_TOKEN_FILE=/opt/flink/secrets/twitch_user_tokens.json
       - TWITCH_TOKEN_GID=9999
+      # The -pyFiles argument for the job, read by docker-entrypoint-job.sh.
+      # Kept here, not hardcoded in that script, so a new module needs only
+      # this line and a bind-mount entry below, not an image rebuild.
+      - FLINK_PYFILES=/opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py
       - DETECTION_WINDOW_SECONDS=5
       # Back to the first design value of 5 minutes (Plan 06 step 12). Commit
       # c7afdab was a frontend change. It decreased this to 10 and did not
@@ -201,6 +205,34 @@ services:
         required: false
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # Checks that the job is RUNNING, not just that the REST endpoint
+      # answers. Those are not the same thing: Flink's REST server starts
+      # as part of general cluster bootstrap, before
+      # ApplicationDispatcherBootstrap runs the job's own main(). Checking
+      # /overview alone could report healthy in the gap between those two
+      # events, or in the instant after the job fails and before the
+      # container exits.
+      #
+      # Checking for the job's name is not enough either -- a FAILED or
+      # CANCELED job still appears in /jobs/overview under its own name.
+      # python3 (already in this image) parses the state field directly,
+      # rather than a grep pattern that would also need to assume a field
+      # order the REST API does not guarantee.
+      test:
+        - "CMD-SHELL"
+        - |
+          curl -sf http://localhost:8081/jobs/overview | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          sys.exit(0 if any(j.get('name') == 'Clip Detector Job' and j.get('state') == 'RUNNING' for j in d.get('jobs', [])) else 1)
+          "
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
     networks:
       - streamscout
 
@@ -318,7 +350,8 @@ services:
       - ./services/flink-job/spike_detector.py:/opt/flink/usrlib/spike_detector.py:ro
       - ./services/flink-job/token_manager.py:/opt/flink/usrlib/token_manager.py:ro
     depends_on:
-      - flink-jobmanager
+      flink-jobmanager:
+        condition: service_healthy
     networks:
       - streamscout
 

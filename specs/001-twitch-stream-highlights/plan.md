@@ -289,8 +289,9 @@ async def on_token_refresh(access_token: str, refresh_token: str):
 
 **1. Flink Job Not Auto-Starting**
 - **Issue**: Docker Compose only starts the Flink infrastructure (JobManager/TaskManager) but does not automatically submit jobs
-- **Fix**: Job must be manually submitted after cluster startup
-- **Command**: `docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d`
+- **Fix at the time**: Job must be manually submitted after cluster startup
+- **Command at the time**: `docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -d`
+- **Superseded**: the job now runs under Flink Application Mode. Starting `flink-jobmanager` starts the job automatically; there is no manual submit command anymore. Running the command above against the current setup would create a duplicate job. See `OPERATIONS.md`, "How the Flink job runs."
 
 **2. Invalid Checkpoint Interval Configuration**
 - **Issue**: `flink-conf.yaml` had `execution.checkpointing.interval: 0` which is invalid (Flink requires ≥10ms or omit entirely)

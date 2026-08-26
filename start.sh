@@ -8,37 +8,78 @@ set -e
 echo "=== Stream Scout Startup ==="
 echo ""
 
-# Stop any existing containers
-echo "[1/5] Stopping existing containers..."
+echo "[1/2] Stopping existing containers..."
 docker compose down
 
 echo ""
-echo "[2/5] Starting all services..."
-docker compose up -d
+echo "[2/2] Starting all services..."
+# --wait blocks until every service with a health check reports healthy,
+# flink-jobmanager included (see its health check in docker-compose.yml).
+# That health check itself confirms the Clip Detector job is registered,
+# not just that flink-jobmanager's REST API answers -- those are not the
+# same moment in Flink Application Mode. See the health check in
+# docker-compose.yml for why that distinction matters.
+#
+# flink-jobmanager runs the job itself, as part of its own startup. There
+# is no separate submission step for this script to wait on or perform.
+CONTAINERS_UP=1
+if ! docker compose up -d --wait --wait-timeout 500; then
+    CONTAINERS_UP=0
+    echo "" >&2
+    echo "ERROR: not every container reported healthy within 500 seconds." >&2
+fi
 
-echo ""
-echo "[3/5] Waiting 60 seconds for services to initialize..."
-sleep 60
-
-echo ""
-echo "[4/5] Submitting Flink job..."
-docker exec streamscout-flink-jobmanager flink run -py /opt/flink/usrlib/clip_detector_job.py -pyFiles /opt/flink/usrlib/spike_detector.py,/opt/flink/usrlib/token_manager.py,/opt/flink/usrlib/clip_attempt.py -d
-
-echo ""
-echo "[5/5] Waiting 15 seconds for job to start..."
-sleep 15
-
-echo ""
-echo "=== Startup Complete ==="
-echo ""
-echo "Services running:"
-docker compose ps --format "table {{.Name}}\t{{.Status}}"
 echo ""
 echo "Flink job status:"
-docker exec streamscout-flink-jobmanager flink list
+if ! FLINK_LIST=$(docker exec streamscout-flink-jobmanager flink list 2>&1); then
+    echo "Could not check: $FLINK_LIST" >&2
+    CONTAINERS_UP=0
+else
+    echo "$FLINK_LIST"
+fi
+
+# The line above is for display. This is the actual check: the health
+# check gates --wait on the job being RUNNING already, but that was a
+# moment ago -- re-check now, immediately before reporting to the
+# operator, the same way the health check itself does (job name and
+# state both, not just that the job appears at all in some state).
+JOB_STATE=$(curl -sf http://localhost:8081/jobs/overview 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print("RUNNING" if any(j.get("name") == "Clip Detector Job" and j.get("state") == "RUNNING" for j in d.get("jobs", [])) else "NOT_RUNNING")
+except Exception:
+    print("NOT_RUNNING")
+' 2>/dev/null || echo "NOT_RUNNING")
+if [ "$JOB_STATE" != "RUNNING" ]; then
+    CONTAINERS_UP=0
+fi
+
+# The banner below reflects CONTAINERS_UP's final value -- after both
+# checks above, not just the first one. Printing it any earlier risked
+# showing "Startup Complete" and then having a later check silently
+# invalidate it, leaving a misleading banner on screen even though the
+# script still exited 1.
+echo ""
+if [ "$CONTAINERS_UP" -eq 1 ]; then
+    echo "=== Startup Complete ==="
+else
+    echo "=== Startup Failed ==="
+    echo ""
+    echo "WARNING: see the ERROR above. Check 'docker compose ps' below" >&2
+    echo "for which container, then 'docker logs <name>' for why." >&2
+fi
+echo ""
+echo "Services running:"
+docker compose ps --format "table {{.Name}}\t{{.Status}}" || true
 echo ""
 echo "URLs:"
 echo "  Frontend:  http://localhost:5000"
 echo "  Flink UI:  http://localhost:8081"
 echo "  Grafana:   http://localhost:3000 (admin/admin)"
 echo ""
+if [ "$CONTAINERS_UP" -eq 1 ]; then
+    exit 0
+else
+    exit 1
+fi
