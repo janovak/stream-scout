@@ -21,26 +21,40 @@ echo "[2/3] Starting all services..."
 # The flink-jobmanager container submits the Flink job itself, once its
 # own JobManager is ready (see docker-entrypoint-job.sh). This script
 # does not submit it.
-docker compose up -d --wait --wait-timeout 400
-
-echo ""
-echo "[3/3] Waiting for the Flink job to register..."
-# flink-jobmanager's health check only proves its REST API answers. It
-# does not prove the job itself reached RUNNING: submission happens
-# after that check already passes, inside docker-entrypoint-job.sh,
-# which can itself retry up to 3 times a few seconds apart. Poll instead
-# of guessing a fixed wait, bounded at 60 seconds.
 #
-# The REST API (queried directly, port 8081 is published to the host) is
-# used for this check, not `flink list`'s text output. The text format is
-# meant for a human, not a stable interface, and a Flink version bump
-# could reformat it without warning.
+# Guarded with "|| true", like every other fallible step below. Without
+# it, a timeout here (under set -e) would exit the script immediately --
+# skipping the diagnostics below entirely, the one case where they would
+# matter most. "docker compose ps" is still informative even when some
+# container never went healthy: it shows which one, unlike Compose's own
+# terse timeout message.
+CONTAINERS_UP=1
+if ! docker compose up -d --wait --wait-timeout 400; then
+    CONTAINERS_UP=0
+    echo "" >&2
+    echo "ERROR: not every container reported healthy within 400 seconds." >&2
+fi
+
 JOB_RUNNING=0
-for attempt in $(seq 1 12); do
-    if ! OVERVIEW=$(curl -sf http://localhost:8081/jobs/overview 2>&1); then
-        echo "  Could not reach the Flink REST API: $OVERVIEW" >&2
-    else
-        JOB_STATE=$(echo "$OVERVIEW" | python3 -c '
+if [ "$CONTAINERS_UP" -eq 1 ]; then
+    echo ""
+    echo "[3/3] Waiting for the Flink job to register..."
+    # flink-jobmanager's health check only proves its REST API answers.
+    # It does not prove the job itself reached RUNNING: submission
+    # happens after that check already passes, inside
+    # docker-entrypoint-job.sh, which can itself retry up to 3 times a
+    # few seconds apart. Poll instead of guessing a fixed wait, bounded
+    # at 60 seconds.
+    #
+    # The REST API (queried directly, port 8081 is published to the
+    # host) is used for this check, not `flink list`'s text output. The
+    # text format is meant for a human, not a stable interface, and a
+    # Flink version bump could reformat it without warning.
+    for attempt in $(seq 1 12); do
+        if ! OVERVIEW=$(curl -sf http://localhost:8081/jobs/overview 2>&1); then
+            echo "  Could not reach the Flink REST API: $OVERVIEW" >&2
+        else
+            JOB_STATE=$(echo "$OVERVIEW" | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -51,20 +65,27 @@ try:
 except ValueError:
     pass
 ' 2>/dev/null || true)
-        if [ "$JOB_STATE" = "RUNNING" ]; then
-            JOB_RUNNING=1
-            break
+            if [ "$JOB_STATE" = "RUNNING" ]; then
+                JOB_RUNNING=1
+                break
+            fi
         fi
-    fi
-    if [ "$attempt" -lt 12 ]; then
-        sleep 5
-    fi
-done
+        if [ "$attempt" -lt 12 ]; then
+            sleep 5
+        fi
+    done
+fi
 
 echo ""
 if [ "$JOB_RUNNING" -eq 1 ]; then
     EXIT_CODE=0
     echo "=== Startup Complete ==="
+elif [ "$CONTAINERS_UP" -eq 0 ]; then
+    EXIT_CODE=1
+    echo "=== Startup Failed: containers did not all become healthy ==="
+    echo ""
+    echo "WARNING: see the ERROR above. Check 'docker compose ps' below" >&2
+    echo "for which container, then 'docker logs <name>' for why." >&2
 else
     EXIT_CODE=1
     echo "=== Startup Finished, BUT THE FLINK JOB IS NOT RUNNING ==="
