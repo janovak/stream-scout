@@ -230,6 +230,7 @@ docker logs streamscout-flink-jobmanager --tail 50
 A Python traceback near the end of the log is the usual cause — a bad token file, a Kafka connection problem, or similar. Fix the cause, then restart the container:
 ```bash
 docker compose restart flink-jobmanager
+docker compose up -d --wait --wait-timeout 500 flink-jobmanager
 ```
 
 ### Flink job fails with "heartbeat timeout"

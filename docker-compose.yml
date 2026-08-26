@@ -208,7 +208,15 @@ services:
       kafka-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      # Checks for the job by name in /jobs/overview, not just that the
+      # REST endpoint answers. Those are not the same thing: Flink's REST
+      # server starts as part of general cluster bootstrap, before
+      # ApplicationDispatcherBootstrap runs the job's own main(). Checking
+      # /overview alone could report healthy in the gap between those two
+      # events, or in the instant after the job fails and before the
+      # container exits. Checking for the job's name closes most of that
+      # gap -- it only appears once the job is actually registered.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/jobs/overview | grep -q 'Clip Detector Job'"]
       interval: 5s
       timeout: 5s
       retries: 36
