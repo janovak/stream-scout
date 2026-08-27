@@ -87,11 +87,26 @@ services:
       kafka:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
+    # chat-messages was 20 partitions against FLINK_PARALLELISM=4 (see
+    # clip_detector_job.py) -- far more partitions than concurrent
+    # broadcasters (15-30, hysteresis band in stream_monitoring_service.py),
+    # so most partitions carried 0-1 broadcasters at any moment. A partition
+    # that idle freezes its subtask's watermark (the minimum across its
+    # partitions), which freezes the *operator* watermark (the minimum
+    # across subtasks) for every broadcaster, not just the quiet one --
+    # KNOWN_ISSUES.md Issue 4. 4 partitions matches today's parallelism
+    # exactly; re-provision together with parallelism if either changes.
+    #
+    # --if-not-exists will NOT shrink an existing 20-partition topic --
+    # Kafka can only grow a topic's partition count in place, never shrink
+    # it. Deploying this requires deleting the live `chat-messages` topic
+    # before the next restart so this command creates it fresh at 4;
+    # otherwise the config here silently stops matching reality.
     command: |
       "
       echo 'Creating Kafka topics...'
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic stream-lifecycle --partitions 10 --replication-factor 1 --config retention.ms=604800000
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic chat-messages --partitions 20 --replication-factor 1 --config retention.ms=3600000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic chat-messages --partitions 4 --replication-factor 1 --config retention.ms=3600000
       echo 'Kafka topics created successfully!'
       kafka-topics --bootstrap-server kafka:29092 --list
       "
