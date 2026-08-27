@@ -412,6 +412,7 @@ services:
     volumes:
       - ./services/api-frontend/static:/app/static:ro
       - ./services/api-frontend/api_frontend_service.py:/app/api_frontend_service.py:ro
+      - ./services/api-frontend/gunicorn.conf.py:/app/gunicorn.conf.py:ro
     depends_on:
       postgres:
         condition: service_healthy

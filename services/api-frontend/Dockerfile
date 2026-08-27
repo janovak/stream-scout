@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code and static files
 COPY api_frontend_service.py .
+COPY gunicorn.conf.py .
 COPY static/ ./static/
 
 # Expose port
