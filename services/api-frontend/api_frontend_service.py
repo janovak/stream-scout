@@ -163,7 +163,20 @@ def get_clips():
         except ValueError:
             return jsonify({"error": "Invalid offset parameter"}), 400
 
-        # Query database
+        # Query database. Keep these two queries separate.
+        #
+        # A merged query with COUNT(*) OVER() looks cheaper than two
+        # round trips. But Postgres must then evaluate the window
+        # function over the full matching set before it can apply
+        # LIMIT. This defeats the index's early-exit on
+        # ORDER BY detected_at DESC LIMIT.
+        #
+        # Test result on the real table (143k rows): the two queries
+        # together take about 42 ms. The merged form takes about
+        # 28 seconds.
+        #
+        # Before you merge these queries, run EXPLAIN ANALYZE again
+        # on production data.
         conn = get_db()
         with conn.cursor() as cur:
             # Get total count for the filter
