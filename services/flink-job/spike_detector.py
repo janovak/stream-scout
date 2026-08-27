@@ -70,15 +70,21 @@ from typing import List, Mapping, Optional, Tuple
 WATERMARK_OUT_OF_ORDERNESS_SECONDS = 1
 
 # KNOWN_ISSUES.md Issue 4: how long a source split can go silent before
-# with_idleness() lets the operator watermark advance past it. The chat topic
-# has more partitions than the job has parallelism, so some partitions carry
-# one quiet broadcaster and go silent for tens of seconds; until this timeout
-# fires, the operator watermark -- the minimum across every split -- is
-# frozen. Measured real out-of-orderness on the live topic tops out at 226ms,
-# so this only needs to be comfortably above that, not anywhere near the 60s
-# it used to be. Not shared with tools/replay.py: that harness fires timers
-# off a min-heap in strictly non-decreasing order and has no split-idleness
-# concept to model.
+# with_idleness() lets the operator watermark advance past it. Through
+# 2026-08-27, chat-messages had 20 partitions against FLINK_PARALLELISM=4 --
+# far more partitions than concurrent broadcasters (15-30), so most
+# partitions carried 0-1 broadcasters and went silent for tens of seconds
+# routinely; until this timeout fires, the operator watermark -- the minimum
+# across every split -- is frozen for everyone, not just the quiet
+# broadcaster. That specific mismatch is fixed (docker-compose.yml now
+# creates chat-messages at 4 partitions, matching parallelism), but this
+# timeout stays: a single broadcaster's own partition can still go quiet on
+# its own, independent of partition count, and this is what recovers the
+# watermark when it does. Measured real out-of-orderness on the live topic
+# tops out at 226ms, so this only needs to be comfortably above that, not
+# anywhere near the 60s it used to be. Not shared with tools/replay.py: that
+# harness fires timers off a min-heap in strictly non-decreasing order and
+# has no split-idleness concept to model.
 WATERMARK_IDLENESS_SECONDS = 10
 
 # Flink sends this as the watermark on job shutdown. Guards the arithmetic in
