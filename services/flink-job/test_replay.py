@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from spike_detector import DetectorConfig
-from tools.replay import EventTimeReplayer, format_evaluation, replay
+from tools.replay import EventTimeReplayer, WATERMARK_OUT_OF_ORDERNESS_MS, format_evaluation, replay
 
 # A short baseline so fixtures stay a readable length -- the shipped default is
 # 300s (see test_spike_detector.py::TestShippedDefaults). These tests are about
@@ -40,27 +40,26 @@ def test_bucket_comes_from_sent_at_not_other_fields():
 
 def test_evaluation_waits_for_watermark_to_pass_the_second():
     replayer = EventTimeReplayer(CONFIG)
-    list(replayer.feed(1, sent_at_ms=1000 * 1000))  # bucket 1000, no eval yet (watermark lags 5s)
-    evaluations = list(replayer.feed(1, sent_at_ms=1004 * 1000))  # watermark = 1004000-5000-1 = 998999
-    assert evaluations == []
-    evaluations = list(replayer.feed(1, sent_at_ms=1005 * 1000))  # watermark = 1005000-5000-1 = 999999, still < 1000000
-    assert evaluations == []
+    list(replayer.feed(1, sent_at_ms=1000 * 1000))  # bucket 1000, no eval yet (watermark lags)
+    evaluations = list(replayer.feed(1, sent_at_ms=1000 * 1000 + WATERMARK_OUT_OF_ORDERNESS_MS))
+    assert evaluations == []  # watermark = 1000*1000 + OOO_MS - OOO_MS - 1 = 999999, still short
     # Flink's real BoundedOutOfOrdernessWatermarks emits maxTimestamp -
     # outOfOrdernessMillis - 1, so it takes one more ms to cross second 1000's
     # boundary than a naive max-bound subtraction would.
-    evaluations = list(replayer.feed(1, sent_at_ms=1005 * 1000 + 1))  # watermark = 1000000
-    assert [e.second for e in evaluations] == [1000]
+    evaluations = list(replayer.feed(1, sent_at_ms=1000 * 1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1))
+    assert [e.second for e in evaluations] == [1000]  # watermark = 1000000
 
 
 def test_out_of_order_message_within_bound_still_counted_before_its_second_fires():
     replayer = EventTimeReplayer(CONFIG)
-    # second 1000 arrives, then second 1003 (pushes watermark to 997999, second
-    # 1000 still not due), then a late second-1000 message arrives before the
-    # watermark passes 1000 -- must land in the same bucket as the first.
+    # second 1000 arrives, then a later-second message that still doesn't
+    # cross second 1000's boundary, then a late second-1000 message arrives
+    # before the watermark passes 1000 -- must land in the same bucket as
+    # the first.
     list(replayer.feed(1, sent_at_ms=1000 * 1000))
-    list(replayer.feed(1, sent_at_ms=1003 * 1000))
-    list(replayer.feed(1, sent_at_ms=1000 * 1000 + 500))  # same second, out of order
-    evaluations = list(replayer.feed(1, sent_at_ms=1005 * 1000 + 1))  # watermark -> 1000000, fires
+    list(replayer.feed(1, sent_at_ms=1001 * 1000))  # later second, watermark still short
+    list(replayer.feed(1, sent_at_ms=1000 * 1000 + 500))  # same second as the first, out of order
+    evaluations = list(replayer.feed(1, sent_at_ms=1000 * 1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1))  # watermark -> 1000000, fires
     fired = [e for e in evaluations if e.second == 1000]
     assert len(fired) == 1
     # Second 1000's bucket holds both the on-time and the out-of-order
@@ -106,14 +105,18 @@ def test_future_buckets_already_in_state_are_excluded_from_evaluate():
         for _ in range(2 + second % 2):
             evaluations.extend(replayer.feed(1, sent_at_ms=second * 1000))
 
-    # A heavy burst for 1001..1005 lands in state before bucket 1000's timer
-    # becomes due (needs watermark >= 1000000, i.e. max_sent_at_ms >= 1005001).
-    for second in range(1001, 1006):
-        for _ in range(100):
-            evaluations.extend(replayer.feed(1, sent_at_ms=second * 1000))
+    # A heavy burst for second 1001 lands in state before bucket 1000's timer
+    # becomes due (needs watermark >= 1000000, i.e.
+    # max_sent_at_ms >= 1000*1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1). A
+    # narrower out-of-orderness bound leaves room for only one future second
+    # to land ahead of the boundary crossing, not several -- that's still
+    # enough to prove the filter, since one leaked future bucket is exactly
+    # what it must exclude.
+    for _ in range(100):
+        evaluations.extend(replayer.feed(1, sent_at_ms=1001 * 1000))
 
     # One more message pushes the watermark past bucket 1000's boundary.
-    evaluations.extend(replayer.feed(1, sent_at_ms=1005 * 1000 + 1))
+    evaluations.extend(replayer.feed(1, sent_at_ms=1000 * 1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1))
 
     fired_for_1000 = [e for e in evaluations if e.second == 1000]
     assert len(fired_for_1000) == 1
@@ -121,13 +124,16 @@ def test_future_buckets_already_in_state_are_excluded_from_evaluate():
     assert fired_for_1000[0].emit is None
     assert replayer._states[1].hold is None
 
-    # The burst is real, though -- once its own seconds come due it must open
+    # The burst is real, though -- once its own second comes due it must open
     # an episode. This is what proves the assertion above is about the filter
-    # and not about the detector being deaf to the burst entirely.
-    for second in range(1006, 1012):
-        evaluations.extend(replayer.feed(1, sent_at_ms=second * 1000))
+    # and not about the detector being deaf to the burst entirely. Checked
+    # right as bucket 1001 becomes due, not after a longer tail: the burst is
+    # only one second wide here (see the comment above), so it ages out of
+    # the 5-second window quickly and a longer tail would let the episode
+    # already retire before this assertion ever ran.
+    evaluations.extend(replayer.feed(1, sent_at_ms=1002 * 1000 + 1))
     assert replayer._states[1].hold is not None
-    assert replayer._states[1].hold.peak_at >= 1001
+    assert replayer._states[1].hold.peak_at == 1001
 
 
 def test_command_messages_filtered_like_production_commandfilter():
@@ -154,7 +160,7 @@ def test_command_message_still_advances_watermark():
     harness's clock lag behind what production actually does."""
     lines = [
         msg(1, 1000 * 1000, text="hello"),      # bucket 1000, not yet due
-        msg(1, 1005 * 1000 + 1, text="!clip"),  # command -- watermark -> 1000000, never counted
+        msg(1, 1000 * 1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1, text="!clip"),  # command -- watermark -> 1000000, never counted
     ]
     evaluations = list(replay(lines, CONFIG))
     assert [e.second for e in evaluations] == [1000]

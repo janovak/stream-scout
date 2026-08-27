@@ -56,7 +56,18 @@ from typing import List, Mapping, Optional, Tuple
 # seconds. clip_detector_job.py's WatermarkStrategy and tools/replay.py's
 # simulated watermark share this value. The two must compute event-time
 # readiness in the same way.
-WATERMARK_OUT_OF_ORDERNESS_SECONDS = 5
+#
+# Was 5 from Phase 2 through 2026-08-27 -- a generic round-number default set
+# when event-time processing was introduced, not derived from a measurement.
+# KNOWN_ISSUES.md Issue 4 later measured real out-of-orderness on the live
+# `chat-messages` topic directly (per-partition, in offset order): worst
+# observed inversion 226ms, zero records more than 1s out of order across the
+# investigation's full sample. 1s keeps roughly 4x that margin. This trims the
+# deliberate floor of the peak-to-clip-request delay (KNOWN_ISSUES.md Issue 4,
+# "Post-deploy validation") by the same 4 seconds it removes here -- it does
+# not touch the separate, larger, still-open sparse-partition/idleness
+# component of that delay.
+WATERMARK_OUT_OF_ORDERNESS_SECONDS = 1
 
 # KNOWN_ISSUES.md Issue 4: how long a source split can go silent before
 # with_idleness() lets the operator watermark advance past it. The chat topic
