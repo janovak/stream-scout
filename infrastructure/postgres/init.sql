@@ -6,7 +6,14 @@ CREATE TABLE streamers (
     streamer_login VARCHAR(255) NOT NULL,
     allows_clipping BOOLEAN DEFAULT TRUE,
     first_seen_at TIMESTAMPTZ DEFAULT NOW(),
-    last_seen_at TIMESTAMPTZ DEFAULT NOW()
+    last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+    -- Both marks carry the same 7-day self-heal rule (spec 004 D5). A NULL
+    -- means "never refused". A mark older than 7 days is stale: the channel
+    -- is tried once more, success clears it, a fresh refusal resets it.
+    -- Without the timestamp a channel that fixes its settings stays dark
+    -- forever, which is what allows_clipping did on its own.
+    eventsub_refused_at TIMESTAMPTZ,   -- last "subscription missing proper authorization"
+    clipping_disabled_at TIMESTAMPTZ   -- last time allows_clipping was set FALSE
 );
 
 CREATE INDEX idx_streamers_last_seen ON streamers(last_seen_at);

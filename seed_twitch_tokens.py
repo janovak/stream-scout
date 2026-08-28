@@ -31,8 +31,21 @@ TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
 TOKEN_FILE_PATH = Path(__file__).parent / "secrets" / "twitch_user_tokens.json"
 
-# Required scopes for chat reading and clip creation
-REQUIRED_SCOPES = [AuthScope.CHAT_READ, AuthScope.CLIPS_EDIT]
+# stream-monitoring (root) and the Flink containers (uid 9999) share this
+# file. token_manager._write_atomic() keeps every container's write readable
+# to the others by chowning to a shared group -- see KNOWN_ISSUES.md Issue 1.
+# The seed runs on the host as an ordinary user who is usually not in that
+# group, so it cannot reproduce the chown. It must therefore not narrow the
+# mode either, or the first Flink read after a re-seed fails.
+TWITCH_TOKEN_GID = int(os.getenv("TWITCH_TOKEN_GID", "9999"))
+
+# Required scopes.
+#
+# `user:read:chat` is what EventSub's `channel.chat.message` subscription
+# needs (spec 004 T017). It replaces IRC's `chat:read`, which Phase 3 drops
+# once IRC is gone -- both are seeded until then, so a re-seed cannot leave
+# the running IRC transport without its scope.
+REQUIRED_SCOPES = [AuthScope.CHAT_READ, AuthScope.USER_READ_CHAT, AuthScope.CLIPS_EDIT]
 
 
 def save_tokens(access_token: str, refresh_token: str, scopes: list[str]) -> None:
@@ -49,7 +62,22 @@ def save_tokens(access_token: str, refresh_token: str, scopes: list[str]) -> Non
     with open(TOKEN_FILE_PATH, "w") as f:
         json.dump(token_data, f, indent=2)
 
-    print(f"\nTokens saved to: {TOKEN_FILE_PATH}")
+    # Hand the file to the shared group when this process is allowed to, and
+    # otherwise leave it group- and world-readable. Either way all three
+    # containers can read it. A 0640 file owned by the seeding host user is
+    # the one combination that locks the Flink containers out.
+    try:
+        os.chown(TOKEN_FILE_PATH, -1, TWITCH_TOKEN_GID)
+        os.chmod(TOKEN_FILE_PATH, 0o640)
+        shared = f"group {TWITCH_TOKEN_GID}, mode 0640"
+    except PermissionError:
+        os.chmod(TOKEN_FILE_PATH, 0o644)
+        shared = (
+            f"mode 0644 -- not a member of gid {TWITCH_TOKEN_GID}, so the file "
+            "stays world-readable until a container rewrites it"
+        )
+
+    print(f"\nTokens saved to: {TOKEN_FILE_PATH} ({shared})")
 
 
 async def seed_tokens() -> None:

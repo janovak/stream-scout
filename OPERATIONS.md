@@ -48,6 +48,56 @@ A working `/v1.0/clip` response or a "Database connection pool initialized" log 
 
 ---
 
+## Database migrations (manual)
+
+`infrastructure/postgres/init.sql` runs **only when the database is created**.
+The deployed database on `streamer-summaries-api` was created long ago, so a new
+column in `init.sql` never reaches it. Every schema change needs the equivalent
+`ALTER TABLE` run by hand against the remote host, before the code that reads
+the column is deployed. Code that queries a column the database does not have
+throws on every call.
+
+Run the statement from this machine with the stream-monitoring virtualenv, which
+already has `psycopg2` and can reach the Tailscale host:
+
+```bash
+cd services/stream-monitoring
+.venv/bin/python -c "
+import psycopg2
+conn = psycopg2.connect('postgresql://twitch:twitch_password@100.112.97.111:5432/twitch')
+with conn, conn.cursor() as cur:
+    cur.execute(open('/path/to/migration.sql').read())
+"
+```
+
+Wrap every migration in one transaction. Postgres DDL is transactional, so a
+`BEGIN ... COMMIT` block cannot half-apply and leave the schema in a state
+neither the old nor the new code understands.
+
+### Spec 004 Phase 2 — the two self-heal timestamps
+
+Applied 2026-08-28. Adds `eventsub_refused_at` (the reconciler writes it when a
+channel refuses the chat subscription) and `clipping_disabled_at` (the Flink job
+writes it beside every `allows_clipping = FALSE`). Both carry the same 7-day
+re-check, so a channel that fixes its settings stops being skipped forever.
+
+```sql
+BEGIN;
+ALTER TABLE streamers ADD COLUMN eventsub_refused_at TIMESTAMPTZ;
+ALTER TABLE streamers ADD COLUMN clipping_disabled_at TIMESTAMPTZ;
+-- Backfill, so the rows already disabled do not all look "stale" (older than
+-- 7 days, therefore due a retry) the moment the new code starts:
+UPDATE streamers SET clipping_disabled_at = NOW() WHERE allows_clipping = FALSE;
+COMMIT;
+```
+
+Note: the deployed `streamers` table declares its existing time columns as
+`timestamp without time zone`, while `init.sql` says `TIMESTAMPTZ`. The two new
+columns follow `init.sql`. Both types compare correctly against `NOW()`, which is
+all the 7-day rule needs.
+
+---
+
 ## Part 1: Full restart
 
 The normal way to restart is the script:

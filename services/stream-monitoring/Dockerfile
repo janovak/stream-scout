@@ -20,10 +20,10 @@ RUN python3 /tmp/twitchapi_leave_room_timeout.py && rm /tmp/twitchapi_leave_room
 # Copy application code
 # Every module is copied by name. A new one is invisible until it is listed
 # here AND bind-mounted in docker-compose.yml -- the same class of gap that
-# bit the Flink job's -pyFiles list. eventsub_pool.py joins this list in
-# Phase 2 (task T027).
+# bit the Flink job's -pyFiles list.
 COPY stream_monitoring_service.py .
 COPY reconciler.py .
+COPY eventsub_pool.py .
 COPY token_manager.py .
 
 # Expose ports

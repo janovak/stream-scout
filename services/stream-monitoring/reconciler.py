@@ -49,6 +49,16 @@ keep the stale member and evict a wanted one instead. The poller does
 `DEL` + `ZADD` inside a MULTI, which is still one round trip and is exact. A
 reader never sees the empty window, because Redis runs the transaction whole.
 
+Refusals are durable
+--------------------
+About 1.5% of channels answer a create with `subscription missing proper
+authorization`. Retrying one every pass wastes a POST per channel per pass
+forever, and skipping it in memory forgets on restart. The refusal is written
+to `streamers.eventsub_refused_at` instead, and a mark older than
+`REFUSAL_RECHECK_DAYS` is retried once: success clears it, a fresh refusal
+resets it (D5, FR-007). `allows_clipping` gets the same self-heal on the
+poller side, through `clipping_disabled_at`.
+
 The transport seam
 ------------------
 The reconciler never talks to Twitch. It talks to a `SubscriptionTransport`.
@@ -83,6 +93,11 @@ DESIRED_GENERATION_KEY = "chat:desired:generation"
 # (T014). A dead subscription for a channel we no longer want is ignored: it is
 # not in the actual set, so it is never in the drop set either.
 ADOPTABLE_STATUSES = frozenset({"enabled"})
+
+# How long a refusal stands before the channel is worth one more try (D5).
+# The same interval governs `clipping_disabled_at` in the poller, so a channel
+# that fixes its settings comes back on both paths at the same rate.
+REFUSAL_RECHECK_DAYS = 7
 
 # Prometheus metrics (FR-012). These live here, not in the service module,
 # because the reconciler owns the values. The service starts the HTTP server
@@ -361,6 +376,110 @@ class StubTransport(SubscriptionTransport):
         return counts
 
 
+class RefusalStore(ABC):
+    """Where a `subscription missing proper authorization` is remembered.
+
+    Kept behind an interface for the same reason `SubscriptionTransport` is:
+    the reconciler owns the 7-day rule, not the storage. `PostgresRefusalStore`
+    is the real one; tests use a fake.
+    """
+
+    @abstractmethod
+    def refusals(self, broadcaster_ids: List[int]) -> Dict[int, bool]:
+        """Of these ids, the ones carrying a refusal, and whether it is stale.
+
+        Maps broadcaster id -> `True` when the mark is older than
+        `REFUSAL_RECHECK_DAYS` and the channel is therefore due its one retry,
+        `False` when the mark still stands and the channel is skipped. Ids
+        with no mark are absent. One call per pass, never one per channel.
+        """
+
+    @abstractmethod
+    def mark_refused(self, broadcaster_id: int) -> None:
+        """Record a refusal at the current time, replacing any older mark."""
+
+    @abstractmethod
+    def clear_refusal(self, broadcaster_id: int) -> None:
+        """Forget a refusal, because the channel has just accepted one."""
+
+
+class PostgresRefusalStore(RefusalStore):
+    """`streamers.eventsub_refused_at`, through the service's connection pool.
+
+    The calls are synchronous, like the reconciler's Redis calls and the
+    poller's own Postgres calls. There is at most one query per pass for the
+    read; the two writes happen only on a refusal or on a channel healing,
+    which is rare by construction.
+
+    Every method swallows its own errors. A database that is briefly away must
+    not stop the reconciler from subscribing: the worst case of a failed read
+    is that a refused channel is tried once more, and of a failed write that a
+    refusal is re-learned next pass.
+    """
+
+    def __init__(self, db_pool, recheck_days: int = REFUSAL_RECHECK_DAYS):
+        self.db_pool = db_pool
+        self.recheck_days = recheck_days
+
+    def refusals(self, broadcaster_ids: List[int]) -> Dict[int, bool]:
+        if not broadcaster_ids:
+            return {}
+        rows = self._run(
+            "read",
+            lambda cur: cur.execute(
+                "SELECT streamer_id, "
+                "       eventsub_refused_at < NOW() - make_interval(days => %s) AS stale "
+                "FROM streamers "
+                "WHERE streamer_id = ANY(%s) AND eventsub_refused_at IS NOT NULL",
+                (self.recheck_days, list(broadcaster_ids)),
+            ),
+            fetch=True,
+        )
+        return {} if rows is None else {row[0]: bool(row[1]) for row in rows}
+
+    def mark_refused(self, broadcaster_id: int) -> None:
+        self._run(
+            "mark",
+            lambda cur: cur.execute(
+                "UPDATE streamers SET eventsub_refused_at = NOW() WHERE streamer_id = %s",
+                (broadcaster_id,),
+            ),
+        )
+
+    def clear_refusal(self, broadcaster_id: int) -> None:
+        self._run(
+            "clear",
+            lambda cur: cur.execute(
+                "UPDATE streamers SET eventsub_refused_at = NULL WHERE streamer_id = %s",
+                (broadcaster_id,),
+            ),
+        )
+
+    def _run(self, operation: str, work, fetch: bool = False):
+        conn = None
+        try:
+            conn = self.db_pool.getconn()
+            with conn.cursor() as cur:
+                work(cur)
+                result = list(cur.fetchall()) if fetch else None
+            conn.commit()
+            return result
+        except Exception as e:
+            logger.error(
+                "Refusal store operation failed",
+                extra={"operation": operation, "error": str(e), "error_type": type(e).__name__},
+            )
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return None
+        finally:
+            if conn is not None:
+                self.db_pool.putconn(conn)
+
+
 @dataclass(frozen=True)
 class DesiredSet:
     """One read of the poller's intent."""
@@ -392,11 +511,15 @@ class Reconciler:
         redis_client,
         config: Optional[ReconcilerConfig] = None,
         on_pass_complete: Optional[Callable[[int], None]] = None,
+        refusal_store: Optional[RefusalStore] = None,
     ):
         self.transport = transport
         self.redis_client = redis_client
         self.config = config or resolve_reconciler_config()
         self.on_pass_complete = on_pass_complete
+        # Optional: without it every channel is attempted every pass, which is
+        # what Phase 1 did. With it, FR-007's skip and 7-day re-check apply.
+        self.refusal_store = refusal_store
         self.running = True
 
         # broadcaster id -> subscription id. This is the actual set. It is
@@ -411,12 +534,32 @@ class Reconciler:
         self._pass_generation = -1
         self._wake = asyncio.Event()
         self._refresh_lock = asyncio.Lock()
+        # Channels whose refusal has gone stale and that this pass is giving
+        # one more try. A create that succeeds for one of these clears the
+        # mark; a create that refuses again resets it (D5).
+        self._rechecking_refusals: Set[int] = set()
 
     # -- public surface ---------------------------------------------------
 
     @property
     def subscription_count(self) -> int:
         return len(self._actual)
+
+    def invalidate_actual_set(self):
+        """Rebuild the actual set from the transport on the next pass.
+
+        The transport calls this when it loses a connection (T023). Everything
+        that socket held is gone, but only the transport can know that. This
+        does not repair anything itself: the next pass re-enumerates, the lost
+        subscriptions are simply absent, `eventsub_subscription_count` drops --
+        which is the alert path (FR-012) -- and the ordinary diff re-creates
+        those channels on a surviving or new connection.
+
+        Drops stay switched off until an enumeration succeeds, so a failure to
+        re-enumerate cannot turn into a mass delete.
+        """
+        self._adoption_complete = False
+        self._wake.set()
 
     def notify_desired_changed(self):
         """Tell the loop that the poller wrote a new desired set.
@@ -482,6 +625,7 @@ class Reconciler:
             )
 
         to_create = [bid for bid in desired.broadcaster_ids() if bid not in self._actual]
+        to_create = self._drop_refused(to_create)
         to_drop = [bid for bid in self._actual if bid not in self._desired_ids]
 
         if not self._adoption_complete and to_drop:
@@ -677,6 +821,15 @@ class Reconciler:
             return
         subscription_id = await self.transport.create(broadcaster_id)
         self._actual[broadcaster_id] = subscription_id
+        if broadcaster_id in self._rechecking_refusals:
+            # The channel refused more than REFUSAL_RECHECK_DAYS ago and has
+            # just accepted. Clear the mark so it is a normal channel again.
+            self._rechecking_refusals.discard(broadcaster_id)
+            self._clear_refusal(broadcaster_id)
+            logger.info(
+                "Stale refusal cleared, channel accepted the subscription",
+                extra={"broadcaster_id": broadcaster_id},
+            )
 
     async def _drop_one(self, broadcaster_id: int):
         subscription_id = self._actual.get(broadcaster_id)
@@ -722,6 +875,13 @@ class Reconciler:
                     count_failure("rate_limited")
                 except SubscriptionRefusedError as e:
                     count_failure("refused")
+                    if operation == "create":
+                        # Durable, so the next pass skips it instead of
+                        # spending a POST on it again (FR-007). A channel
+                        # already under a stale mark gets its timestamp reset
+                        # by the same UPDATE, which restarts its 7 days.
+                        self._rechecking_refusals.discard(broadcaster_id)
+                        self._record_refusal(broadcaster_id)
                     logger.warning(
                         "Channel refused the subscription",
                         extra={"broadcaster_id": broadcaster_id, "error": str(e)},
@@ -778,9 +938,72 @@ class Reconciler:
                 extra={"generation": desired.generation, "desired": len(self._desired_ids)},
             )
 
+    # -- refusals (FR-007, D5) --------------------------------------------
+
+    def _drop_refused(self, broadcaster_ids: List[int]) -> List[int]:
+        """Remove the channels that are still under a refusal.
+
+        One query per pass for the whole candidate list, never one per
+        channel. A mark older than `REFUSAL_RECHECK_DAYS` does not come back
+        from the store, so those channels stay in the list and get their one
+        retry; they are remembered here so that a success can clear the mark.
+        """
+        self._rechecking_refusals = set()
+        if self.refusal_store is None or not broadcaster_ids:
+            return broadcaster_ids
+
+        try:
+            marks = self.refusal_store.refusals(broadcaster_ids)
+        except Exception as e:
+            # NFR-002 again. A store that is away must not take the loop down,
+            # and must not leave every channel unsubscribed. Attempting a
+            # channel that would have been skipped costs one POST; skipping
+            # every channel because the database is away costs the coverage.
+            logger.error(
+                "Refusal cache unavailable, attempting every channel this pass",
+                extra={"error": str(e), "error_type": type(e).__name__},
+            )
+            return broadcaster_ids
+
+        if not marks:
+            return broadcaster_ids
+
+        standing = {bid for bid, stale in marks.items() if not stale}
+        # A stale mark buys one retry this pass. Remember which, so that a
+        # create that now succeeds can clear the mark instead of leaving the
+        # channel marked while it is plainly working.
+        self._rechecking_refusals = {bid for bid, stale in marks.items() if stale}
+        attempting = [bid for bid in broadcaster_ids if bid not in standing]
+        logger.info(
+            "Applied the refusal cache",
+            extra={
+                "skipped": len(standing),
+                "rechecking": len(self._rechecking_refusals),
+                "attempting": len(attempting),
+                "recheck_days": REFUSAL_RECHECK_DAYS,
+            },
+        )
+        return attempting
+
+    def _record_refusal(self, broadcaster_id: int):
+        if self.refusal_store is None:
+            return
+        self.refusal_store.mark_refused(broadcaster_id)
+
+    def _clear_refusal(self, broadcaster_id: int):
+        if self.refusal_store is None:
+            return
+        self.refusal_store.clear_refusal(broadcaster_id)
+
     def _publish_occupancy(self):
         try:
-            for connection, count in self.transport.occupancy().items():
+            occupancy = self.transport.occupancy()
+            # Drop the previous labels first. A connection that is retired
+            # keeps its last value forever otherwise, so a pool that lost a
+            # socket goes on reporting the 300 subscriptions it no longer has
+            # -- which is precisely the number the FR-012 alert watches.
+            eventsub_connection_occupancy.clear()
+            for connection, count in occupancy.items():
                 eventsub_connection_occupancy.labels(connection=connection).set(count)
         except Exception as e:
             logger.warning("Could not read transport occupancy", extra={"error": str(e)})

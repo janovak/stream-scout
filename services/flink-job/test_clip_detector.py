@@ -229,3 +229,116 @@ class TestMessageParsing:
         assert len(filtered) == 2
         assert filtered[0]["text"] == "LUL that was funny"
         assert filtered[1]["text"] == "POGGERS"
+
+
+# ---------------------------------------------------------------------------
+# The clipping self-heal (spec 004 T025a / FR-013), against a real Postgres
+# ---------------------------------------------------------------------------
+#
+# `allows_clipping = FALSE` used to be permanent. It now carries
+# `clipping_disabled_at`, which stream-monitoring uses to let a broadcaster
+# back into the ranking after seven days. The two must be written together or
+# they disagree, and that is a property of the SQL rather than of the Python
+# around it -- so this runs against a real database, in a schema it creates and
+# drops, and skips when there is none.
+
+import os
+
+TEST_SCHEMA = "spec004_clipping_test"
+TEST_POSTGRES_URL = os.getenv(
+    "TEST_POSTGRES_URL", "postgresql://twitch:twitch_password@100.112.97.111:5432/twitch"
+)
+
+
+@pytest.fixture
+def clipping_client():
+    psycopg2 = pytest.importorskip("psycopg2")
+    from clip_detector_job import PostgresClient
+
+    try:
+        conn = psycopg2.connect(TEST_POSTGRES_URL, connect_timeout=3)
+    except Exception as e:  # pragma: no cover -- environment, not logic
+        pytest.skip(f"no Postgres available for the clipping self-heal check: {e}")
+
+    with conn.cursor() as cur:
+        cur.execute(f"DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE")
+        cur.execute(f"CREATE SCHEMA {TEST_SCHEMA}")
+        cur.execute(f"SET search_path TO {TEST_SCHEMA}")
+        cur.execute(
+            """
+            CREATE TABLE streamers (
+                streamer_id BIGINT PRIMARY KEY,
+                streamer_login VARCHAR(255) NOT NULL,
+                allows_clipping BOOLEAN DEFAULT TRUE,
+                clipping_disabled_at TIMESTAMPTZ
+            )
+            """
+        )
+        # Never let this touch the deployed table.
+        cur.execute(
+            "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.oid = to_regclass('streamers')"
+        )
+        resolved = cur.fetchone()
+        assert resolved and resolved[0] == TEST_SCHEMA, (
+            f"'streamers' resolves to {resolved} rather than the test schema; refusing to run"
+        )
+        cur.execute(
+            "INSERT INTO streamers (streamer_id, streamer_login) VALUES (1, 'a_streamer')"
+        )
+    conn.commit()
+
+    client = PostgresClient("unused", "0", "unused", "unused", "unused")
+    client._conn = conn
+    try:
+        yield client
+    finally:
+        with conn.cursor() as cur:
+            cur.execute(f"DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE")
+        conn.commit()
+        conn.close()
+
+
+def read_streamer(client, streamer_id=1):
+    with client._conn.cursor() as cur:
+        cur.execute(
+            "SELECT allows_clipping, clipping_disabled_at FROM streamers WHERE streamer_id = %s",
+            (streamer_id,),
+        )
+        return cur.fetchone()
+
+
+class TestClippingSelfHeal:
+    """T025a -- the boolean and its timestamp are written together."""
+
+    def test_disabling_stamps_the_time(self, clipping_client):
+        clipping_client.mark_clipping_disabled(1)
+        allows, disabled_at = read_streamer(clipping_client)
+        assert allows is False
+        assert disabled_at is not None
+
+    def test_a_successful_clip_clears_both(self, clipping_client):
+        clipping_client.mark_clipping_disabled(1)
+        clipping_client.mark_clipping_allowed(1)
+        assert read_streamer(clipping_client) == (True, None)
+
+    def test_a_fresh_refusal_resets_the_timestamp(self, clipping_client):
+        """The 7-day retry that refuses again restarts the seven days."""
+        with clipping_client._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE streamers SET allows_clipping = FALSE, "
+                "clipping_disabled_at = NOW() - make_interval(days => 30) WHERE streamer_id = 1"
+            )
+        clipping_client._conn.commit()
+        _, stale = read_streamer(clipping_client)
+
+        clipping_client.mark_clipping_disabled(1)
+
+        _, refreshed = read_streamer(clipping_client)
+        assert refreshed > stale
+
+    def test_healing_leaves_an_already_allowed_streamer_alone(self, clipping_client):
+        """The common case writes nothing, so a clip does not cost an UPDATE
+        of a row that is already correct."""
+        clipping_client.mark_clipping_allowed(1)
+        assert read_streamer(clipping_client) == (True, None)
