@@ -1,22 +1,46 @@
 # Research: EventSub Ingestion with a Parallel Reconciler
 
-**Date**: 2026-08-27. Numbers are measured unless the text says "projected".
-The measured spike data lives in `specs/003-detector-scale-fanout/research.md`
-§1. This document does not repeat it; it records the decisions taken from it.
+**Date**: 2026-08-27. Phase 0 measured 2026-08-28. Numbers are measured unless
+the text says "projected". The measured spike data lives in
+`specs/003-detector-scale-fanout/research.md` §1. This document does not repeat
+it; it records the decisions taken from it.
 
-## Phase 0 — measurements that must exist before cutover
+## Phase 0 — measurement gate (COMPLETE, 2026-08-28)
 
-Two decisions (D3, D4) and one risk (R1) rest on comparisons nobody has made
-yet. Getting them wrong corrupts detection with no error. Phase 0 makes them.
+Two decisions (D3, D4) and one risk (R1) rested on comparisons nobody had made.
+Phase 0 made them with throwaway scripts running both transports live against
+the top ~500 channels (auth user `48754970`, a separate `user:read:chat` token
+that did not touch the running IRC production token). **All four passed. The
+T006 gate is met — Phase 2 is unblocked.**
 
-| Task | Question | Measured input so far |
+| Task | Result | Feeds |
 |---|---|---|
-| T001 | Does `sent_at` change meaning when its source moves from IRC `tmi-sent-ts` to the EventSub envelope's `metadata.message_timestamp`? Run both transports on the same channels; record the per-message difference | Envelope value is Twitch *dispatch* time; `tmi-sent-ts` is *send* time. Different quantities; expected to track closely, but "expected" is not data |
-| T002 | Delivery-lag percentiles at 500 channels. Does the tail keep growing past 394? | 394-channel spike: p50 154 ms, p95 220 ms, max 1243 ms. Tail grew with fan-out (max 366 ms at 2 channels) |
-| T003 | Safe subscription-creation concurrency. Where do 429s begin? | Sequential 2.1 subs/s, p50 421 ms per POST, zero 429s across 394 creations. Concurrency is unmeasured |
-| T004 | Ramp-window loss: `received event for unknown subscription` count against total during a 500-channel ramp | The library logs this and drops the events. Rate unmeasured |
+| **T001** | `metadata.message_timestamp − tmi_sent_ts` over 24,473 joined messages (15 channels, 12 min): min 0, **median +1 ms**, p95 1 ms, max 1 ms, mean +0.5 ms, **0 negative**. The envelope timestamp *is* the IRC send time — same Twitch-assigned instant, not "dispatch vs send". | D3, FR-009, **T006** |
+| **T002** | EventSub delivery lag `local_recv − envelope_ts` over 59,405 messages (414 channels, 8 min): p50 163, p95 217, p99 257, p99.9 415, p99.99 1,255 ms. **Over 2,000 ms: 1 message = 0.0017%.** Over 1,000 ms: 0.039%. | D4, SC-005 |
+| **T003** | 250 creates at concurrency 1 / 5 / 10 / 20 → **zero 429s at every level** (2.6 / 11.5 / 6.5 / 44 subs/s; POST p50 ~330–385 ms). The rate limit is not a concurrency ceiling. | D2 |
+| **T003b** | 550 creates, concurrency 15, retry + 10 s backoff on 429: **first 429 after 364 successful creates** (t ≈ 14 s), burst budget ≈ 360–420, **time to 500 enabled = 40.6 s**, time to 550 = 53.2 s, 180 total 429s all retried through. A second cold ramp on an already-drained budget still converged (500 in 125 s, 796 429s). | D2, SC-001 |
+| **T004** | 500-channel cold ramp, 12,555 events in the ramp window: **0 × `received event for unknown subscription`, loss 0.00%.** Per-channel first-60 s vs steady (5–6 min) rate ratio 1.08 — opening baseline not depressed. | R1, **FR-014** |
 
-**Checkpoint**: D2, D3, D4 decided from data; the T004 result answers FR-014.
+**T005**: this section + D2/D3/D4/R1 below are the Phase 0 commit.
+**T006 GATE**: median dispatch-vs-receive offset = **1 ms**, far inside the 2 s
+watermark → **PASS. Phase 2 unblocked.**
+**FR-014**: ramp loss is 0.00% and the opening baseline is not depressed →
+**the warm-up gate is NOT built. Skip T040.**
+
+### Caveats carried forward
+
+- T002 ran at **414 channels, not 500** — 86 creates hit 429 at concurrency 10
+  before the harness added backoff. 414 ≈ the 394-channel spike; the lag
+  distribution is the relevant output and it is clean. Re-confirm the tail at a
+  full, stable 500 during Phase 5 (T044 / T038).
+- T002's lag tail includes scheduling jitter from a single-process measurement
+  consumer (one asyncio loop doing receive + bookkeeping). The real Kafka
+  producer path is lighter, so 0.0017% over 2 s is an **upper bound**.
+- T001's dedicated offset number (±1 ms) is not subject to that jitter — it is
+  a difference of two Twitch-supplied timestamps, independent of receive time.
+- twitchAPI 4.5.0 registers the notification callback synchronously with the
+  create POST returning (`websocket.py` `_subscribe`), so the ramp race the 003
+  spike saw does not reproduce here. If the library is upgraded, re-check T004.
 
 ## Decisions
 
@@ -32,25 +56,48 @@ yet. Getting them wrong corrupts detection with no error. Phase 0 makes them.
   unwieldy — that is far past 500 channels (about 7 sockets at 2000). Kept in
   spec Out of Scope as the fallback.
 
-### D2 — Reconciler concurrency: start at 10, tune from T003
+### D2 — Reconciler concurrency: 10, with mandatory 429 backoff-and-retry
 
-- **Decision**: bounded concurrency, initial value 10, configurable, back off
-  on 429.
-- **Rationale**: creation is latency-bound, not rate-limited — p50 421 ms per
-  POST, zero 429s sequentially. So it parallelizes. 10 in flight projects to
-  ~20 subs/s and 500 channels in ~25 s.
-- **Alternatives considered**: unbounded fan-out (risks 429s never seen
-  sequentially, and mirrors the `ClipCreator` thread bug this project is trying
-  to move away from); staying sequential (2.1/s — no better than IRC). The
-  projection is arithmetic, not data; T003 sets the real number.
+- **Decision**: bounded concurrency, default **10** (`RECONCILE_CONCURRENCY`,
+  env-configurable). On a 429, back off (fixed ~10 s, or honour the
+  `Ratelimit-Reset` header if the library exposes it) and **retry the failed
+  channels** — never drop them. The backoff/retry loop is load-bearing, not a
+  safety net.
+- **Rationale (measured, T003 / T003b, 2026-08-28)**: the limit is a
+  **per-token request budget**, not a concurrency ceiling. 250 creates drew
+  **zero 429s at concurrency 1, 5, 10 and 20**. A larger burst hits the budget:
+  the first 429 landed after **364 successful creates** (~14 s at concurrency
+  15). Burst budget ≈ 360–420 creates. So concurrency can be anywhere in
+  10–20 with no throttling risk *within* a burst; what matters past ~400
+  channels is the retry loop. With concurrency 15 + 10 s backoff, a cold start
+  reached **500 subscriptions in 40.6 s** and 550 in 53.2 s — inside the SC-001
+  60 s target and well under the 120 s ceiling. Even a ramp starting on an
+  already-drained budget converged (500 in 125 s, 796 429s, all retried).
+- **Why keep 10 rather than raise it**: 10 already clears SC-001 with margin;
+  15–20 shave ~10 s off cold start but buy nothing operationally and give the
+  reconciler more in-flight work to unwind on a mid-ramp restart. 10 is the
+  conservative default; the env var is there if a future channel count needs it.
+- **Alternatives considered**: unbounded fan-out (mirrors the `ClipCreator`
+  thread bug this project is moving away from; and a burst >420 just 429s
+  anyway); staying sequential (2.1/s — no better than IRC, 500 in ~240 s);
+  a fixed requests-per-second limiter instead of concurrency + backoff (more
+  code, and the measured burst-then-throttle shape is handled fine by
+  concurrency + reactive backoff).
 
-### D3 — `sent_at` source: envelope `metadata.message_timestamp`, gated on T001
+### D3 — `sent_at` source: envelope `metadata.message_timestamp` — GATE PASSED
 
 - **Decision**: `sent_at` comes from the EventSub envelope's
   `metadata.message_timestamp`, converted to epoch milliseconds.
   `ChannelChatMessageData` has no timestamp field, so there is no other
-  per-message option. Cutover proceeds **only if** T001 shows the median
-  dispatch-versus-receive offset is within the 2 s watermark tolerance (D4).
+  per-message option. **T001 gate met** (2026-08-28): median offset **+1 ms**,
+  max 1 ms, 0 negative, over 24,473 messages joined by message UUID. Cutover
+  proceeds.
+- **What T001 actually showed**: `metadata.message_timestamp` and IRC
+  `tmi-sent-ts` are **the same value** to the millisecond — not "dispatch time
+  vs send time" as feared, but the one Twitch-assigned instant carried on both
+  transports. There is no offset to correct and no calibration constant to
+  maintain. `SentAtTimestampAssigner` sees the identical event-time input it
+  sees today; the corpus-derived tuning stays valid.
 - **Rationale**: `SentAtTimestampAssigner` drives Flink's event time from
   `sent_at`. A silent shift in that quantity would move every bucket boundary
   and invalidate the corpus-derived tuning without failing loudly.
@@ -60,28 +107,34 @@ yet. Getting them wrong corrupts detection with no error. Phase 0 makes them.
   Plan 06 Phase 2 deliberately adopted); block the feature and pursue webhook
   (only if T001 shows a material, uncorrectable offset).
 - **Clarified 2026-08-27**: this is the chosen rule (spec Clarifications).
-- **Offset direction**: dispatch time is always at or after send time, so the
-  offset is one-signed. A small, steady positive offset shifts every event time
-  later by the same amount — it delays detection slightly but does not distort
-  the relative bucket structure the detector reads. T001 checks the median
-  magnitude against the 2 s tolerance; a wide or unstable spread is the real
-  failure signal, not a constant shift.
+- **Offset direction (pre-measurement reasoning, now moot)**: dispatch time was
+  expected to be at or after send time, giving a one-signed offset. T001 showed
+  the two timestamps are identical, so there is no offset in either direction.
+  The "wide or unstable spread" failure signal did not appear: the spread is
+  0–1 ms.
 
 ### D4 — Watermark tolerance: 2 s
 
 - **Decision**: `WATERMARK_OUT_OF_ORDERNESS_SECONDS` moves from 1 to 2, in
   `services/flink-job/spike_detector.py`. `clip_detector_job.py` and
   `tools/replay.py` read the same constant, so all three move together.
-- **Rationale**: the measured max delivery lag at 394 channels is 1243 ms, and
-  the tail grows with fan-out. A 1 s tolerance already drops that tail. 2 s
-  clears the measured max with margin. The cost is ~1 s added to the
-  peak-to-clip-request delay floor.
+- **Rationale (T002, 2026-08-28)**: EventSub delivery lag over 59,405 messages
+  at 414 channels held p50 163 / p95 217 / p99 257 ms — flat against the
+  394-channel spike (154 / 220). The tail did **not** keep growing: p99.99 was
+  1,255 ms and exactly **one message (0.0017%) exceeded 2,000 ms** (a lone
+  4.4 s outlier, most likely a GC pause in the measurement consumer). A 2 s
+  tolerance therefore drops ~0.0017% of records — ~60× under the SC-005 0.1%
+  budget. The cost is ~1 s added to the peak-to-clip-request delay floor.
 - **Alternatives considered**: keep 1 s and accept a measured drop rate
-  (the operator chose the watermark move instead — spec Clarifications);
-  raise to 5 s (the pre-2026-08-27 value, a round number with no measurement
-  behind it — over-corrects and slows every detection).
-- **Acceptance**: after the move, the residual late-drop rate at 500 channels
-  must be below 0.1% (SC-005). T002 confirms the tail has not grown past 2 s.
+  (the operator chose the watermark move instead — spec Clarifications); at 1 s
+  the T002 data shows ~0.039% would drop — still under budget but with no
+  margin for the untested 414→500 gap. Raise to 5 s (the pre-2026-08-27 value,
+  a round number with no measurement behind it — over-corrects and slows every
+  detection).
+- **Acceptance**: the residual late-drop rate at a stable 500 channels must be
+  below 0.1% (SC-005), measured in Phase 5 from Flink's `numLateRecordsDropped`
+  (T038). T002 confirms the tail has not grown past 2 s at 414; the 414→500
+  re-check is a Phase 5 item.
 
 ### D5 — Refusal cache and `allows_clipping`: shared 7-day re-check
 
@@ -120,18 +173,21 @@ yet. Getting them wrong corrupts detection with no error. Phase 0 makes them.
 
 | ID | Risk | Mitigation | Phase 0 task |
 |---|---|---|---|
-| R1 | Events dropped during the subscribe ramp — `received event for unknown subscription` | Measure the loss. Add a warm-up gate that withholds a channel's baseline until its subscription is settled, only if the loss distorts detection (FR-014) | T004 |
-| R2 | D3 shifts event time silently and corrupts detection | Measure both timestamps side by side before cutover. Cutover is gated on the result (D3) | T001 |
-| R3 | Concurrency triggers 429s not seen sequentially | Start at 10, back off on 429, keep it configurable (D2) | T003 |
+| R1 | Events dropped during the subscribe ramp — `received event for unknown subscription` | **CLOSED (T004, 2026-08-28)**: 0 dropped events across a 500-channel cold ramp (12,555 events in the window), opening baseline not depressed (first-60 s / steady ratio 1.08). twitchAPI 4.5.0 registers the callback synchronously with the create POST. No warm-up gate — T040 skipped. Re-check only if the library is upgraded | T004 ✓ |
+| R2 | D3 shifts event time silently and corrupts detection | **CLOSED (T001, 2026-08-28)**: the two timestamps are identical (median offset +1 ms, 0 negative, over 24,473 messages). No event-time shift. T006 gate passed | T001 ✓ |
+| R3 | Concurrency triggers 429s not seen sequentially | **Measured (T003/T003b)**: 429s are budget-driven, not concurrency-driven — none at concurrency ≤20 for 250 creates; first 429 after ~364 creates in a larger burst. Mitigation is the D2 backoff-and-retry loop, which converged a 500-channel cold start in 40.6 s and recovered even from a drained budget. Concurrency 10 default, configurable | T003 ✓ |
 | R4 | A socket death drops up to 300 channels at once | Consistent-hash routing plus fast reconcile. Alert on a subscription-count drop (FR-012) | — |
 | R5 | Removing IRC leaves no fallback if EventSub misbehaves in production | Deliberate. The operator accepted no intermediate compatibility. `git revert` of the branch is the fallback | — |
 
 ## Deployment and token notes
 
-- **Token scope**: the current token carries `chat:read` and `clips:edit`.
-  EventSub needs `user:read:chat`. A superset token already exists from the
-  spike. Re-seeding does **not** invalidate the running production token — that
-  was verified during the spike with production running throughout.
+- **Token scope**: the production token carries `chat:read` and `clips:edit`
+  only — checked on disk 2026-08-28, no `user:read:chat`. Phase 0 seeded a
+  **separate** `secrets/phase0_tokens.json` (superset `chat:read` +
+  `clips:edit` + `user:read:chat`) via `seed_twitch_tokens.py` device flow and
+  never touched the production file; prod kept running on IRC throughout, token
+  unaffected. Phase 2 T017 still needs to add `AuthScope.USER_READ_CHAT` to
+  `REQUIRED_SCOPES` and re-seed the production token file.
 - **New modules**: `reconciler.py` and `eventsub_pool.py` need a `COPY` line in
   `services/stream-monitoring/Dockerfile` and a bind-mount entry in
   `docker-compose.yml`. Neither is picked up automatically.
