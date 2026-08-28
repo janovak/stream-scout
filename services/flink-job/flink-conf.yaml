@@ -4,7 +4,15 @@ jobmanager.rpc.address: flink-jobmanager
 jobmanager.rpc.port: 6123
 jobmanager.memory.process.size: 1024m
 
-taskmanager.memory.process.size: 2048m
+# Measured 2026-08-27: the TaskManager sat at ~1.47 GiB of a 2048m cap (~73%)
+# while watching only ~30 broadcasters. state.backend is hashmap and
+# checkpointing is off, so all keyed state lives on the JVM heap and grows
+# with the broadcaster count. Scaling toward 2000 broadcasters against a 73%
+# resting utilisation would have hit this ceiling well before any detector
+# cost mattered. The host has 15 GiB total with ~5.2 GiB free, so this
+# headroom is already paid for.
+# See specs/003-detector-scale-fanout/research.md.
+taskmanager.memory.process.size: 6144m
 taskmanager.numberOfTaskSlots: 4
 
 parallelism.default: 4

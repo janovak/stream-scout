@@ -269,7 +269,12 @@ services:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.memory.process.size: 2048m
+        # Keep in step with services/flink-job/flink-conf.yaml -- these two
+        # values are duplicated and drift silently if only one is edited.
+        # Raised from 2048m: the TaskManager rested at ~73% of that cap at
+        # only ~30 broadcasters, and hashmap state grows with broadcaster
+        # count. See specs/003-detector-scale-fanout/research.md.
+        taskmanager.memory.process.size: 6144m
         taskmanager.numberOfTaskSlots: 4
         metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prom.port: 9249
