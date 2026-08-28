@@ -53,19 +53,35 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 # IRC JOIN bucket (20 per 10s, per account) blocks rather than fails, so a
 # larger set costs startup time -- roughly LEAVE_THRESHOLD/2 seconds to join
 # from cold -- before it costs anything else.
-JOIN_THRESHOLD = int(os.getenv("JOIN_THRESHOLD", "15"))
-LEAVE_THRESHOLD = int(os.getenv("LEAVE_THRESHOLD", "30"))
+def resolve_thresholds(env=None):
+    """Read and validate the hysteresis thresholds from `env`.
 
-if JOIN_THRESHOLD < 1:
-    raise ValueError(f"JOIN_THRESHOLD must be >= 1, got {JOIN_THRESHOLD}")
-if LEAVE_THRESHOLD < JOIN_THRESHOLD:
-    # Hysteresis requires a band. Equal values give none, and an inverted pair
-    # would make every joined channel instantly leave-eligible -- thrashing
-    # chat connections once per poll and destroying Flink's baseline.
-    raise ValueError(
-        f"LEAVE_THRESHOLD ({LEAVE_THRESHOLD}) must be >= JOIN_THRESHOLD "
-        f"({JOIN_THRESHOLD}) to give the hysteresis band a width"
-    )
+    A function, not inline module code, so tests can exercise the validation
+    without reloading this module -- module-level start_http_server() and the
+    Prometheus collectors below cannot be registered twice in one process.
+
+    Returns (join_threshold, leave_threshold). Raises ValueError on a
+    configuration that would misbehave rather than fail loudly at runtime.
+    """
+    env = os.environ if env is None else env
+    join = int(env.get("JOIN_THRESHOLD", "15"))
+    leave = int(env.get("LEAVE_THRESHOLD", "30"))
+
+    if join < 1:
+        raise ValueError(f"JOIN_THRESHOLD must be >= 1, got {join}")
+    if leave < join:
+        # Hysteresis requires a band. Equal values give none, and an inverted
+        # pair would make every joined channel instantly leave-eligible --
+        # thrashing chat connections once per poll and destroying Flink's
+        # baseline.
+        raise ValueError(
+            f"LEAVE_THRESHOLD ({leave}) must be >= JOIN_THRESHOLD "
+            f"({join}) to give the hysteresis band a width"
+        )
+    return join, leave
+
+
+JOIN_THRESHOLD, LEAVE_THRESHOLD = resolve_thresholds()
 
 # Extra raw streams (by viewer rank) to fetch beyond LEAVE_THRESHOLD so that
 # streamers with clipping disabled don't eat a rank slot a real candidate
@@ -104,6 +120,22 @@ HELIX_MAX_PAGE_SIZE = 100
 # that a reconnect threw away) is fixed in the library itself -- see
 # patches/twitchapi_leave_room_timeout.py -- not with a wrapper here.
 GET_STREAMS_TIMEOUT_SECONDS = 10
+
+
+def fetch_budget(fetch_count):
+    """Return (pages, timeout_seconds) for fetching `fetch_count` streams.
+
+    Scales the budget with the number of Helix pages needed, so raising
+    LEAVE_THRESHOLD does not silently start tripping a bound sized for one
+    page. Caps it below the poll interval regardless: bounding this call
+    exists to recover within one poll, and an unscaled ceiling would let a
+    stalled fetch eat several cycles -- the very thing
+    GET_STREAMS_TIMEOUT_SECONDS guards against. At the measured ~0.1s per
+    page the cap still leaves a wide margin (a 21-page fetch runs in ~2s
+    against a 60s cap).
+    """
+    pages = math.ceil(fetch_count / HELIX_MAX_PAGE_SIZE)
+    return pages, min(GET_STREAMS_TIMEOUT_SECONDS * pages, POLL_INTERVAL_SECONDS // 2)
 
 # pyTwitchAPI's Chat.is_connected() also reads False for the entire span of a
 # still-in-progress reconnect (it only reassigns the connection on success),
@@ -298,19 +330,7 @@ class StreamMonitoringService:
                         break
                 return collected
 
-            # Scale the budget with the number of pages this fetch needs, so a
-            # larger LEAVE_THRESHOLD doesn't trip a timeout sized for one page.
-            # Cap it below the poll interval regardless: the whole point of
-            # bounding this call is to recover within one poll, and an
-            # unbounded scale would let a stalled fetch eat several cycles --
-            # exactly what GET_STREAMS_TIMEOUT_SECONDS exists to prevent. At
-            # ~0.1s per page the cap still leaves a large multiple of the
-            # expected duration (a 21-page fetch runs in ~2s against a 60s cap).
-            pages = math.ceil(fetch_count / HELIX_MAX_PAGE_SIZE)
-            fetch_timeout = min(
-                GET_STREAMS_TIMEOUT_SECONDS * pages,
-                POLL_INTERVAL_SECONDS // 2,
-            )
+            pages, fetch_timeout = fetch_budget(fetch_count)
 
             try:
                 raw_streams = await asyncio.wait_for(_fetch_top_streams(), timeout=fetch_timeout)
