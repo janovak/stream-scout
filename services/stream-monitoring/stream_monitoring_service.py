@@ -2,8 +2,13 @@
 """
 Stream Monitoring Service
 
-Monitors top Twitch streams, joins chat rooms, and publishes messages to Kafka.
+Ranks the top Twitch streams and writes the set that chat must cover to Redis.
 Uses Redis for online streamer state management with TTL-based expiration.
+
+The poll job decides intent and returns. It makes no chat connections and no
+subscriptions. `reconciler.py` reads the intent and does all network fan-out,
+in parallel, on its own task. The two only meet at the Redis keys that
+`reconciler.py` documents.
 """
 
 import asyncio
@@ -29,6 +34,14 @@ from twitchAPI.chat import Chat, ChatMessage, EventData
 from twitchAPI.twitch import Twitch
 from twitchAPI.type import AuthScope, ChatEvent
 
+from reconciler import (
+    DESIRED_GENERATION_KEY,
+    DESIRED_IDS_KEY,
+    DESIRED_KEY,
+    Reconciler,
+    StubTransport,
+    resolve_reconciler_config,
+)
 from token_manager import TwitchCredentials, get_credentials
 
 
@@ -42,17 +55,18 @@ PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "9100"))
 HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", "8080"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# Hysteresis thresholds for chat room management
-# Join chat when streamer enters top JOIN_THRESHOLD
-# Leave chat only when streamer exits top LEAVE_THRESHOLD
+# Hysteresis thresholds for the monitored set
+# A streamer enters the desired set on reaching top JOIN_THRESHOLD
+# A streamer leaves it only on exiting top LEAVE_THRESHOLD
 # This preserves Flink baseline data during rank fluctuations
 #
 # Configurable so the monitored set can be ramped empirically (15/30 ->
 # 50/100 -> 150/300 ...) to find where the system actually degrades, rather
-# than designing for one guessed target. Raise these gradually and watch: the
-# IRC JOIN bucket (20 per 10s, per account) blocks rather than fails, so a
-# larger set costs startup time -- roughly LEAVE_THRESHOLD/2 seconds to join
-# from cold -- before it costs anything else.
+# than designing for one guessed target. The old warning here was that a
+# larger set cost startup time inside the poll tick, at roughly
+# LEAVE_THRESHOLD/2 seconds to join from cold. That is no longer true: the
+# poll writes intent and returns, and `reconciler.py` does the fan-out in
+# parallel outside the tick. See `compute_desired_set` below.
 def resolve_thresholds(env=None):
     """Read and validate the hysteresis thresholds from `env`.
 
@@ -82,6 +96,40 @@ def resolve_thresholds(env=None):
 
 
 JOIN_THRESHOLD, LEAVE_THRESHOLD = resolve_thresholds()
+
+
+def compute_desired_set(ranked_logins, previous_desired, join_threshold, leave_threshold):
+    """Return {login: rank} for the channels chat should cover, with hysteresis.
+
+    This is the same band the join loop used to apply, moved to where intent is
+    decided instead of where connections are made (FR-011). The rule does not
+    change:
+
+    - A login ENTERS when it reaches the top `join_threshold`.
+    - A login STAYS while it holds the top `leave_threshold`, even though it
+      is no longer in the join band. This is the retained band, ranks 16-30 at
+      the shipped 15/30.
+    - A login LEAVES only when it drops out of the top `leave_threshold`, or
+      off the ranked list altogether.
+
+    In set terms the old loop settled on `(joined | top_join) & top_leave`, and
+    that is what the expression below computes. Hysteresis stops a channel near
+    the boundary from leaving and rejoining once per poll, which would destroy
+    the Flink baseline it has built.
+
+    `ranked_logins` is in rank order, best first. `previous_desired` is the
+    membership of the last poll. It is read back from Redis rather than held in
+    memory, so a restart keeps the band instead of collapsing it to the join
+    threshold.
+    """
+    desired = {}
+    for rank, login in enumerate(ranked_logins, 1):
+        if rank > leave_threshold:
+            break
+        if rank <= join_threshold or login in previous_desired:
+            desired[login] = rank
+    return desired
+
 
 # Extra raw streams (by viewer rank) to fetch beyond LEAVE_THRESHOLD so that
 # streamers with clipping disabled don't eat a rank slot a real candidate
@@ -177,8 +225,14 @@ class StreamMonitoringService:
         self.credentials: Optional[TwitchCredentials] = None
         self.running = True
         self.joined_channels: Set[str] = set()
-        self.broadcaster_ids: Dict[str, int] = {}  # login -> id mapping
+        # login -> id. Still read by the IRC message handler, which Phase 3
+        # deletes. The reconciler does NOT read this: it takes the same map
+        # from Redis, because intent must cross the seam through Redis and not
+        # through a shared attribute.
+        self.broadcaster_ids: Dict[str, int] = {}
         self._consecutive_dead_chat_polls = 0
+        self.reconciler: Optional[Reconciler] = None
+        self._reconciler_task: Optional[asyncio.Task] = None
 
     async def _on_token_refresh(self, access_token: str, refresh_token: str):
         """Callback invoked when tokens are refreshed by pyTwitchAPI."""
@@ -250,6 +304,18 @@ class StreamMonitoringService:
         self.redis_client.ping()
         logger.info("Redis connection initialized")
 
+        # Build the reconciler. It reads the desired set this service writes
+        # and owns every network call that used to happen inside the poll tick.
+        self.reconciler = Reconciler(
+            transport=self._build_transport(),
+            redis_client=self.redis_client,
+            config=resolve_reconciler_config(),
+            # active_stream_count used to count IRC rooms. joined_channels is
+            # no longer maintained, so the gauge follows the reconciler's
+            # actual set -- the subscriptions that really exist.
+            on_pass_complete=active_stream_count.set,
+        )
+
         # Initialize scheduler
         self.scheduler = AsyncIOScheduler()
         self.scheduler.add_job(
@@ -264,10 +330,25 @@ class StreamMonitoringService:
         start_http_server(PROMETHEUS_PORT)
         logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
 
+    def _build_transport(self):
+        """Return the transport the reconciler drives.
+
+        Phase 1 runs against the stub. The reconciler is transport-independent
+        by design, so Phase 2 (T018/T022) swaps in the EventSub websocket pool
+        here and changes nothing else.
+        """
+        return StubTransport()
+
     async def start(self):
         """Start the service."""
         await self.initialize()
         self.scheduler.start()
+
+        # The reconciler is a task in this process, beside the poll job. It is
+        # not a separate container: it shares this process's /health endpoint
+        # and this logger.
+        self._reconciler_task = asyncio.create_task(self.reconciler.run())
+
         logger.info("Stream Monitoring Service started")
 
         # Keep the service running
@@ -281,6 +362,20 @@ class StreamMonitoringService:
 
         if self.scheduler:
             self.scheduler.shutdown(wait=True)
+
+        # Stop the reconciler before Redis closes underneath it. Ask first,
+        # then cancel, so a pass that is already running can finish its
+        # current operation instead of leaving a half-made subscription.
+        if self.reconciler is not None:
+            self.reconciler.stop()
+        if self._reconciler_task is not None:
+            self._reconciler_task.cancel()
+            try:
+                await self._reconciler_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning("Reconciler stopped with an error", extra={"error": str(e)})
 
         if self.chat is not None:
             try:
@@ -364,25 +459,27 @@ class StreamMonitoringService:
                     }
                 )
 
+            # The membership of the last desired set IS the hysteresis state.
+            # It is read back from Redis rather than held in memory, so a
+            # restart keeps the retained band instead of collapsing coverage
+            # to the top JOIN_THRESHOLD.
+            previous_desired = self._read_previous_desired()
+
             for login in disabled_logins:
-                if login in self.joined_channels:
-                    logger.info("Streamer has clipping disabled, will leave chat", extra={
+                if login in previous_desired:
+                    logger.info("Streamer has clipping disabled, dropping from the desired set", extra={
                         "broadcaster_login": login
                     })
 
-            # Track streamers by rank for hysteresis logic
-            top_join_streamers = set()  # Streamers in top JOIN_THRESHOLD (eligible to join)
-            top_leave_streamers = set()  # Streamers in top LEAVE_THRESHOLD (not yet eligible to leave)
+            ranked_logins = []
+            broadcaster_ids = {}
 
             for rank, stream in enumerate(streams, 1):
                 broadcaster_login = stream.user_login.lower()
                 broadcaster_id = int(stream.user_id)
+                ranked_logins.append(broadcaster_login)
+                broadcaster_ids[broadcaster_login] = broadcaster_id
                 self.broadcaster_ids[broadcaster_login] = broadcaster_id
-
-                if rank <= JOIN_THRESHOLD:
-                    top_join_streamers.add(broadcaster_login)
-                if rank <= LEAVE_THRESHOLD:
-                    top_leave_streamers.add(broadcaster_login)
 
                 # Update Redis with TTL
                 redis_key = f"streamer:online:{broadcaster_login}"
@@ -401,9 +498,15 @@ class StreamMonitoringService:
                         "rank": rank
                     })
 
-            # Check for streamers that went offline (dropped out of top LEAVE_THRESHOLD)
-            for login in list(self.joined_channels):
-                if login not in top_leave_streamers:
+            desired = compute_desired_set(
+                ranked_logins, previous_desired, JOIN_THRESHOLD, LEAVE_THRESHOLD
+            )
+
+            # Streamers that went offline. A login leaves `desired` only when
+            # it drops out of the top LEAVE_THRESHOLD, so this is the same
+            # condition the join loop used to apply against joined_channels.
+            for login in previous_desired:
+                if login not in desired:
                     redis_key = f"streamer:online:{login}"
                     if not self.redis_client.exists(redis_key):
                         broadcaster_id = self.broadcaster_ids.get(login, 0)
@@ -413,25 +516,71 @@ class StreamMonitoringService:
                             "broadcaster_id": broadcaster_id
                         })
 
-            # Manage chat connections with hysteresis
-            await self._manage_chat_connections(top_join_streamers, top_leave_streamers, disabled_logins)
+            # Hand the intent to the reconciler and return. No joins, no
+            # subscribes, no waiting on a rate-limited bucket. This is the
+            # whole point of the split: the poll must always finish well
+            # inside POLL_INTERVAL_SECONDS, because APScheduler runs it with
+            # max_instances=1 and a skipped poll stops refreshing the online
+            # keys that expire at REDIS_STREAMER_TTL.
+            self._write_desired_set(desired, broadcaster_ids)
 
-            # Update metrics (count of streamers we're actively monitoring). Must
-            # run after _manage_chat_connections, not before: a dead-connection
-            # recovery there can swing self.joined_channels by the entire
-            # monitored set within this same poll, and reading the gauge first
-            # would report a value that's already stale by the time this poll
-            # returns.
-            active_stream_count.set(len(self.joined_channels))
+            logger.info("Poll complete", extra={
+                "ranked": len(ranked_logins),
+                "desired": len(desired),
+                "entered": len(set(desired) - previous_desired),
+                "left": len(previous_desired - set(desired)),
+            })
 
         except Exception as e:
             logger.error("Error polling streams", extra={"error": str(e)})
             twitch_api_errors_total.labels(error_type="poll_streams").inc()
 
+    def _read_previous_desired(self) -> Set[str]:
+        """Return the logins the last poll asked for. This is the hysteresis state."""
+        return {
+            login.decode("utf-8") if isinstance(login, bytes) else login
+            for login in self.redis_client.zrange(DESIRED_KEY, 0, -1)
+        }
+
+    def _write_desired_set(self, desired: Dict[str, int], broadcaster_ids: Dict[str, int]):
+        """Publish the desired set for the reconciler, in one transaction.
+
+        One round trip whatever changed, so the cost of this write follows the
+        SIZE of the desired set and never the size of the CHANGE (FR-003).
+
+        DEL then ZADD, not the rank trim that data-model.md describes: a member
+        that leaves the set keeps its old score, and that score is also a low
+        rank, so a ZREMRANGEBYRANK would keep the stale member and evict a
+        wanted one instead. The pipeline is a MULTI/EXEC, so the reconciler
+        never reads the gap between the delete and the write, and the set, the
+        id map, and the generation can never disagree.
+        """
+        pipe = self.redis_client.pipeline()
+        pipe.delete(DESIRED_KEY, DESIRED_IDS_KEY)
+        if desired:
+            pipe.zadd(DESIRED_KEY, desired)
+            pipe.hset(
+                DESIRED_IDS_KEY,
+                mapping={login: broadcaster_ids[login] for login in desired},
+            )
+        pipe.incr(DESIRED_GENERATION_KEY)
+        pipe.execute()
+
+        # The reconciler shares this event loop, so this is the fast path. Its
+        # idle timeout is the backstop if the signal is ever missed.
+        if self.reconciler is not None:
+            self.reconciler.notify_desired_changed()
+
     async def _manage_chat_connections(self, join_eligible: Set[str], leave_eligible: Set[str],
                                         disabled_logins: Optional[Set[str]] = None):
         """
         Manage chat room connections with hysteresis.
+
+        DEAD CODE ON THE POLL PATH. `poll_top_streams` no longer calls this.
+        Chat membership is now intent in Redis plus `reconciler.py`. The
+        function and its tests stay until Phase 3 removes IRC outright
+        (tasks T029-T031), because deleting the transport is a separate step
+        from moving the work off the poll tick.
 
         Args:
             join_eligible: Streamers in top JOIN_THRESHOLD (should join if not already joined)
@@ -521,11 +670,11 @@ class StreamMonitoringService:
         # because hysteresis means only a handful of channels change per poll
         # -- it is the cold start that hurts.
         #
-        # The fix, when this bites, is to move joining out of the poll: the
-        # poller writes the desired set to Redis and a separate long-lived
-        # worker reconciles toward it at its own pace. Do not paper over it by
-        # widening POLL_INTERVAL_SECONDS, which would only stretch the same
-        # gap against REDIS_STREAMER_TTL.
+        # DONE, spec 004 Phase 1: the poller writes the desired set to Redis
+        # and `reconciler.py` converges toward it on its own task. Nothing
+        # reaches this loop from the poll path any more. The paragraphs above
+        # describe the failure that motivated the split; keep them until
+        # Phase 3 deletes the IRC client with them.
         for channel in channels_to_join:
             try:
                 await self.chat.join_room(channel)

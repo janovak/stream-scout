@@ -56,13 +56,35 @@ COMMIT;
 | Key | Type | Written by | Read by | TTL |
 |---|---|---|---|---|
 | `chat:desired` | Sorted set: member = broadcaster login, score = rank (1 = top) | Poller, once per poll | Reconciler | none — overwritten each poll |
+| `chat:desired:ids` | Hash: broadcaster login → broadcaster id | Poller, once per poll | Reconciler | none — overwritten each poll |
 | `chat:desired:generation` | String: monotonic counter, bumped each poll | Poller | Reconciler (detect a stale in-flight reconcile) | none |
 | `streamer:online:{login}` | String: broadcaster id (existing key, unchanged) | Poller | Poller | `REDIS_STREAMER_TTL` = 180 s |
 
 The sorted set lets the reconciler work highest-rank-first with `ZRANGE
-chat:desired 0 -1 WITHSCORES`. The poller writes the whole set in one
-`ZADD` plus a `ZREMRANGEBYRANK` trim, so its cost does not scale with the size
-of the change (FR-003).
+chat:desired 0 -1 WITHSCORES`.
+
+`chat:desired:ids` was added in Phase 1. The poller ranks by login, but
+EventSub subscribes by broadcaster id, so the map has to cross the seam. It is
+written in the same transaction as `chat:desired`, so the two can never
+disagree. The alternative — having the reconciler read each
+`streamer:online:{login}` key — was rejected: those keys expire at 180 s, so a
+poll that stalls would take the ids away from a reconciler that still wants
+the channels.
+
+### The write is `DEL` + `ZADD`, not a rank trim (corrected in Phase 1)
+
+This document first specified one `ZADD` plus a `ZREMRANGEBYRANK` trim. **That
+does not work.** A member that leaves the desired set keeps the score it was
+last written with, and that score is also a low rank, so the trim cannot tell
+it from a wanted member. It would keep the stale login and evict a wanted one
+instead.
+
+The poller instead issues `DEL chat:desired chat:desired:ids`, then `ZADD`,
+then `HSET`, then `INCR` on the generation, all inside one MULTI/EXEC. Redis
+runs a transaction whole, so the reconciler never reads the gap between the
+delete and the write. This is still one round trip whatever changed, which is
+what FR-003 actually requires: the cost follows the SIZE of the desired set,
+never the size of the CHANGE.
 
 The reconciler holds its own view of the **actual set** — the subscriptions
 that exist — rebuilt from `get_eventsub_subscriptions()` at start-up (page
