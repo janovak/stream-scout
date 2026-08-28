@@ -57,6 +57,9 @@ parallel with Phase 0.
 - [ ] T013 [US4] **[FR-005]** Make the reconciler converge from any starting state: on start-up rebuild the actual set from `get_eventsub_subscriptions()` by **counting pages, not reading `total`** (research trap), and adopt existing subscriptions rather than duplicating
 - [ ] T014 [US4] Handle drift: a subscription that is `revoked` or absent but still wanted is recreated on the next reconcile; one no longer wanted is dropped. A desired-set change mid-reconcile is picked up via `chat:desired:generation`
 - [ ] T014a [P] [US4] **[FR-004, FR-005]** Reconciler unit tests in `services/stream-monitoring/test_stream_monitoring.py`: diff produces the right create/drop set; an already-subscribed channel is adopted, never re-created; a revoked subscription is re-created; a channel that leaves the desired set mid-reconcile is not created
+- [ ] T014b [US4] **[NFR-003]** Start-up adoption tolerates a partial enumeration: if `get_eventsub_subscriptions` pagination raises mid-list, the reconciler keeps what it saw and does not treat unseen subscriptions as absent. Add a test
+- [ ] T014c [US4] **[NFR-002]** A Redis or Postgres error inside a reconcile pass is logged, the affected work is skipped, and the loop retries next pass — no crash, no dropped live subscription. Add a test
+- [ ] T014d [P] [US1] **[NFR-001]** Assert the reconciler holds no per-channel task or thread: at 500 desired channels the task/thread count is bounded by the concurrency limit plus a small constant
 - [ ] T015 [US1] **[FR-012]** Add Prometheus metrics: `eventsub_subscription_count`, `reconcile_duration_seconds`, `subscription_create_failures_total{reason}`, `eventsub_connection_occupancy{connection}`
 - [ ] T016 [US2] **[FR-012]** Expose reconciler liveness so a stalled or dead reconciler is visible while polls keep succeeding (US2 acceptance scenario 2) — a `reconcile_last_success_timestamp` gauge
 
@@ -85,8 +88,9 @@ runs against a stub transport until Phase 2.
 - [ ] T026 **[migration]** Add both new columns to `infrastructure/postgres/init.sql` (`eventsub_refused_at`, `clipping_disabled_at`) and record the manual `ALTER TABLE` + backfill from `data-model.md` in `OPERATIONS.md` — `init.sql` runs only on a fresh database
 - [ ] T027 **[deployment wiring]** Add `COPY reconciler.py` and `COPY eventsub_pool.py` to `services/stream-monitoring/Dockerfile`, and bind-mount both in `docker-compose.yml`. A new module is invisible without both (same class of gap as the Flink `-pyFiles` list)
 - [ ] T028 **[deployment wiring]** Update the `user:read:chat` scope note in `docker-compose.yml` where the current scopes are documented
+- [ ] T028a **[GATE for Phase 3]** Define and check the go/no-go for IRC removal: the T006 event-time gate passed, T002 confirmed the delivery-lag tail stays under 2 s at 500 channels, EventSub has carried live traffic for at least 2 h with `eventsub_subscription_count` stable at the desired-set size, and the T021 schema test passes. Record the check in `research.md`
 
-**Checkpoint**: EventSub carries live traffic to Kafka.
+**Checkpoint**: EventSub carries live traffic to Kafka and the T028a gate is met.
 
 ---
 
@@ -109,7 +113,7 @@ runs against a stub transport until Phase 2.
 
 - [ ] T036 [US3] **[D4, FR-010]** Set `WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2` in `services/flink-job/spike_detector.py`. Update the comment to cite the T002 measurement, not KNOWN_ISSUES Issue 4. `clip_detector_job.py` and `tools/replay.py` read the same constant
 - [ ] T037 [US3] Update the KNOWN_ISSUES Issue 4 "Post-deploy validation" delay arithmetic for the +1 s change
-- [ ] T038 [US3] **[SC-005]** Measure the residual late-drop rate at 500 channels with the 2 s watermark. Record it in `research.md`. It must be below 0.1%
+- [ ] T038 [US3] **[SC-005]** Measure the residual late-drop rate at 500 channels with the 2 s watermark, from Flink's late-records-dropped metric on the `chat-messages` source (`numLateRecordsDropped` / total). Record it in `research.md`. It must be below 0.1%
 - [ ] T039 [US3] **[US3 Independent Test]** Replay a post-cutover capture through `tools/replay.py` and compare anomaly rate and character against the pre-cutover corpus. Not byte-identical — the input differs — but the rate and shape must be consistent
 - [ ] T040 [US3] **[R1, FR-014]** Add a per-channel warm-up gate that withholds a channel's baseline until its subscription is settled — **only if** T004 showed the ramp loss distorts detection. If T004 was clean, note that here and skip
 
@@ -120,7 +124,8 @@ runs against a stub transport until Phase 2.
 - [ ] T041 [US1] **[SC-001]** Cold start to 500 channels: measure time to full coverage. Target under 60 s; fail over 120 s
 - [ ] T042 [US2] **[SC-002]** Poll duration flat against desired-set change size (re-run T010 at 500 channels live)
 - [ ] T043 **[SC-003]** No `Bucket channel_join got rate limited` anywhere in the logs — the IRC bucket is gone
-- [ ] T044 [US1] **[SC-004]** 500 channels sustained for 30+ minutes: subscription count stable, no unexplained drift
+- [ ] T044 [US1] **[SC-004]** 500 channels sustained for 30+ minutes: `eventsub_subscription_count` within ±1% of the desired-set size, every delta attributable to a logged refusal, a reconnect, or a desired-set change
+- [ ] T044a **[SC-007]** Confirm every FR-012 metric (`eventsub_subscription_count`, `reconcile_duration_seconds`, `subscription_create_failures_total`, `eventsub_connection_occupancy`, `reconcile_last_success_timestamp`) is present on `/metrics` and populated while the reconciler runs
 - [ ] T045 [US4] **[SC-006]** Kill the service mid-ramp, restart, confirm convergence with no duplicate subscriptions
 - [ ] T046 [US3] Confirm `sent_at` in live Kafka messages is epoch ms and within the 2 s watermark of ingestion `timestamp`
 - [ ] T047 Run the full `test_stream_monitoring.py` suite; every test passes
@@ -132,6 +137,7 @@ runs against a stub transport until Phase 2.
 
 - [ ] T049 Run `/speckit.analyze` — cross-artifact consistency across `spec.md`, `plan.md`, `tasks.md`. Read-only
 - [ ] T050 Address any CRITICAL or HIGH findings from T049 before merging
+- [ ] T050a Re-run `checklists/requirements.md` against the final spec; close CHK003, CHK013, CHK015, CHK030 or record why each stays open
 - [ ] T051 Run `/code-review high` on the diff — targets what tests cannot see: event-time semantics, the live ingestion path, socket-death reconcile, token re-seed
 - [ ] T052 Address code-review findings
 - [ ] T053 Update `research.md` with final measured numbers, replacing every projection
@@ -145,17 +151,19 @@ runs against a stub transport until Phase 2.
 - **Phase 0 blocks Phase 2.** T006 especially: cutting over before T001 knows
   whether event time shifts risks silent detection damage.
 - **Phase 1 is transport-independent** and can run alongside Phase 0.
-- **Phase 3 depends on the Phase 2 checkpoint** — delete IRC only once EventSub
-  carries traffic.
+- **Phase 3 depends on the T028a gate** — delete IRC only once EventSub carries
+  traffic and the go/no-go check passes.
 - T036 depends on T002. T038 depends on T036. T040 depends on T004.
 - T022 depends on T012 and T018. T025, T025a, T025b depend on T026 (columns must exist).
 - T025b changes poller behaviour that T025a's Flink write feeds; land T025a first.
+- T014b, T014c, T014d test the reconciler and depend on T012–T014.
+- T028a depends on T006, T002, T021, T022.
 
 ## Parallel opportunities
 
 - All four Phase 0 measurement tasks (T001–T004) are independent.
 - Phase 1 and Phase 0 run together.
-- Within Phase 1: T010, T011, T014a (tests) are `[P]` against the implementation tasks.
+- Within Phase 1: T010, T011, T014a, T014d (tests) are `[P]` against the implementation tasks.
 - Within Phase 2: T019a, T021, T025c are `[P]`.
 - T034 is `[P]` in Phase 3.
 

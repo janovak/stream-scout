@@ -60,6 +60,12 @@ yet. Getting them wrong corrupts detection with no error. Phase 0 makes them.
   Plan 06 Phase 2 deliberately adopted); block the feature and pursue webhook
   (only if T001 shows a material, uncorrectable offset).
 - **Clarified 2026-08-27**: this is the chosen rule (spec Clarifications).
+- **Offset direction**: dispatch time is always at or after send time, so the
+  offset is one-signed. A small, steady positive offset shifts every event time
+  later by the same amount — it delays detection slightly but does not distort
+  the relative bucket structure the detector reads. T001 checks the median
+  magnitude against the 2 s tolerance; a wide or unstable spread is the real
+  failure signal, not a constant shift.
 
 ### D4 — Watermark tolerance: 2 s
 

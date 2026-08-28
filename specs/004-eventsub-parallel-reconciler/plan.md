@@ -33,6 +33,7 @@ not need a working system at each intermediate step.
 **Target Platform**: Docker Compose stack; one `stream-monitoring` container; Flink standalone cluster
 **Project Type**: single (backend service plus stream-processing job)
 **Process model**: the reconciler runs as an `asyncio` task inside the existing `stream-monitoring` process, next to the APScheduler poll job — not a separate container. It shares that process's `/health` endpoint and its `jsonlogger` path (constitution: health endpoints, centralized logging)
+**Reconcile cadence**: a continuous loop. Each pass diffs `chat:desired` against the actual set and acts. It wakes on a `chat:desired:generation` bump (poll wrote a new desired set) or after a short idle interval (default 5 s), whichever comes first. One pass never overlaps the next
 **Performance Goals**: cold start to 500 channels under 60 s (target), 120 s (hard ceiling); poll duration flat against desired-set change size
 **Constraints**: 300 subscriptions per websocket connection (measured); `WATERMARK_OUT_OF_ORDERNESS_SECONDS` moves 1 → 2; `chat-messages` Kafka schema unchanged (FR-008)
 **Scale/Scope**: 15/30 channels today; 500 near-term; no hard ceiling by design

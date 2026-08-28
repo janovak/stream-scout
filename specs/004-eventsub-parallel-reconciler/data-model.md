@@ -39,11 +39,16 @@ is written alongside every flip to `FALSE` so the two never disagree.
 database needs a manual `ALTER TABLE streamers ADD COLUMN ...` for both columns.
 This is the same manual step earlier specs needed; the task list calls it out.
 
+Run it in one transaction so a half-apply cannot happen — Postgres DDL is
+transactional:
+
 ```sql
+BEGIN;
 ALTER TABLE streamers ADD COLUMN eventsub_refused_at TIMESTAMPTZ;
 ALTER TABLE streamers ADD COLUMN clipping_disabled_at TIMESTAMPTZ;
 -- backfill so existing disabled rows are not retried immediately as "stale":
 UPDATE streamers SET clipping_disabled_at = NOW() WHERE allows_clipping = FALSE;
+COMMIT;
 ```
 
 ## Redis — desired set
