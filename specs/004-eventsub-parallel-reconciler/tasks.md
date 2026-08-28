@@ -1,108 +1,168 @@
+---
+description: "Task list for EventSub ingestion with a parallel reconciler"
+---
+
 # Tasks: EventSub Ingestion with a Parallel Reconciler
 
-**Input**: `spec.md`, `plan.md`, plus `specs/003-detector-scale-fanout/research.md` §1 for the measured spike data
-**Prerequisites**: PR #41 (configurable thresholds) merged
+**Input**: `spec.md`, `plan.md`, `research.md`, `data-model.md`,
+`contracts/chat-messages.schema.md`. The measured spike data is in
+`specs/003-detector-scale-fanout/research.md` §1.
 
-**Path**: `services/stream-monitoring/`, venv at `.venv` (constitution).
+**Prerequisites**: PR #41 (configurable channel thresholds) is merged and on
+this branch as of the 2026-08-27 merge of `origin/main`.
+
+## Path Conventions
+
+Service code: `services/stream-monitoring/`, venv at `.venv` (constitution).
+Flink code: `services/flink-job/`. Schema: `infrastructure/postgres/init.sql`.
+
+## Format
+
+`- [ ] [TaskID] [P?] [Story?] Description with file path`
+
+- **[P]**: can run in parallel — different files, no dependency on an open task
+- **[US1..US4]**: the user story from `spec.md` the task serves
 
 ---
 
-## Phase 0: Measure before cutting over
+## Phase 0: Measurement gate ⚠️ BLOCKING
 
-**Purpose**: Two design decisions (D3, D4) rest on comparisons nobody has made
-yet. Making them wrong corrupts detection silently.
+**Purpose**: decisions D3 and D4 and the FR-014 warm-up question rest on
+comparisons nobody has made. Getting them wrong corrupts detection silently.
+Phase 0 blocks Phase 2, not Phase 1.
 
-- [ ] T001 **[D3, FR-009]** Run IRC and EventSub side by side on the same channels. For each message, record `tmi-sent-ts` and `metadata.message_timestamp`. Report the distribution of the difference. This decides whether `sent_at` can change source without shifting event time
-- [ ] T002 **[D4]** From T001's EventSub stream, measure delivery-lag percentiles at the target channel count. The 394-channel spike gave p50 154ms / p95 220ms / max 1243ms; confirm at 500 and check whether the tail keeps growing
-- [ ] T003 **[D2]** Measure subscription creation at concurrency 1, 5, 10, 20. Find where 429s begin. The 2.1/s sequential figure is measured; anything above it is projection
-- [ ] T004 **[R1]** Quantify ramp loss: count `received event for unknown subscription` against total during a 500-channel ramp. Decides whether a warm-up gate is needed
-- [ ] T005 Record all four in `research.md` in this feature directory
+- [ ] T001 [US3] **[D3, FR-009]** Run IRC and EventSub side by side on the same 10–20 channels. For each message record IRC `tmi-sent-ts` and the EventSub envelope `metadata.message_timestamp`. Report the distribution of the difference. Write a throwaway script under `services/stream-monitoring/` or `tools/`; do not commit it
+- [ ] T002 [US3] **[D4]** From T001's EventSub stream, measure delivery-lag percentiles at 500 channels. Confirm p50/p95/max against the 394-channel figures (154 ms / 220 ms / 1243 ms) and whether the tail grows past 2 s
+- [ ] T003 **[D2]** Measure subscription-creation throughput at concurrency 1, 5, 10, 20. Find where 429s begin. Anything above the measured 2.1/s sequential figure is projection until this runs
+- [ ] T004 [US3] **[R1, FR-014]** Quantify ramp loss: count `received event for unknown subscription` against total messages during a 500-channel ramp. This decides whether the warm-up gate is built
+- [ ] T005 Record T001–T004 in `specs/004-eventsub-parallel-reconciler/research.md`, replacing the "unmeasured" notes with numbers
+- [ ] T006 **[GATE]** Confirm from T001 that the median dispatch-versus-receive offset is within 2 s. If it is not, stop and revisit D3 (static offset, or webhook) before any Phase 2 work
 
-**Checkpoint**: D2, D3, D4 decided from data.
+**Checkpoint**: D2, D3, D4 decided from data. FR-014 answered.
 
 ---
 
-## Phase 1: The seam (transport-independent)
+## Phase 1: The seam — transport-independent
 
-**Purpose**: Split poller from reconciler. This is the change that fixes the
-cold-start problem, and it would help on IRC too.
+**Purpose**: split the poller from the reconciler. This is the change that
+fixes cold start, and it would help on IRC too. Can start immediately, in
+parallel with Phase 0.
 
-- [ ] T006 Define the Redis desired-set schema — sorted set keyed by rank, so the reconciler can work highest-rank-first
-- [ ] T007 [US2] **[FR-002]** Strip network fan-out from `poll_top_streams`: it computes the desired set, writes it, refreshes online keys, emits lifecycle events, and returns. No joins, no subscribes
-- [ ] T008 [US2] Assert FR-003 with a test: poll duration must not scale with desired-set change size
-- [ ] T009 **[FR-004]** Add `reconciler.py` — diff desired vs actual, bounded concurrency (T003's value), highest rank first
-- [ ] T010 [US4] **[FR-005]** Make the reconciler converge from any starting state: adopt existing subscriptions, never duplicate
-- [ ] T011 [US4] Handle drift — revoked subscriptions recreated, stale ones dropped
-- [ ] T011a **[FR-011]** Assert hysteresis survives the rewrite: a channel entering top JOIN_THRESHOLD is subscribed, and is dropped only after it exits top LEAVE_THRESHOLD. This logic moves from `_manage_chat_connections` into the desired-set computation, so it is easy to lose in the move
-- [ ] T012 Add metrics per FR-012: subscription count, reconcile duration, creation failures, per-connection occupancy
+- [ ] T007 [US2] Define the Redis desired-set layout from `data-model.md`: sorted set `chat:desired` (member = login, score = rank), plus `chat:desired:generation`. Document it in a module docstring in `services/stream-monitoring/reconciler.py`
+- [ ] T008 [US2] **[FR-002, FR-003]** In `services/stream-monitoring/stream_monitoring_service.py`, strip network fan-out from `poll_top_streams`: it ranks, writes `chat:desired` in one `ZADD` + rank trim, refreshes `streamer:online:*` keys, emits lifecycle events, and returns. No joins, no subscribes
+- [ ] T009 [US2] **[FR-011]** Move the hysteresis band (`resolve_thresholds`, JOIN/LEAVE) into the desired-set computation: a login enters `chat:desired` when it reaches top `JOIN_THRESHOLD` and stays until it exits top `LEAVE_THRESHOLD`. Keep `resolve_thresholds` and its validation as-is
+- [ ] T010 [P] [US2] Add a test in `services/stream-monitoring/test_stream_monitoring.py` asserting FR-003: `poll_top_streams` duration does not scale with desired-set change size (0-change vs 500-change poll within noise)
+- [ ] T011 [P] [US2] Add a test asserting FR-011 survives the move: a login entering top `JOIN_THRESHOLD` appears in `chat:desired`; it is removed only after it exits top `LEAVE_THRESHOLD`; the 16–30 band is retained
+- [ ] T012 [US1] **[FR-004]** Add `services/stream-monitoring/reconciler.py`: read `chat:desired`, diff against the in-memory actual set, create/drop highest-rank-first, bounded concurrency (T003's value, default 10, env-configurable), back off on 429. It runs as an `asyncio` task in the existing `stream_monitoring_service.py` process, launched from `start()`, logging through the shared `jsonlogger` — not a separate container
+- [ ] T013 [US4] **[FR-005]** Make the reconciler converge from any starting state: on start-up rebuild the actual set from `get_eventsub_subscriptions()` by **counting pages, not reading `total`** (research trap), and adopt existing subscriptions rather than duplicating
+- [ ] T014 [US4] Handle drift: a subscription that is `revoked` or absent but still wanted is recreated on the next reconcile; one no longer wanted is dropped. A desired-set change mid-reconcile is picked up via `chat:desired:generation`
+- [ ] T014a [P] [US4] **[FR-004, FR-005]** Reconciler unit tests in `services/stream-monitoring/test_stream_monitoring.py`: diff produces the right create/drop set; an already-subscribed channel is adopted, never re-created; a revoked subscription is re-created; a channel that leaves the desired set mid-reconcile is not created
+- [ ] T015 [US1] **[FR-012]** Add Prometheus metrics: `eventsub_subscription_count`, `reconcile_duration_seconds`, `subscription_create_failures_total{reason}`, `eventsub_connection_occupancy{connection}`
+- [ ] T016 [US2] **[FR-012]** Expose reconciler liveness so a stalled or dead reconciler is visible while polls keep succeeding (US2 acceptance scenario 2) — a `reconcile_last_success_timestamp` gauge
 
-**Checkpoint**: The poller is fast and the reconciler owns all network work.
+**Checkpoint**: the poller is fast; the reconciler owns all network work. Still
+runs against a stub transport until Phase 2.
 
 ---
 
 ## Phase 2: EventSub transport
 
-- [ ] T013 Add `user:read:chat` to the token scopes and re-seed. Verified during the spike: re-auth does NOT invalidate the existing token
-- [ ] T014 **[FR-001, FR-006]** Add `eventsub_pool.py` — `EventSubWebsocket` pool, consistent-hash routing, per-connection occupancy against the measured **300** cap (D6)
-- [ ] T015 [US3] **[FR-009]** Map `ChannelChatMessageEvent` to the existing Kafka schema. `sent_at` per T001's finding. Fragments, badges, and cheer need remapping — the shapes differ from IRC
-- [ ] T016 [US3] Assert the published schema is unchanged from what the Flink job consumes (FR-008)
-- [ ] T017 [US1] Wire the reconciler to the pool
-- [ ] T018 [R4] Handle socket death: recreate only that connection's subscriptions
-- [ ] T019 [US4] Tolerate lingering `websocket_disconnected` subscriptions — `DELETE` returns "not found" and Twitch garbage-collects them itself
-- [ ] T020 [D5] **[FR-007]** Persist authorization refusals next to `allows_clipping`; skip them, with a re-check interval
+**Depends on Phase 0 (T006 gate) and Phase 1.**
+
+- [ ] T017 **[FR-001]** Add `user:read:chat` to `services/stream-monitoring/token_manager.py` scopes and re-seed via `seed_twitch_tokens.py`. Re-auth does not invalidate the running token (verified in the spike)
+- [ ] T018 [US1] **[FR-006, D6]** Add `services/stream-monitoring/eventsub_pool.py`: an `EventSubWebsocket` pool with consistent-hash routing by `broadcaster_id`, per-connection occupancy against the measured **300** cap, and pool growth when `desired_count > connections * 300`
+- [ ] T019 [US1] Handle the per-connection `enabled` count reported wrong by the library: track occupancy locally from create/drop, do not re-read it each cycle
+- [ ] T019a [P] [US1] **[FR-006]** `eventsub_pool.py` unit tests: consistent-hash routing puts a `broadcaster_id` on the same connection across reconciles; occupancy never exceeds 300; the pool grows a connection when `desired_count > connections * 300`
+- [ ] T020 [US3] **[FR-009]** Map `ChannelChatMessageEvent` to the `chat-messages` schema per `contracts/chat-messages.schema.md`. Convert the RFC 3339 `metadata.message_timestamp` to epoch ms for `sent_at`. Remap `badges`, `is_subscriber`, `is_mod` from `event.badges`; keep `emotes` `{}`
+- [ ] T021 [P] [US3] **[FR-008]** Add a test asserting a mapped EventSub message and a mapped IRC message produce the same JSON keys and the same types for `sent_at` (int or null, never str), `broadcaster_id`, and `text`
+- [ ] T022 [US1] Wire the reconciler (T012) to the pool (T018): create = subscribe on the routed connection; drop = unsubscribe; publish `on_message` to Kafka `chat-messages` via the existing producer path
+- [ ] T023 [US4] **[R4]** Handle socket death: recreate only that connection's subscriptions, driven by the next reconcile; alert path is the `eventsub_subscription_count` drop (T015)
+- [ ] T024 [US4] Tolerate lingering `websocket_disconnected` subscriptions: a `DELETE` returning "not found" is logged at debug and treated as success, not an error
+- [ ] T025 [US3] **[D5, FR-007]** Add `eventsub_refused_at TIMESTAMPTZ` handling in `reconciler.py`: on `subscription missing proper authorization`, set it to `NOW()` and skip the channel. Skip any channel with a non-null `eventsub_refused_at` unless it is more than 7 days old, then retry once (success clears it to `NULL`)
+- [ ] T025a [US3] **[FR-013]** In `services/flink-job/clip_detector_job.py`, when the job sets `allows_clipping = FALSE`, also set `clipping_disabled_at = NOW()` in the same `UPDATE`. On a later successful clip for a broadcaster whose flag is `FALSE`, set `allows_clipping = TRUE, clipping_disabled_at = NULL`
+- [ ] T025b [US3] **[FR-013]** In `stream_monitoring_service.py` `_get_clipping_disabled_ids`, exclude rows whose `clipping_disabled_at < NOW() - INTERVAL '7 days'` from the disabled set, so a stale-disabled streamer re-enters ranking and gets one more clip attempt
+- [ ] T025c [P] [US3] **[FR-007, FR-013]** Tests: a refusal newer than 7 days is skipped, one older is retried; a `clipping_disabled_at` older than 7 days re-enters ranking; a fresh failure resets the timestamp
+- [ ] T026 **[migration]** Add both new columns to `infrastructure/postgres/init.sql` (`eventsub_refused_at`, `clipping_disabled_at`) and record the manual `ALTER TABLE` + backfill from `data-model.md` in `OPERATIONS.md` — `init.sql` runs only on a fresh database
+- [ ] T027 **[deployment wiring]** Add `COPY reconciler.py` and `COPY eventsub_pool.py` to `services/stream-monitoring/Dockerfile`, and bind-mount both in `docker-compose.yml`. A new module is invisible without both (same class of gap as the Flink `-pyFiles` list)
+- [ ] T028 **[deployment wiring]** Update the `user:read:chat` scope note in `docker-compose.yml` where the current scopes are documented
+
+**Checkpoint**: EventSub carries live traffic to Kafka.
+
+---
 
 ## Phase 3: Remove IRC
 
-**No dual-transport period — the operator does not need intermediate
-compatibility.** Doing this properly is what keeps the service simple.
+**No dual-transport period.** Delete IRC once EventSub carries traffic
+(Phase 2 checkpoint met). This is what keeps the service simple.
 
-- [ ] T021 **[FR-001]** Delete `_manage_chat_connections`, `joined_channels`, `_on_chat_ready`, `_on_chat_message`, and the `Chat` client
-- [ ] T022 Delete `DEAD_CHAT_CONFIRMATION_POLLS` and the dead-chat recovery path — it exists only for IRC's connection-oriented membership
-- [ ] T023 Delete `patches/twitchapi_leave_room_timeout.py` and its Dockerfile wiring. It works around a PART-confirmation hang that EventSub cannot have
-- [ ] T024 Remove `chat:read` from required scopes if nothing else needs it
-- [ ] T025 Update `KNOWN_ISSUES.md` — several entries are IRC-specific and become moot
+- [ ] T029 **[FR-001]** Delete `_manage_chat_connections`, `joined_channels`, `_on_chat_ready`, `_on_chat_message`, the `Chat` client, and the `ChatEvent`/`Chat` imports from `stream_monitoring_service.py`
+- [ ] T030 Delete `DEAD_CHAT_CONFIRMATION_POLLS`, `_consecutive_dead_chat_polls`, and the dead-chat recovery path — it exists only for IRC's connection-oriented membership
+- [ ] T031 Delete `services/stream-monitoring/patches/twitchapi_leave_room_timeout.py` and its two Dockerfile lines (`COPY` + `RUN`). It works around a PART-confirmation hang EventSub cannot have
+- [ ] T032 Remove `CHAT_READ` from the scope mapping in `stream_monitoring_service.py` and `chat:read` from required scopes if nothing else needs it (T017 added `user:read:chat`)
+- [ ] T033 Delete the `GET_STREAMS_TIMEOUT_SECONDS` chat-hang comment block that references the deleted patch; keep the timeout itself
+- [ ] T034 [P] Remove IRC-specific tests from `test_stream_monitoring.py` (join/leave, dead-connection recovery, hysteresis-via-`_manage_chat_connections`); the FR-011 behaviour is now covered by T011
+- [ ] T035 Update `KNOWN_ISSUES.md` — IRC-specific entries (the JOIN bucket, the `leave_room` hang, dead-chat recovery) become moot. It is untracked in git; edit it in place
+
+---
 
 ## Phase 4: Watermark and detection
 
-- [ ] T026 **[D4, FR-010]** Set `WATERMARK_OUT_OF_ORDERNESS_SECONDS` from T002. Do not inherit the IRC value by default. Record the accepted late-drop rate (SC-005)
-- [ ] T027 [US3] Confirm the detector behaves unchanged: replay a post-cutover capture and compare anomaly rates against the pre-cutover corpus. Not byte-identical — the input differs — but the rate and character must be consistent
-- [ ] T028 [R1] Add a warm-up gate if T004 shows meaningful ramp loss
+- [ ] T036 [US3] **[D4, FR-010]** Set `WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2` in `services/flink-job/spike_detector.py`. Update the comment to cite the T002 measurement, not KNOWN_ISSUES Issue 4. `clip_detector_job.py` and `tools/replay.py` read the same constant
+- [ ] T037 [US3] Update the KNOWN_ISSUES Issue 4 "Post-deploy validation" delay arithmetic for the +1 s change
+- [ ] T038 [US3] **[SC-005]** Measure the residual late-drop rate at 500 channels with the 2 s watermark. Record it in `research.md`. It must be below 0.1%
+- [ ] T039 [US3] **[US3 Independent Test]** Replay a post-cutover capture through `tools/replay.py` and compare anomaly rate and character against the pre-cutover corpus. Not byte-identical — the input differs — but the rate and shape must be consistent
+- [ ] T040 [US3] **[R1, FR-014]** Add a per-channel warm-up gate that withholds a channel's baseline until its subscription is settled — **only if** T004 showed the ramp loss distorts detection. If T004 was clean, note that here and skip
+
+---
 
 ## Phase 5: Verify
 
-- [ ] T029 [SC-001] Cold start to 500 channels under 60 s
-- [ ] T030 [SC-002] Poll duration flat against change size
-- [ ] T031 [SC-003] No `Bucket channel_join got rate limited` anywhere — the bucket is gone
-- [ ] T032 [SC-004] 500 channels sustained, subscription count stable
-- [ ] T033 [SC-006] Restart mid-ramp converges with no duplicates
-- [ ] T034 Full test suite passes
+- [ ] T041 [US1] **[SC-001]** Cold start to 500 channels: measure time to full coverage. Target under 60 s; fail over 120 s
+- [ ] T042 [US2] **[SC-002]** Poll duration flat against desired-set change size (re-run T010 at 500 channels live)
+- [ ] T043 **[SC-003]** No `Bucket channel_join got rate limited` anywhere in the logs — the IRC bucket is gone
+- [ ] T044 [US1] **[SC-004]** 500 channels sustained for 30+ minutes: subscription count stable, no unexplained drift
+- [ ] T045 [US4] **[SC-006]** Kill the service mid-ramp, restart, confirm convergence with no duplicate subscriptions
+- [ ] T046 [US3] Confirm `sent_at` in live Kafka messages is epoch ms and within the 2 s watermark of ingestion `timestamp`
+- [ ] T047 Run the full `test_stream_monitoring.py` suite; every test passes
+- [ ] T048 Run `test_replay.py` and `test_spike_detector.py` unmodified after the T036 constant change; adjust only tests that assert the old `1` value, and only to `2`
 
-## Phase 6: Review
+---
 
-- [ ] T035 `/speckit.analyze` — cross-artifact consistency
-- [ ] T036 `/code-review high` — this is a large change touching event-time semantics and a live ingestion path
-- [ ] T037 Address findings
+## Phase 6: Review and handoff
+
+- [ ] T049 Run `/speckit.analyze` — cross-artifact consistency across `spec.md`, `plan.md`, `tasks.md`. Read-only
+- [ ] T050 Address any CRITICAL or HIGH findings from T049 before merging
+- [ ] T051 Run `/code-review high` on the diff — targets what tests cannot see: event-time semantics, the live ingestion path, socket-death reconcile, token re-seed
+- [ ] T052 Address code-review findings
+- [ ] T053 Update `research.md` with final measured numbers, replacing every projection
+- [ ] T054 Record in `spec.md` Out of Scope that the clip-budget-and-ranking feature (spec 005) is now the next ceiling, carrying `research.md` §1 and §3 forward
+- [ ] T055 Update `OPERATIONS.md` and `QUICKSTART.md` for the transport change (no IRC, the reconciler process, the `user:read:chat` scope, the manual `ALTER TABLE`)
 
 ---
 
 ## Dependencies
 
-- **Phase 0 blocks Phase 2.** T001 (timestamp comparison) especially: cutting
-  over before knowing whether event time shifts risks silent detection damage.
-- Phase 1 is transport-independent and can start immediately.
-- Phase 3 depends on Phase 2 working — delete IRC only once EventSub carries
-  traffic.
-- T026 depends on T002.
+- **Phase 0 blocks Phase 2.** T006 especially: cutting over before T001 knows
+  whether event time shifts risks silent detection damage.
+- **Phase 1 is transport-independent** and can run alongside Phase 0.
+- **Phase 3 depends on the Phase 2 checkpoint** — delete IRC only once EventSub
+  carries traffic.
+- T036 depends on T002. T038 depends on T036. T040 depends on T004.
+- T022 depends on T012 and T018. T025, T025a, T025b depend on T026 (columns must exist).
+- T025b changes poller behaviour that T025a's Flink write feeds; land T025a first.
 
 ## Parallel opportunities
 
-- Phase 0 measurement tasks are independent of each other.
-- Phase 1 (the seam) and Phase 0 (measurement) can proceed together.
+- All four Phase 0 measurement tasks (T001–T004) are independent.
+- Phase 1 and Phase 0 run together.
+- Within Phase 1: T010, T011, T014a (tests) are `[P]` against the implementation tasks.
+- Within Phase 2: T019a, T021, T025c are `[P]`.
+- T034 is `[P]` in Phase 3.
 
 ## Scope discipline
 
-`spec.md` Out of Scope lists the `ClipCreator` thread-and-budget problem. It is
-real, it will bite at 500 channels, and it is **not** part of this feature. A
-larger monitored set produces more anomalies than Twitch will let you clip, so
-the fix is ranking against a scarce budget — a design change worth its own
-spec. Resist pulling it in here.
+`spec.md` Out of Scope lists `ClipCreator`'s unbounded threads and the missing
+clip budget. It is real and it will bite at 500 channels — a larger monitored
+set detects more anomalies than Twitch will let you clip. The fix is ranking
+against a scarce budget, which is a design change and its own spec (005). Do not
+pull it in here.

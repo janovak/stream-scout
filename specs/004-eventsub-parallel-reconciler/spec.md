@@ -39,6 +39,29 @@ IRC path is **removed**, not kept behind a flag. No dual-transport period, no
 migration dance. This is a deliberate simplification and it removes most of the
 complexity this feature would otherwise carry.
 
+## Clarifications
+
+### Session 2026-08-27
+
+- Q: What is the acceptable late-event drop rate at the chosen watermark? → A:
+  Set `WATERMARK_OUT_OF_ORDERNESS_SECONDS` to 2 (from 1). A 2 s tolerance
+  clears the measured 1243 ms maximum delivery lag at 394 channels with margin.
+  Record the residual late-drop rate. It MUST stay below 0.1%.
+- Q: Is the 60 s cold-start figure a hard gate or a target? → A: 60 s is the
+  target. 120 s is the hard ceiling and the fail line. The primary bar is to
+  beat the ~250 s IRC baseline by a wide margin.
+- Q: How does an authorization refusal leave the skip cache? → A: A 7-day
+  re-check. Store the time of the refusal. Retry a refusal once it is more than
+  7 days old. Apply the same 7-day re-check to the existing `allows_clipping`
+  skip, so both conditions self-heal.
+- Q: What is the event-time source for `sent_at`? → A: The envelope field
+  `metadata.message_timestamp` (dispatch time). Cut over only if Phase 0 task
+  T001 shows the median dispatch-versus-receive offset is within the 2 s
+  watermark tolerance.
+- Q: Is a ramp-window warm-up gate required? → A: Only if Phase 0 task T004
+  shows the "received event for unknown subscription" loss is large enough to
+  distort detection. If the loss is small, accept it.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Cold start is fast at large channel counts (Priority: P1)
@@ -56,8 +79,8 @@ channels and measure time to full coverage.
 **Acceptance Scenarios**:
 
 1. **Given** a cold start targeting 500 channels, **When** the reconciler runs,
-   **Then** full coverage is reached in well under the IRC equivalent (~250 s),
-   with a target of under 60 s.
+   **Then** full coverage is reached in under 60 s (target) and never more than
+   120 s (hard ceiling), against the IRC equivalent of ~250 s.
 2. **Given** subscription creation is in progress, **When** a poll tick occurs,
    **Then** the poll completes normally and is not blocked or skipped.
 
@@ -95,8 +118,9 @@ distribution before and after.
 
 1. **Given** an EventSub message, **When** it is published to Kafka, **Then**
    its schema matches what the Flink job consumes today.
-2. **Given** measured delivery lag, **When** the watermark tolerance is set,
-   **Then** late-event drops stay below an agreed threshold.
+2. **Given** the watermark tolerance is set to 2 s, **When** delivery lag is
+   measured at the target channel count, **Then** late-event drops stay below
+   0.1%.
 
 ### User Story 4 - Subscriptions survive restarts and drift (Priority: P2)
 
@@ -115,15 +139,16 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
 ### Edge Cases
 
 - A channel refuses subscription with `subscription missing proper
-  authorization`. Measured at ~1.5% of channels (6 of 400). These must be
-  remembered and skipped, like clipping-disabled streamers already are, not
-  retried every cycle.
+  authorization`. Measured at ~1.5% of channels (6 of 400). Record the refusal
+  with its time and skip the channel, like clipping-disabled streamers already
+  are. Retry the refusal only once it is more than 7 days old.
 - A websocket connection dies holding up to 300 subscriptions.
 - Subscriptions linger as `websocket_disconnected` after a socket closes, and
   `DELETE` on them returns "not found".
 - Events arrive for a subscription the library has not yet registered — the
   library logs `received event for unknown subscription with ID ...` during a
-  ramp, and drops them.
+  ramp, and drops them. Phase 0 task T004 measures this loss. A warm-up gate is
+  added only if the loss is large enough to distort detection.
 - The desired set changes while a reconcile is in flight.
 - A channel appears in the desired set, then leaves before its subscription
   completes.
@@ -143,19 +168,30 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   existing subscriptions rather than duplicating them.
 - **FR-006**: The system MUST distribute subscriptions across websocket
   connections, respecting the measured **300 per connection** cap.
-- **FR-007**: Channels that refuse authorization MUST be recorded and skipped
-  on later cycles.
+- **FR-007**: Channels that refuse authorization MUST be recorded with the time
+  of the refusal and skipped on later cycles. A refusal MUST be retried once it
+  is more than 7 days old.
 - **FR-008**: Published Kafka messages MUST keep the schema the Flink job
   consumes today, including a `sent_at` field.
-- **FR-009**: The event-time source for `sent_at` MUST be defined explicitly,
-  given that `ChannelChatMessageData` carries no timestamp and the envelope's
-  `metadata.message_timestamp` is a dispatch time, not IRC's `tmi-sent-ts`.
-- **FR-010**: The watermark out-of-orderness tolerance MUST be set from
-  measured EventSub delivery lag, not inherited from the IRC value.
+- **FR-009**: The event-time source for `sent_at` MUST be the envelope field
+  `metadata.message_timestamp` (dispatch time), because `ChannelChatMessageData`
+  carries no timestamp. Cutover MUST proceed only if Phase 0 task T001 shows the
+  median dispatch-versus-receive offset is within the 2 s watermark tolerance.
+- **FR-010**: `WATERMARK_OUT_OF_ORDERNESS_SECONDS` MUST be set to 2, replacing
+  the IRC-era value of 1. The residual late-event drop rate MUST be measured at
+  the target channel count and MUST stay below 0.1%.
 - **FR-011**: Hysteresis (join at `JOIN_THRESHOLD`, leave at `LEAVE_THRESHOLD`)
   MUST be preserved.
 - **FR-012**: Prometheus metrics MUST cover subscription count, reconcile
-  duration, creation failures, and per-connection utilisation.
+  duration, creation failures, per-connection occupancy, and the time of the
+  last successful reconcile (so a stalled reconciler is visible while polls
+  keep succeeding).
+- **FR-013**: The existing `allows_clipping` skip MUST also self-heal on the
+  same 7-day re-check, so a streamer that re-enables clipping is retried rather
+  than skipped forever.
+- **FR-014**: A per-channel warm-up gate that withholds a channel's baseline
+  until its subscription is settled MUST be added only if Phase 0 task T004
+  shows the ramp-window event loss is large enough to distort detection.
 
 ### Key Entities
 
@@ -163,20 +199,23 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
 - **Actual set**: the subscriptions that currently exist.
 - **Reconciler**: the component driving actual toward desired.
 - **Connection pool**: websocket connections, each holding up to 300 subs.
+- **Skip record**: a streamer marked unusable for a reason (clipping disabled,
+  or EventSub authorization refused), with the time the mark was set. A mark
+  older than 7 days is retried.
 
 ## Success Criteria *(mandatory)*
 
 ### Measurable Outcomes
 
-- **SC-001**: Cold start to 500 channels completes in under 60 s (IRC baseline
-  ~250 s).
+- **SC-001**: Cold start to 500 channels completes in under 60 s (target) and
+  in no more than 120 s (hard ceiling), against an IRC baseline of ~250 s.
 - **SC-002**: Poll duration does not scale with desired-set change size.
 - **SC-003**: No `Bucket channel_join got rate limited` — the IRC bucket is
   gone entirely.
 - **SC-004**: Sustained 500 channels with subscription count stable and no
   unexplained drift.
-- **SC-005**: Late-event drop rate at the chosen watermark tolerance stays
-  below an agreed threshold.
+- **SC-005**: With `WATERMARK_OUT_OF_ORDERNESS_SECONDS` at 2, the late-event
+  drop rate at 500 channels stays below 0.1%.
 - **SC-006**: A restart mid-ramp converges without duplicate subscriptions.
 
 ## Out of Scope
@@ -188,4 +227,5 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   which is a design change. Candidate for 005.
 - The detector state work in 003, which measurement deflated.
 - Kafka partition and Flink parallelism re-provisioning.
-- Webhook transport, unless websocket proves insufficient (see `plan.md`).
+- Webhook transport, unless websocket proves insufficient (see `research.md`
+  decision D1).

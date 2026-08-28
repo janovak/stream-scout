@@ -1,149 +1,129 @@
 # Implementation Plan: EventSub Ingestion with a Parallel Reconciler
 
 **Branch**: `004-eventsub-parallel-reconciler` | **Date**: 2026-08-27 | **Spec**: [spec.md](./spec.md)
+**Input**: Feature specification from `/specs/004-eventsub-parallel-reconciler/spec.md`
 
 ## Summary
 
-Split the stream-monitoring service into a **poller** (decides what should be
-watched, never blocks) and a **reconciler** (makes it so, in parallel, out of
-band). Swap the transport underneath from IRC to EventSub websockets.
+Chat ingestion runs over IRC today. The Twitch JOIN limit is 20 per 10 seconds
+per account, and it blocks rather than fails. That limit caps how many channels
+the system can watch, and no extra connection or machine moves it.
+
+This feature makes two changes that only deliver value together:
+
+1. **Transport**: replace IRC with EventSub `channel.chat.message` websockets.
+   This removes the ceiling. Subscriptions cost 0 against the budget.
+2. **Structure**: move subscription management out of the poll job into a
+   long-lived parallel reconciler. The poller writes intent. The reconciler
+   owns all network fan-out and creates subscriptions concurrently.
+
+The transport swap alone buys almost nothing at cold start: measured sequential
+EventSub creation is 2.1/s, about the same as IRC's 2/s. The win needs parallel
+creation *and* the move out of the poll tick.
+
+IRC is removed outright. There is no dual-transport period. The operator does
+not need a working system at each intermediate step.
 
 ## Technical Context
 
-**Language/Version**: Python 3.10/3.11, twitchAPI 4.5.0
-**Primary Dependencies**: `twitchAPI.eventsub.websocket.EventSubWebsocket`, Redis, confluent-kafka
-**Storage**: Redis (desired set, refusal cache), Postgres (streamers)
-**Testing**: pytest — `test_stream_monitoring.py`
-**Constraints**: 300 subscriptions per websocket connection (measured)
-**Scale/Scope**: 500 channels near-term, no hard ceiling by design
+**Language/Version**: Python 3.11 (`services/stream-monitoring`); Python 3.10 (PyFlink job, unchanged)
+**Primary Dependencies**: `twitchAPI` 4.5.0 (`twitchAPI.eventsub.websocket.EventSubWebsocket`), `redis`, `confluent-kafka`, `apscheduler`, `psycopg2`
+**Storage**: Redis (desired set, per-connection routing hints); Postgres (`streamers` table — adds refusal and re-check columns); Flink keyed state (unchanged)
+**Testing**: pytest — `services/stream-monitoring/test_stream_monitoring.py`; Flink side `test_replay.py`, `test_spike_detector.py`
+**Target Platform**: Docker Compose stack; one `stream-monitoring` container; Flink standalone cluster
+**Project Type**: single (backend service plus stream-processing job)
+**Process model**: the reconciler runs as an `asyncio` task inside the existing `stream-monitoring` process, next to the APScheduler poll job — not a separate container. It shares that process's `/health` endpoint and its `jsonlogger` path (constitution: health endpoints, centralized logging)
+**Performance Goals**: cold start to 500 channels under 60 s (target), 120 s (hard ceiling); poll duration flat against desired-set change size
+**Constraints**: 300 subscriptions per websocket connection (measured); `WATERMARK_OUT_OF_ORDERNESS_SECONDS` moves 1 → 2; `chat-messages` Kafka schema unchanged (FR-008)
+**Scale/Scope**: 15/30 channels today; 500 near-term; no hard ceiling by design
 
 ## Constitution Check
 
+*GATE: must pass before Phase 0 research. Re-checked after Phase 1 design.*
+
 | Principle | Status |
 |---|---|
-| Kafka for inter-service messaging | Unchanged — same topics, same schema |
-| Postgres exclusively for persistence | Unchanged |
-| PyFlink for stream processing | Unchanged — but see D3, event-time semantics |
-| Prometheus metrics | Extended (FR-012) |
-| **No data loss in the pipeline** | **At risk — see R1 and D3** |
-| Filter bot commands | Unchanged (Flink-side) |
+| Kafka for all inter-service messaging | Unchanged — same `chat-messages` and `stream-lifecycle` topics, same schema |
+| Postgres exclusively for persistence | Unchanged — refusal state is two new columns on `streamers`, not a new store |
+| PyFlink for stream processing | Unchanged — the job keeps its code; only `WATERMARK_OUT_OF_ORDERNESS_SECONDS` changes |
+| Twitch API integration | Unchanged in principle — transport moves from IRC to EventSub, still one Twitch account |
+| Prometheus metrics | Extended — subscription count, reconcile duration, creation failures, per-connection occupancy (FR-012) |
+| Grafana / Loki observability | Unchanged — same structured-log path |
+| **No data loss in the pipeline** | **At risk** — see research R1 (ramp-window drops) and R2 (event-time shift). Both are measured in Phase 0 before cutover |
+| Health check endpoints | Unchanged — `/health` on 8080 stays |
+| Filter bot commands | Unchanged — `CommandFilter` is Flink-side and untouched |
 | Python virtual environments | `services/stream-monitoring/.venv` |
 
-## Architecture
-
-```
-                 ┌──────────────┐
-   Helix         │   Poller     │   every POLL_INTERVAL_SECONDS
-   get_streams ─▶│              │   - rank, filter clip-disabled
-                 │  (fast, no   │   - write desired set + rank
-                 │   network    │   - refresh Redis online keys
-                 │   fan-out)   │
-                 └──────┬───────┘
-                        │ desired set (Redis sorted set, by rank)
-                        ▼
-                 ┌──────────────┐
-                 │ Reconciler   │   long-lived, independent of poll ticks
-                 │              │   - diff desired vs actual
-                 │ bounded      │   - create/drop, highest rank first
-                 │ concurrency  │   - route to a connection with room
-                 └──────┬───────┘
-                        │
-                        ▼
-              ┌──────────────────────┐
-              │ EventSub WS pool     │  N sockets x 300 subs
-              │  on_message ─────────┼──▶ Kafka `chat-messages`
-              └──────────────────────┘
-```
-
-The seam matters more than the transport. The poller writes intent; the
-reconciler owns all network fan-out. That is what makes FR-003 achievable and
-it is why the same design would have helped on IRC.
-
-## Design decisions to make (these are the real work)
-
-### D1 — Transport: websocket or webhook
-
-**Recommend websocket.** No public ingress, no TLS cert, no challenge
-handshake, and the library handles reconnect. Cost: ~300 subs per connection
-and subscriptions die with the socket.
-
-Webhook has a higher ceiling and server-side persistence across restarts, but
-needs a public HTTPS endpoint. Revisit only if the connection pool becomes
-unwieldy — that is a long way past 500.
-
-### D2 — Reconciler concurrency
-
-Measured: sequential is 2.1 subs/s, p50 421 ms per POST, **zero 429s** across
-394 creations. So the limit is latency, not rate — but the safe concurrency is
-**unmeasured**. Start at 10 (projecting ~20/s, 500 channels in ~25 s), watch
-for 429s, and tune. Do not assume the projection; it is arithmetic, not data.
-
-### D3 — `sent_at` semantics ⚠️ the subtle one
-
-`SentAtTimestampAssigner` drives Flink's event time from `sent_at`, which today
-is IRC's `tmi-sent-ts` — when Twitch *received* the message.
-
-**`ChannelChatMessageData` has no timestamp field at all.** The only per-message
-time is `metadata.message_timestamp` on the EventSub envelope, which is when
-Twitch *dispatched* the event. These are different quantities.
-
-They should track closely, but "should" is not evidence. This must be measured
-against the IRC stream before cutover, because a silent shift in event time
-would corrupt anomaly detection without any error surfacing.
-
-### D4 — Watermark tolerance
-
-`WATERMARK_OUT_OF_ORDERNESS_SECONDS = 1` (commit `4ce10e0`). Measured EventSub
-lag at 394 channels: p50 154 ms, p95 220 ms, **max 1243 ms** — the tail already
-breaches 1 s, and the tail grew with fan-out (max was 366 ms at 2 channels).
-
-Choose deliberately: raise the tolerance and accept later detection, or keep it
-and accept a measured drop rate. **Do not leave this to inertia.**
-
-### D5 — Refusal cache
-
-~1.5% of channels refuse with `subscription missing proper authorization`.
-Store alongside the existing `allows_clipping` flag in Postgres, so refusals are
-skipped rather than retried every cycle. Consider a re-check interval — a
-refusal may not be permanent.
-
-### D6 — Connection pool routing
-
-Route by consistent hash so a channel lands on the same connection across
-reconciles. On socket death, only that connection's subscriptions need
-recreating. Track per-connection occupancy against the 300 cap.
-
-## Risks
-
-| ID | Risk | Mitigation |
-|---|---|---|
-| R1 | Events dropped during ramp — the library logs `received event for unknown subscription` | Warm-up period before trusting a channel's baseline; quantify the loss |
-| R2 | D3 shifts event time silently and corrupts detection | Measure both timestamps side by side before cutover |
-| R3 | Concurrency triggers 429s not seen sequentially | Start low, back off on 429, make it configurable |
-| R4 | Socket death drops 300 channels at once | Hash routing plus fast reconcile; alert on subscription count drop |
-| R5 | Removing IRC leaves no fallback if EventSub misbehaves in production | Deliberate — the operator accepted no intermediate compatibility. `git revert` is the fallback |
+No principle is violated by design. The two "at risk" items are gated by Phase 0
+measurement, not accepted blind. If Phase 0 shows either would corrupt
+detection, cutover does not proceed on this design (research R2, decision D3).
 
 ## Project Structure
 
+### Documentation (this feature)
+
+```text
+specs/004-eventsub-parallel-reconciler/
+├── plan.md              # This file
+├── research.md          # Phase 0 — decisions D1–D6, risks R1–R5, measurement tasks
+├── data-model.md        # Phase 1 — desired set, skip records, connection routing
+├── contracts/
+│   └── chat-messages.schema.md   # the Kafka schema that MUST NOT change (FR-008)
+└── tasks.md             # Phase 2 — /speckit.tasks output
 ```
+
+### Source Code (repository root)
+
+```text
 services/stream-monitoring/
-├── stream_monitoring_service.py   # poller; loses all chat/join logic
-├── reconciler.py                  # NEW — desired vs actual, parallel
-├── eventsub_pool.py               # NEW — connection pool, hash routing
+├── stream_monitoring_service.py   # poller — loses all chat/join logic; keeps Helix, Redis, Postgres, lifecycle
+├── reconciler.py                  # NEW — diff desired vs actual, bounded concurrency, highest rank first
+├── eventsub_pool.py               # NEW — EventSubWebsocket pool, consistent-hash routing, 300-cap occupancy
 ├── token_manager.py               # +user:read:chat scope
-└── test_stream_monitoring.py
+├── test_stream_monitoring.py      # extended — poll-does-not-block, hysteresis-survives, reconciler convergence
+├── Dockerfile                     # +COPY reconciler.py eventsub_pool.py; drop the patches/ step
+└── patches/twitchapi_leave_room_timeout.py   # DELETED in Phase 3
+
+services/flink-job/
+└── spike_detector.py              # WATERMARK_OUT_OF_ORDERNESS_SECONDS: 1 → 2
+
+infrastructure/postgres/
+└── init.sql                       # +eventsub_refused_at, +clipping_disabled_at on streamers
+
+docker-compose.yml                 # +bind-mounts for reconciler.py, eventsub_pool.py; +user:read:chat note
 ```
 
-**Structure Decision**: New modules rather than growing
-`stream_monitoring_service.py`, which is already ~660 lines and carries most of
-the service's hard-won edge-case comments. The poller keeps its Helix, Redis,
-Postgres, and lifecycle-event logic; it loses `_manage_chat_connections`,
-`joined_channels`, the dead-chat detection, and the `patches/` workaround —
-all of which exist only because of IRC's connection-oriented membership model.
+**Structure Decision**: New modules, not growth of `stream_monitoring_service.py`.
+That file is ~700 lines and carries most of the service's hard-won edge-case
+comments. The poller keeps its Helix, Redis, Postgres, and lifecycle-event
+logic. It loses `_manage_chat_connections`, `joined_channels`, `_on_chat_ready`,
+`_on_chat_message`, the dead-chat detection, and `patches/` — all of which exist
+only because of IRC's connection-oriented membership model. `resolve_thresholds`
+and the hysteresis band it validates stay; the band now feeds the desired-set
+computation instead of the join loop.
 
-## Token scope change
+### Deployment wiring (do not skip)
 
-The current token has `chat:read` and `clips:edit`. EventSub needs
-`user:read:chat`. A superset token already exists from the spike (see
-003 `research.md`). Re-seeding does **not** invalidate the existing token —
-that was verified during the spike, with production running throughout.
+`stream-monitoring` mounts each source file by name in `docker-compose.yml` and
+copies each by name in the `Dockerfile`. A new module is invisible until both
+are updated. This is the same class of gap that bit the Flink job's `-pyFiles`
+list in earlier specs. `reconciler.py` and `eventsub_pool.py` each need a
+`COPY` line and a bind-mount entry.
+
+## Phase Overview
+
+| Phase | Purpose | Gate |
+|---|---|---|
+| 0 — Measure | Run IRC and EventSub side by side. Decide D2, D3, D4, and the R1 warm-up question from data | Blocks Phase 2 |
+| 1 — The seam | Split poller from reconciler. Transport-independent. Fixes cold start on its own | Poller fast; reconciler owns network work |
+| 2 — EventSub transport | Token scope, connection pool, message mapping, wire the reconciler to the pool | EventSub carries live traffic |
+| 3 — Remove IRC | Delete the `Chat` client, dead-chat detection, and the `patches/` workaround. No dual-transport period | Service is simpler, not just changed |
+| 4 — Watermark and detection | Set `WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2`. Confirm the detector behaves unchanged. Add a warm-up gate only if T004 requires it | Late-drop rate < 0.1% |
+| 5 — Verify | The six success criteria | All SC pass |
+| 6 — Review | `/speckit.analyze`, `/code-review high`, address findings | Clean |
+
+## Complexity Tracking
+
+No constitution violation needs justification. The one deliberate simplification
+— removing IRC with no compatibility flag — reduces complexity rather than
+adding it, and the operator has accepted the trade (research R5).
