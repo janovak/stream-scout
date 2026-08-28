@@ -42,6 +42,111 @@ watermark → **PASS. Phase 2 unblocked.**
   create POST returning (`websocket.py` `_subscribe`), so the ramp race the 003
   spike saw does not reproduce here. If the library is upgraded, re-check T004.
 
+## Phase 2 — T028a go/no-go gate for IRC removal (2026-08-28)
+
+Phase 3 deletes IRC outright. R5 accepted that there is no intermediate
+fallback — `git revert` of the branch is the fallback — so this gate is the
+evidence taken before the thing we would fall back to is deleted.
+
+EventSub replaced IRC in production at **16:43:40Z**. The soak ran to
+**18:43:40Z** on the post-code-review build, sampling every minute.
+
+| Condition | Status |
+|---|---|
+| **T006** event-time gate | **PASS** (Phase 0): median dispatch-vs-send offset 1 ms over 24,473 joined messages |
+| **T002** delivery-lag tail under 2 s | **PASS at the operating point, NOT re-confirmed at 500.** See below |
+| **≥ 2 h live traffic, `eventsub_subscription_count` stable** | **PASS**: 92 min at 19–21 channels, 91 samples, `subs == desired` on every one |
+| **T021** schema test | **PASS**: green in `test_stream_monitoring.py`, and confirmed live (below) |
+
+### What the soak measured
+
+- **Subscription stability**: 91 one-minute samples, `eventsub_subscription_count`
+  equal to `ZCARD chat:desired` in **all 91**. Deviation 0%, against the SC-004
+  budget of ±1%. The count moved 19 → 20 → 21 with the desired set and never
+  lagged it by more than one sample interval.
+- **Failures**: `subscription_create_failures_total` stayed empty for the whole
+  soak — no 429, no refusal, no error. `eventsub_refused_at` is still NULL for
+  every row, so nothing was wrongly marked.
+- **Reconcile cost**: 1,383 passes; 1,017 of the first 1,020 under 0.5 s, the
+  rest under 1 s apart from the 3.4 s cold start. Mean 113 ms.
+- **Throughput**: 231,095 messages into `chat-messages` over the soak,
+  2,465/min average (2,468–2,756 across the three 30-minute marks).
+- **Resources**: 50.8 MiB RSS, 20 file descriptors, 17 threads, flat. No leak
+  signature from the retire path.
+
+### The reconnect path was exercised for real
+
+At **16:52:42Z** the socket missed its keepalive and the library reconnected,
+re-subscribing all 18 channels with **new subscription ids**. This is the path
+the post-review fixes address (`_live_subscription_ids`, `_forget_unrecognised`),
+and it is the one no unit test can fully stand in for.
+
+Checked directly against Twitch afterwards by walking the subscription pages:
+**20 enabled, all on one session — exactly matching `eventsub_subscription_count`
+20 and `eventsub_connection_occupancy{connection="0"} 20`.** Nothing leaked,
+nothing duplicated, and the reconciler kept tracking the desired set across it
+(18 → 19 → 20).
+
+Incidental: `get_eventsub_subscriptions().total` reported 20 correctly here.
+That does not soften D6 — the spike caught it reporting 300 while the pages held
+396, and 20 subscriptions is far too few to reproduce that. Page counting stays.
+
+### Detection is unchanged on EventSub data (FR-008, D3 in production)
+
+The strongest available evidence that the schema and the event-time semantics
+survived the cutover is that the Flink job never noticed it:
+
+| | Clips | Rate | Mean intensity |
+|---|---|---|---|
+| 3 h of IRC before cutover | 137 | ~45.7/h | 5.63 |
+| First hour on EventSub | 40 | ~40/h | 5.84 |
+
+Anomalies fire with sane event time (`peaked at … 5s ago`) across 17
+broadcasters. This is a live version of the comparison T039 plans to make by
+replay, and it is a stronger one: the same job, the same tuning, only the
+transport changed.
+
+### R1 needs one qualification
+
+One `received event for unknown subscription` was logged at 16:52:48Z, inside
+the resubscribe window after the reconnect. Phase 0 T004 measured **0** of these
+across a 500-channel cold ramp (12,555 events) and recorded ramp loss as 0.00%.
+
+That conclusion is not contradicted, but "0.00%" should be read as "below the
+resolution of that measurement", not "impossible". The race is real and narrow:
+Twitch activates a subscription server-side before the create POST's response
+reaches us and the callback is registered, so an event arriving in that window
+has nowhere to go. The cost is one chat message, which is immaterial against a
+baseline built over five minutes. **R1 stays closed; no warm-up gate.**
+
+### What is NOT met: the 500-channel tail
+
+`T002` measured the delivery-lag tail at **414** channels, not 500 (Phase 0
+caveat, carried above). Production runs at `JOIN_THRESHOLD` 15 /
+`LEAVE_THRESHOLD` 30 — 19 to 21 channels — so this soak re-confirmed the tail at
+**~20 channels** (p50 151 / p95 205 / max 288 ms, sampled over 249 messages
+against a live pool), not at 500.
+
+Raising production to 500 is a capacity change, and `research.md` Out of Scope
+already records why that bites: a 500-channel set detects far more anomalies than
+the clip budget can act on. **The operator's decision (2026-08-28) is to leave
+production at 15/30 and keep the 414→500 re-check where `tasks.md` already puts
+it — Phase 5, T038 and T044.**
+
+### Verdict
+
+**Three of the four conditions are met outright. The fourth is met at the
+operating point and deferred at 500 by decision, not by oversight.**
+
+For Phase 3 — deleting IRC — the risk R5 names is "EventSub misbehaves in
+production". At the scale production actually runs, that risk is now evidenced
+against: two hours of exact subscription tracking, a real reconnect survived
+with Twitch and the service in agreement, zero failures, and unchanged detection
+output. **Phase 3 is unblocked at the current operating point.** It does not
+carry a claim about 500 channels; that claim is Phase 5's to make, and the
+414→500 gap is the one thing standing between this gate and an unconditional
+pass.
+
 ## Decisions
 
 ### D1 — Transport: websocket, not webhook
