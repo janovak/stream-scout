@@ -9,6 +9,7 @@ Uses Redis for online streamer state management with TTL-based expiration.
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -45,23 +46,73 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 # Join chat when streamer enters top JOIN_THRESHOLD
 # Leave chat only when streamer exits top LEAVE_THRESHOLD
 # This preserves Flink baseline data during rank fluctuations
-JOIN_THRESHOLD = 15   # Join chat rooms for top 15 streamers
-LEAVE_THRESHOLD = 30  # Only leave when streamer drops out of top 30
+#
+# Configurable so the monitored set can be ramped empirically (15/30 ->
+# 50/100 -> 150/300 ...) to find where the system actually degrades, rather
+# than designing for one guessed target. Raise these gradually and watch: the
+# IRC JOIN bucket (20 per 10s, per account) blocks rather than fails, so a
+# larger set costs startup time -- roughly LEAVE_THRESHOLD/2 seconds to join
+# from cold -- before it costs anything else.
+def resolve_thresholds(env=None):
+    """Read and validate the hysteresis thresholds from `env`.
+
+    A function, not inline module code, so tests can exercise the validation
+    without reloading this module -- module-level start_http_server() and the
+    Prometheus collectors below cannot be registered twice in one process.
+
+    Returns (join_threshold, leave_threshold). Raises ValueError on a
+    configuration that would misbehave rather than fail loudly at runtime.
+    """
+    env = os.environ if env is None else env
+    join = int(env.get("JOIN_THRESHOLD", "15"))
+    leave = int(env.get("LEAVE_THRESHOLD", "30"))
+
+    if join < 1:
+        raise ValueError(f"JOIN_THRESHOLD must be >= 1, got {join}")
+    if leave < join:
+        # Hysteresis requires a band. Equal values give none, and an inverted
+        # pair would make every joined channel instantly leave-eligible --
+        # thrashing chat connections once per poll and destroying Flink's
+        # baseline.
+        raise ValueError(
+            f"LEAVE_THRESHOLD ({leave}) must be >= JOIN_THRESHOLD "
+            f"({join}) to give the hysteresis band a width"
+        )
+    return join, leave
+
+
+JOIN_THRESHOLD, LEAVE_THRESHOLD = resolve_thresholds()
 
 # Extra raw streams (by viewer rank) to fetch beyond LEAVE_THRESHOLD so that
 # streamers with clipping disabled don't eat a rank slot a real candidate
 # could use -- some of Twitch's consistently highest-viewed streamers
 # (e.g. kaicenat, ishowspeed) have clipping disabled, so without padding
 # they'd permanently shrink the real candidate pool below LEAVE_THRESHOLD.
-CLIPPING_DISABLED_FETCH_BUFFER = 20
+#
+# The default of 20 was sized against LEAVE_THRESHOLD=30. It is a flat pad, so
+# it thins out as the threshold grows; scale it with the threshold if the
+# "Fewer than LEAVE_THRESHOLD clip-allowed streams" warning starts firing.
+CLIPPING_DISABLED_FETCH_BUFFER = int(os.getenv("CLIPPING_DISABLED_FETCH_BUFFER", "20"))
 
 REDIS_STREAMER_TTL = 180  # 3 minutes TTL for streamer online status
 POLL_INTERVAL_SECONDS = 120  # Poll every 2 minutes
 
+# Helix caps `first` at 100 per page, so a fetch larger than that must
+# paginate. pyTwitchAPI's get_streams() is an auto-paginating async generator:
+# pass first=100 (one full page per request) and keep consuming until we have
+# what we need. Passing first>100 is rejected by Helix outright, which is what
+# the old min(..., 100) guarded against -- at the cost of silently capping the
+# monitored set at 100 however high LEAVE_THRESHOLD went.
+HELIX_MAX_PAGE_SIZE = 100
+
 # aiohttp already bounds this request (ClientTimeout total=300s), but that is
 # well past our 120s poll interval, so a stalled call would silently eat
-# several cycles before raising. Measured median for this call is ~0.1s, so
-# 10s leaves ~100x headroom while still recovering within one poll interval.
+# several cycles before raising. Measured median for a single page is ~0.1s.
+#
+# This is now a per-page budget, not a whole-call one: the timeout below scales
+# with the number of pages the fetch needs, so raising LEAVE_THRESHOLD does not
+# silently start tripping a fixed timeout. 10s per page keeps the ~100x
+# headroom the single-page measurement justified.
 # Don't go much lower: a skipped poll opens a 240s gap against the 180s
 # REDIS_STREAMER_TTL, expiring online keys and churning lifecycle events.
 #
@@ -69,6 +120,22 @@ POLL_INTERVAL_SECONDS = 120  # Poll every 2 minutes
 # that a reconnect threw away) is fixed in the library itself -- see
 # patches/twitchapi_leave_room_timeout.py -- not with a wrapper here.
 GET_STREAMS_TIMEOUT_SECONDS = 10
+
+
+def fetch_budget(fetch_count):
+    """Return (pages, timeout_seconds) for fetching `fetch_count` streams.
+
+    Scales the budget with the number of Helix pages needed, so raising
+    LEAVE_THRESHOLD does not silently start tripping a bound sized for one
+    page. Caps it below the poll interval regardless: bounding this call
+    exists to recover within one poll, and an unscaled ceiling would let a
+    stalled fetch eat several cycles -- the very thing
+    GET_STREAMS_TIMEOUT_SECONDS guards against. At the measured ~0.1s per
+    page the cap still leaves a wide margin (a 21-page fetch runs in ~2s
+    against a 60s cap).
+    """
+    pages = math.ceil(fetch_count / HELIX_MAX_PAGE_SIZE)
+    return pages, min(GET_STREAMS_TIMEOUT_SECONDS * pages, POLL_INTERVAL_SECONDS // 2)
 
 # pyTwitchAPI's Chat.is_connected() also reads False for the entire span of a
 # still-in-progress reconnect (it only reassigns the connection on success),
@@ -250,21 +317,28 @@ class StreamMonitoringService:
             # out streamers with clipping disabled *before* assigning rank -- so a
             # disabled streamer near the top can't eat a rank slot it can never use.
             # See CLIPPING_DISABLED_FETCH_BUFFER above for why padding is needed.
-            fetch_count = min(LEAVE_THRESHOLD + CLIPPING_DISABLED_FETCH_BUFFER, 100)
+            fetch_count = LEAVE_THRESHOLD + CLIPPING_DISABLED_FETCH_BUFFER
 
             async def _fetch_top_streams():
                 collected = []
-                async for stream in self.twitch.get_streams(first=fetch_count):
+                # first= is the PAGE size, capped by Helix at 100. The
+                # generator pages on its own, so the loop below -- not first=
+                # -- is what bounds the total.
+                async for stream in self.twitch.get_streams(first=HELIX_MAX_PAGE_SIZE):
                     collected.append(stream)
                     if len(collected) >= fetch_count:
                         break
                 return collected
 
+            pages, fetch_timeout = fetch_budget(fetch_count)
+
             try:
-                raw_streams = await asyncio.wait_for(_fetch_top_streams(), timeout=GET_STREAMS_TIMEOUT_SECONDS)
+                raw_streams = await asyncio.wait_for(_fetch_top_streams(), timeout=fetch_timeout)
             except asyncio.TimeoutError:
                 logger.error("Timed out fetching top streams from Twitch API", extra={
-                    "timeout_seconds": GET_STREAMS_TIMEOUT_SECONDS
+                    "timeout_seconds": fetch_timeout,
+                    "pages": pages,
+                    "fetch_count": fetch_count
                 })
                 twitch_api_errors_total.labels(error_type="get_streams_timeout").inc()
                 return
@@ -427,6 +501,31 @@ class StreamMonitoringService:
                 return
 
         # Join new channels (entered top JOIN_THRESHOLD)
+        #
+        # RAMP WARNING -- this loop is the expected first bottleneck as
+        # JOIN_THRESHOLD grows, and it is not a Twitch failure, it is a
+        # scheduling one. join_room() waits on pyTwitchAPI's channel_join
+        # bucket, which is 20 joins per 10s PER ACCOUNT and blocks rather than
+        # failing. So a cold start joining N channels parks here for roughly
+        # N/2 seconds, inside the poll job itself.
+        #
+        # Once that exceeds POLL_INTERVAL_SECONDS (120), APScheduler's default
+        # max_instances=1 starts skipping the next poll entirely: "Execution of
+        # job skipped: maximum number of running instances reached". Skipped
+        # polls stop refreshing the Redis online keys, whose TTL is 180s, so
+        # streamers begin expiring as offline and churning lifecycle events
+        # while the join storm is still going.
+        #
+        # Rough thresholds at the 20/10s rate: ~240 channels of cold joining
+        # fills one poll interval. Steady state is fine at far higher numbers,
+        # because hysteresis means only a handful of channels change per poll
+        # -- it is the cold start that hurts.
+        #
+        # The fix, when this bites, is to move joining out of the poll: the
+        # poller writes the desired set to Redis and a separate long-lived
+        # worker reconciles toward it at its own pace. Do not paper over it by
+        # widening POLL_INTERVAL_SECONDS, which would only stretch the same
+        # gap against REDIS_STREAMER_TTL.
         for channel in channels_to_join:
             try:
                 await self.chat.join_room(channel)
