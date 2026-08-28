@@ -42,7 +42,8 @@ keys, Phase 1b and Phase 2 are unnecessary.
 
 - [ ] T005a1 **[DO FIRST]** Raise `taskmanager.memory.process.size` from 2048m to 4-6 GB in `flink-conf.yaml` and `docker-compose.yml`. The TaskManager is at ~73% of its cap at only 30 broadcasters, and the box has 5.2 GiB free. This is the likeliest real constraint, and it costs nothing but config
 - [ ] T005b Only if measurement shows the LRU matters: add `python.state.cache-size`, `python.map-state.read-cache-size`, `python.map-state.write-cache-size` to `flink-conf.yaml`. Note per `research.md` that at parallelism 4, 2000 broadcasters is ~500 keys per subtask, which already fits the default 1000
-- [ ] T005c Run the 2000-key load test (same rig as T023). Confirm the watermark holds and JVM heap stays inside the raised budget. Record cache hit rate to confirm or refute the LRU concern
+- [ ] T005b1 **[BLOCKER — does not exist yet]** Build the 2000-key load rig: a synthetic producer that writes chat messages for N distinct `broadcaster_id`s into the `chat-messages` Kafka topic at a configurable rate. NOTE: `tools/replay.py` cannot do this — it is a pure-Python mirror that never exercises Flink state, the PyFlink boundary, or the LRU cache. It proves math equivalence only. Every runtime measurement in this feature (T005c, T022, T022a, T023) depends on this rig
+- [ ] T005c Run the 2000-key load test using the T005b1 rig. Confirm the watermark holds and JVM heap stays inside the raised budget. Record cache hit rate to confirm or refute the LRU concern
 - [ ] T005d **[DECISION]** If T005a1 alone holds: close Phase 1b and Phase 2 as not needed, and go to Phase 3 verification. If not, record why, then continue
 
 **Checkpoint**: Either the feature is done with a config change, or Option 2 is
