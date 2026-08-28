@@ -19,7 +19,6 @@ import os
 import signal
 import sys
 import time
-import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 
@@ -30,9 +29,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from confluent_kafka import Producer
 from prometheus_client import Counter, Gauge, start_http_server
 from pythonjsonlogger import jsonlogger
-from twitchAPI.chat import Chat, ChatMessage, EventData
 from twitchAPI.twitch import Twitch
-from twitchAPI.type import AuthScope, ChatEvent
+from twitchAPI.type import AuthScope
 
 from eventsub_pool import EventSubPoolTransport, map_chat_message
 from reconciler import (
@@ -59,8 +57,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 # Token-file scope strings -> pyTwitchAPI enums. One place, so adding a scope
 # is one line here and one line in seed_twitch_tokens.py REQUIRED_SCOPES.
 #
-# `user:read:chat` is the EventSub chat scope (T017). `chat:read` is IRC's and
-# goes away with IRC in Phase 3.
+# `user:read:chat` is the EventSub chat scope (T017).
 # A broadcaster marked clipping-disabled re-enters the ranking once the mark is
 # this old, for one more attempt. Same interval as the reconciler's refusal
 # re-check (reconciler.REFUSAL_RECHECK_DAYS), because they are the same rule
@@ -68,7 +65,6 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 CLIPPING_RECHECK_DAYS = 7
 
 SCOPE_MAP = {
-    "chat:read": AuthScope.CHAT_READ,
     "user:read:chat": AuthScope.USER_READ_CHAT,
     "clips:edit": AuthScope.CLIPS_EDIT,
 }
@@ -103,8 +99,8 @@ def resolve_thresholds(env=None):
         raise ValueError(f"JOIN_THRESHOLD must be >= 1, got {join}")
     if leave < join:
         # Hysteresis requires a band. Equal values give none, and an inverted
-        # pair would make every joined channel instantly leave-eligible --
-        # thrashing chat connections once per poll and destroying Flink's
+        # pair would make every desired channel instantly leave-eligible --
+        # thrashing the desired set once per poll and destroying Flink's
         # baseline.
         raise ValueError(
             f"LEAVE_THRESHOLD ({leave}) must be >= JOIN_THRESHOLD "
@@ -181,10 +177,6 @@ HELIX_MAX_PAGE_SIZE = 100
 # headroom the single-page measurement justified.
 # Don't go much lower: a skipped poll opens a 240s gap against the 180s
 # REDIS_STREAMER_TTL, expiring online keys and churning lifecycle events.
-#
-# The chat-side hang (Chat.leave_room waiting forever on a PART confirmation
-# that a reconnect threw away) is fixed in the library itself -- see
-# patches/twitchapi_leave_room_timeout.py -- not with a wrapper here.
 GET_STREAMS_TIMEOUT_SECONDS = 10
 
 
@@ -202,15 +194,6 @@ def fetch_budget(fetch_count):
     """
     pages = math.ceil(fetch_count / HELIX_MAX_PAGE_SIZE)
     return pages, min(GET_STREAMS_TIMEOUT_SECONDS * pages, POLL_INTERVAL_SECONDS // 2)
-
-# pyTwitchAPI's Chat.is_connected() also reads False for the entire span of a
-# still-in-progress reconnect (it only reassigns the connection on success),
-# not just after the library has permanently given up. Its own retry budget
-# (reconnect_delay_steps) sums to 255s. Requiring the connection to look dead
-# across this many consecutive 120s polls (240s+ of continuous non-connected
-# readings) keeps us from tearing down a client that's still mid-recovery in
-# the common case, without adding a wall-clock timer of our own.
-DEAD_CHAT_CONFIRMATION_POLLS = 3
 
 # Logging setup
 logger = logging.getLogger("stream_monitoring")
@@ -235,20 +218,12 @@ class StreamMonitoringService:
 
     def __init__(self):
         self.twitch: Optional[Twitch] = None
-        self.chat: Optional[Chat] = None
         self.scheduler: Optional[AsyncIOScheduler] = None
         self.kafka_producer: Optional[Producer] = None
         self.db_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
         self.redis_client: Optional[redis.Redis] = None
         self.credentials: Optional[TwitchCredentials] = None
         self.running = True
-        self.joined_channels: Set[str] = set()
-        # login -> id. Still read by the IRC message handler, which Phase 3
-        # deletes. The reconciler does NOT read this: it takes the same map
-        # from Redis, because intent must cross the seam through Redis and not
-        # through a shared attribute.
-        self.broadcaster_ids: Dict[str, int] = {}
-        self._consecutive_dead_chat_polls = 0
         self.reconciler: Optional[Reconciler] = None
         self.transport: Optional[EventSubPoolTransport] = None
         # Both set from the token file in initialize(). No user auth at all
@@ -363,9 +338,8 @@ class StreamMonitoringService:
             transport=self.transport,
             redis_client=self.redis_client,
             config=resolve_reconciler_config(),
-            # active_stream_count used to count IRC rooms. joined_channels is
-            # no longer maintained, so the gauge follows the reconciler's
-            # actual set -- the subscriptions that really exist.
+            # active_stream_count used to count IRC rooms. It now follows the
+            # reconciler's actual set -- the subscriptions that really exist.
             on_pass_complete=active_stream_count.set,
             refusal_store=self._build_refusal_store(),
         )
@@ -511,18 +485,6 @@ class StreamMonitoringService:
             except Exception as e:
                 logger.warning("Error closing the EventSub pool", extra={"error": str(e)})
 
-        if self.chat is not None:
-            try:
-                # Chat.stop() is synchronous -- it blocks internally via
-                # run_coroutine_threadsafe(...).result() until its teardown
-                # coroutine finishes on the chat's own thread. `await`ing its
-                # (None) return value used to raise a TypeError that this
-                # except swallowed silently after the real stop had already
-                # completed.
-                self.chat.stop()
-            except Exception as e:
-                logger.warning("Error stopping chat client", extra={"error": str(e)})
-
         if self.twitch:
             await self.twitch.close()
 
@@ -538,7 +500,7 @@ class StreamMonitoringService:
         logger.info("Stream Monitoring Service stopped")
 
     async def poll_top_streams(self):
-        """Poll Twitch API for top streams and manage chat connections."""
+        """Poll Twitch API for top streams and write the desired set to Redis."""
         try:
             logger.info("Polling for top streams")
 
@@ -613,7 +575,6 @@ class StreamMonitoringService:
                 broadcaster_id = int(stream.user_id)
                 ranked_logins.append(broadcaster_login)
                 broadcaster_ids[broadcaster_login] = broadcaster_id
-                self.broadcaster_ids[broadcaster_login] = broadcaster_id
 
                 # Update Redis with TTL
                 redis_key = f"streamer:online:{broadcaster_login}"
@@ -637,13 +598,13 @@ class StreamMonitoringService:
             )
 
             # Streamers that went offline. A login leaves `desired` only when
-            # it drops out of the top LEAVE_THRESHOLD, so this is the same
-            # condition the join loop used to apply against joined_channels.
+            # it drops out of the top LEAVE_THRESHOLD, so it is no longer in
+            # this poll's ranking and `broadcaster_ids` has no id for it.
             for login in previous_desired:
                 if login not in desired:
                     redis_key = f"streamer:online:{login}"
                     if not self.redis_client.exists(redis_key):
-                        broadcaster_id = self.broadcaster_ids.get(login, 0)
+                        broadcaster_id = broadcaster_ids.get(login, 0)
                         self._publish_lifecycle_event("offline", broadcaster_id, login, 0)
                         logger.info("Streamer offline", extra={
                             "broadcaster_login": login,
@@ -704,173 +665,6 @@ class StreamMonitoringService:
         # idle timeout is the backstop if the signal is ever missed.
         if self.reconciler is not None:
             self.reconciler.notify_desired_changed()
-
-    async def _manage_chat_connections(self, join_eligible: Set[str], leave_eligible: Set[str],
-                                        disabled_logins: Optional[Set[str]] = None):
-        """
-        Manage chat room connections with hysteresis.
-
-        DEAD CODE ON THE POLL PATH. `poll_top_streams` no longer calls this.
-        Chat membership is now intent in Redis plus `reconciler.py`. The
-        function and its tests stay until Phase 3 removes IRC outright
-        (tasks T029-T031), because deleting the transport is a separate step
-        from moving the work off the poll tick.
-
-        Args:
-            join_eligible: Streamers in top JOIN_THRESHOLD (should join if not already joined)
-            leave_eligible: Streamers in top LEAVE_THRESHOLD (should NOT leave yet)
-            disabled_logins: Streamers known to have clipping disabled (for leave-reason logging)
-
-        Hysteresis logic:
-        - Join chat when streamer enters top JOIN_THRESHOLD
-        - Leave chat only when streamer drops out of top LEAVE_THRESHOLD
-        - This prevents thrashing and preserves Flink baseline data
-        """
-        disabled_logins = disabled_logins or set()
-
-        # pyTwitchAPI's reconnect logic gives up for good after exhausting a
-        # bounded backoff list (~4.25 minutes total) and never retries again.
-        # From that point, join_room()/leave_room() keep failing forever with
-        # "Cannot write to closing transport" against the dead socket, while
-        # everything else about the process (health check, scheduler, DB)
-        # still looks healthy. is_connected() reports this, but also reads
-        # False during a still-in-progress reconnect the library would have
-        # completed on its own -- see DEAD_CHAT_CONFIRMATION_POLLS -- so we
-        # only act once it has looked dead for several consecutive polls.
-        if self.chat is not None and not self.chat.is_connected():
-            self._consecutive_dead_chat_polls += 1
-        else:
-            self._consecutive_dead_chat_polls = 0
-
-        if self.chat is not None and self._consecutive_dead_chat_polls >= DEAD_CHAT_CONFIRMATION_POLLS:
-            logger.warning("Chat connection is dead, recreating client", extra={
-                "consecutive_dead_polls": self._consecutive_dead_chat_polls
-            })
-            try:
-                self.chat.stop()
-            except Exception as e:
-                logger.warning("Error stopping dead chat client", extra={"error": str(e)})
-            self.chat = None
-            self._consecutive_dead_chat_polls = 0
-            # The dead socket already dropped every room it held. Rejoin
-            # everything hysteresis says should still be joined -- the
-            # surviving 16-30 band too, not just newly-JOIN_THRESHOLD-eligible
-            # channels -- or recovery would silently narrow coverage from
-            # top-LEAVE_THRESHOLD down to top-JOIN_THRESHOLD on every outage.
-            join_eligible = join_eligible | (self.joined_channels & leave_eligible)
-            self.joined_channels = set()
-
-        # Join channels for streamers who entered top JOIN_THRESHOLD
-        channels_to_join = join_eligible - self.joined_channels
-
-        # Only leave channels for streamers who dropped out of top LEAVE_THRESHOLD
-        # (i.e., they're currently joined but NOT in leave_eligible set)
-        channels_to_leave = self.joined_channels - leave_eligible
-
-        # Initialize chat if needed
-        if channels_to_join and not self.chat:
-            try:
-                # Default no_message_reset_time is 10 minutes -- far too long a
-                # blind spot for a dead connection given we track 15-30 channels
-                # that together produce many messages/sec; 30s gives huge margin
-                # over any observed lull while catching a dead socket fast.
-                self.chat = await Chat(self.twitch, no_message_reset_time=0.5)
-                self.chat.register_event(ChatEvent.READY, self._on_chat_ready)
-                self.chat.register_event(ChatEvent.MESSAGE, self._on_chat_message)
-                self.chat.start()
-                logger.info("Chat client started")
-            except Exception as e:
-                logger.error("Failed to start chat client", extra={"error": str(e)})
-                return
-
-        # Join new channels (entered top JOIN_THRESHOLD)
-        #
-        # RAMP WARNING -- this loop is the expected first bottleneck as
-        # JOIN_THRESHOLD grows, and it is not a Twitch failure, it is a
-        # scheduling one. join_room() waits on pyTwitchAPI's channel_join
-        # bucket, which is 20 joins per 10s PER ACCOUNT and blocks rather than
-        # failing. So a cold start joining N channels parks here for roughly
-        # N/2 seconds, inside the poll job itself.
-        #
-        # Once that exceeds POLL_INTERVAL_SECONDS (120), APScheduler's default
-        # max_instances=1 starts skipping the next poll entirely: "Execution of
-        # job skipped: maximum number of running instances reached". Skipped
-        # polls stop refreshing the Redis online keys, whose TTL is 180s, so
-        # streamers begin expiring as offline and churning lifecycle events
-        # while the join storm is still going.
-        #
-        # Rough thresholds at the 20/10s rate: ~240 channels of cold joining
-        # fills one poll interval. Steady state is fine at far higher numbers,
-        # because hysteresis means only a handful of channels change per poll
-        # -- it is the cold start that hurts.
-        #
-        # DONE, spec 004 Phase 1: the poller writes the desired set to Redis
-        # and `reconciler.py` converges toward it on its own task. Nothing
-        # reaches this loop from the poll path any more. The paragraphs above
-        # describe the failure that motivated the split; keep them until
-        # Phase 3 deletes the IRC client with them.
-        for channel in channels_to_join:
-            try:
-                await self.chat.join_room(channel)
-                self.joined_channels.add(channel)
-                logger.info("Joined chat room", extra={
-                    "channel": channel,
-                    "reason": f"entered top {JOIN_THRESHOLD}"
-                })
-            except Exception as e:
-                logger.error("Failed to join chat room", extra={"channel": channel, "error": str(e)})
-
-        # Leave channels (dropped out of top LEAVE_THRESHOLD, or clipping disabled)
-        for channel in channels_to_leave:
-            try:
-                await self.chat.leave_room(channel)
-                self.joined_channels.discard(channel)
-                reason = "clipping disabled" if channel in disabled_logins else f"exited top {LEAVE_THRESHOLD}"
-                logger.info("Left chat room", extra={
-                    "channel": channel,
-                    "reason": reason
-                })
-            except Exception as e:
-                logger.error("Failed to leave chat room", extra={"channel": channel, "error": str(e)})
-
-    async def _on_chat_ready(self, ready_event: EventData):
-        """Handle chat ready event."""
-        logger.info("Chat client ready")
-
-    async def _on_chat_message(self, msg: ChatMessage):
-        """Handle incoming chat messages."""
-        try:
-            broadcaster_login = msg.room.name.lower()
-            broadcaster_id = self.broadcaster_ids.get(broadcaster_login)
-
-            if not broadcaster_id:
-                return
-
-            # Build message payload
-            message_payload = {
-                "broadcaster_id": broadcaster_id,
-                "timestamp": int(time.time() * 1000),   # ingestion clock, unchanged
-                "sent_at": msg.sent_timestamp,           # Twitch server clock, from tmi-sent-ts
-                "message_id": str(uuid.uuid4()),
-                "text": msg.text,
-                "user_id": int(msg.user.id) if msg.user.id else 0,
-                "user_name": msg.user.name,
-                "metadata": {
-                    "emotes": {},
-                    "badges": dict(msg.user.badges) if msg.user.badges else {},
-                    "is_subscriber": msg.user.subscriber,
-                    "is_mod": msg.user.mod
-                }
-            }
-
-            # Publish to Kafka
-            self._publish_chat_message(broadcaster_id, message_payload)
-
-            # Update metrics
-            chat_messages_total.labels(broadcaster_id=str(broadcaster_id)).inc()
-
-        except Exception as e:
-            logger.error("Error processing chat message", extra={"error": str(e)})
 
     def _publish_chat_message(self, broadcaster_id: int, message: dict):
         """Publish chat message to Kafka."""
