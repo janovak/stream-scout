@@ -31,14 +31,15 @@ Flink code: `services/flink-job/`. Schema: `infrastructure/postgres/init.sql`.
 comparisons nobody has made. Getting them wrong corrupts detection silently.
 Phase 0 blocks Phase 2, not Phase 1.
 
-- [ ] T001 [US3] **[D3, FR-009]** Run IRC and EventSub side by side on the same 10–20 channels. For each message record IRC `tmi-sent-ts` and the EventSub envelope `metadata.message_timestamp`. Report the distribution of the difference. Write a throwaway script under `services/stream-monitoring/` or `tools/`; do not commit it
-- [ ] T002 [US3] **[D4]** From T001's EventSub stream, measure delivery-lag percentiles at 500 channels. Confirm p50/p95/max against the 394-channel figures (154 ms / 220 ms / 1243 ms) and whether the tail grows past 2 s
-- [ ] T003 **[D2]** Measure subscription-creation throughput at concurrency 1, 5, 10, 20. Find where 429s begin. Anything above the measured 2.1/s sequential figure is projection until this runs
-- [ ] T004 [US3] **[R1, FR-014]** Quantify ramp loss: count `received event for unknown subscription` against total messages during a 500-channel ramp. This decides whether the warm-up gate is built
-- [ ] T005 Record T001–T004 in `specs/004-eventsub-parallel-reconciler/research.md`, replacing the "unmeasured" notes with numbers
-- [ ] T006 **[GATE]** Confirm from T001 that the median dispatch-versus-receive offset is within 2 s. If it is not, stop and revisit D3 (static offset, or webhook) before any Phase 2 work
+- [x] T001 [US3] **[D3, FR-009]** DONE 2026-08-28 — envelope `metadata.message_timestamp` == IRC `tmi-sent-ts` to the ms (median +1 ms, 0 negative, 24,473 joined messages). No event-time shift. See `research.md` Phase 0 / D3
+- [x] T002 [US3] **[D4]** DONE 2026-08-28 — delivery lag at 414 channels: p50 163 / p95 217 / p99 257 ms, one message (0.0017%) over 2 s. Tail did not grow vs the spike. 414→500 re-check carried to Phase 5 (T038/T044)
+- [x] T003 **[D2]** DONE 2026-08-28 — zero 429s at concurrency 1/5/10/20 for 250 creates; 429s are a per-token burst budget (~360–420), not a concurrency ceiling. Concurrency-15 + backoff cold start = 500 subs in 40.6 s. See `research.md` D2
+- [x] T004 [US3] **[R1, FR-014]** DONE 2026-08-28 — 0 `received event for unknown subscription`, 0.00% ramp loss, opening baseline not depressed. twitchAPI 4.5.0 registers the callback synchronously. **Warm-up gate NOT built — T040 skipped**
+- [x] T005 DONE — `research.md` Phase 0 section + D2/D3/D4/R1/R2/R3 updated with measured numbers (commit `56de514`)
+- [x] T006 **[GATE]** PASS 2026-08-28 — median offset 1 ms, far inside the 2 s watermark. **Phase 2 unblocked**
 
-**Checkpoint**: D2, D3, D4 decided from data. FR-014 answered.
+**Checkpoint**: DONE. D2, D3, D4 decided from data. FR-014 answered (no gate).
+Open item for Phase 5: re-confirm the T002 lag tail at a stable 500 channels.
 
 ---
 
@@ -53,7 +54,7 @@ parallel with Phase 0.
 - [ ] T009 [US2] **[FR-011]** Move the hysteresis band (`resolve_thresholds`, JOIN/LEAVE) into the desired-set computation: a login enters `chat:desired` when it reaches top `JOIN_THRESHOLD` and stays until it exits top `LEAVE_THRESHOLD`. Keep `resolve_thresholds` and its validation as-is
 - [ ] T010 [P] [US2] Add a test in `services/stream-monitoring/test_stream_monitoring.py` asserting FR-003: `poll_top_streams` duration does not scale with desired-set change size (0-change vs 500-change poll within noise)
 - [ ] T011 [P] [US2] Add a test asserting FR-011 survives the move: a login entering top `JOIN_THRESHOLD` appears in `chat:desired`; it is removed only after it exits top `LEAVE_THRESHOLD`; the 16–30 band is retained
-- [ ] T012 [US1] **[FR-004]** Add `services/stream-monitoring/reconciler.py`: read `chat:desired`, diff against the in-memory actual set, create/drop highest-rank-first, bounded concurrency (T003's value, default 10, env-configurable), back off on 429. It runs as an `asyncio` task in the existing `stream_monitoring_service.py` process, launched from `start()`, logging through the shared `jsonlogger` — not a separate container
+- [ ] T012 [US1] **[FR-004, D2]** Add `services/stream-monitoring/reconciler.py`: read `chat:desired`, diff against the in-memory actual set, create/drop highest-rank-first, concurrency `RECONCILE_CONCURRENCY` (default 10). **On a 429: back off (~10 s, or honour `Ratelimit-Reset` if the library exposes it) and retry the failed channels — never drop them.** T003 showed 429s are budget-driven, not concurrency-driven, so the retry loop is load-bearing past ~400 channels, not a safety net. Runs as an `asyncio` task in the existing `stream_monitoring_service.py` process, launched from `start()`, logging through the shared `jsonlogger` — not a separate container
 - [ ] T013 [US4] **[FR-005]** Make the reconciler converge from any starting state: on start-up rebuild the actual set from `get_eventsub_subscriptions()` by **counting pages, not reading `total`** (research trap), and adopt existing subscriptions rather than duplicating
 - [ ] T014 [US4] Handle drift: a subscription that is `revoked` or absent but still wanted is recreated on the next reconcile; one no longer wanted is dropped. A desired-set change mid-reconcile is picked up via `chat:desired:generation`
 - [ ] T014a [P] [US4] **[FR-004, FR-005]** Reconciler unit tests in `services/stream-monitoring/test_stream_monitoring.py`: diff produces the right create/drop set; an already-subscribed channel is adopted, never re-created; a revoked subscription is re-created; a channel that leaves the desired set mid-reconcile is not created
@@ -115,7 +116,7 @@ runs against a stub transport until Phase 2.
 - [ ] T037 [US3] Update the KNOWN_ISSUES Issue 4 "Post-deploy validation" delay arithmetic for the +1 s change
 - [ ] T038 [US3] **[SC-005]** Measure the residual late-drop rate at 500 channels with the 2 s watermark, from Flink's late-records-dropped metric on the `chat-messages` source (`numLateRecordsDropped` / total). Record it in `research.md`. It must be below 0.1%
 - [ ] T039 [US3] **[US3 Independent Test]** Replay a post-cutover capture through `tools/replay.py` and compare anomaly rate and character against the pre-cutover corpus. Not byte-identical — the input differs — but the rate and shape must be consistent
-- [ ] T040 [US3] **[R1, FR-014]** Add a per-channel warm-up gate that withholds a channel's baseline until its subscription is settled — **only if** T004 showed the ramp loss distorts detection. If T004 was clean, note that here and skip
+- [x] T040 [US3] **[R1, FR-014]** SKIPPED 2026-08-28 — T004 measured 0.00% ramp loss and no opening-baseline depression. No warm-up gate is built. Re-open only if twitchAPI is upgraded past 4.5.0 (the synchronous-callback behaviour is version-specific — `research.md` R1)
 
 ---
 
