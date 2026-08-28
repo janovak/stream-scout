@@ -245,8 +245,13 @@ class TestMessageParsing:
 import os
 
 TEST_SCHEMA = "spec004_clipping_test"
+# Deliberately localhost, not the deployed host. The fixture runs DDL --
+# CREATE SCHEMA and DROP SCHEMA CASCADE -- and defaulting that at the live
+# database would put every `pytest` run on production, and put its credential
+# in this file. `docker compose --profile local-db up postgres` gives a local
+# one; set TEST_POSTGRES_URL to point somewhere else on purpose.
 TEST_POSTGRES_URL = os.getenv(
-    "TEST_POSTGRES_URL", "postgresql://twitch:twitch_password@100.112.97.111:5432/twitch"
+    "TEST_POSTGRES_URL", "postgresql://twitch:twitch_password@localhost:5432/twitch"
 )
 
 

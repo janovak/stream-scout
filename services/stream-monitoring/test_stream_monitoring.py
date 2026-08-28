@@ -2360,6 +2360,163 @@ class TestPoolSocketDeath:
         asyncio.run(run())
 
 
+class TestPoolRaces:
+    """Failure modes that only appear because the supervisor shares the loop."""
+
+    def test_a_connection_retired_mid_create_leaves_no_ghost_slot(self):
+        """The supervisor runs on this loop, and a create is an await.
+
+        If a slot were recorded against a connection that has already been
+        retired, nothing would ever clear it: `_retire` has been and gone, no
+        revocation arrives for a dead session, and the reconciler does not
+        delete a channel it still wants. Every later create would hand back
+        that dead id without contacting Twitch, and the channel would be
+        permanently dark while every count said "covered".
+        """
+
+        async def run():
+            pool = make_pool()
+            await pool._grow()
+            connection = pool._connections[0]
+            original = connection.websocket.listen_channel_chat_message
+
+            async def retire_then_subscribe(*args, **kwargs):
+                pool._retire(connection)
+                return await original(*args, **kwargs)
+
+            connection.websocket.listen_channel_chat_message = retire_then_subscribe
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+            assert pool._slots == {}
+            assert pool._by_subscription == {}
+
+        asyncio.run(run())
+
+    def test_a_slot_on_a_retired_connection_is_not_handed_back(self):
+        """The early return must check the connection, not just the slot."""
+
+        async def run():
+            pool = make_pool()
+            subscription_id = await pool.create(7)
+            # Retire without going through _retire, the way a stale slot could
+            # survive a bookkeeping slip.
+            pool._connections = []
+
+            recreated = await pool.create(7)
+            assert recreated != subscription_id
+            assert pool._slots[7].connection_id == pool._connections[0].connection_id
+
+        asyncio.run(run())
+
+    def test_deleting_a_rotated_id_still_clears_the_library(self):
+        """`list()` reports the id a reconnect made; `_by_subscription` has the old.
+
+        Deleting the reported id and stopping there would leave the library's
+        own registry intact, so the socket re-creates the channel on its next
+        reconnect -- exactly the resurrection this cleanup exists to prevent.
+        """
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_pool(twitch=twitch)
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+            websocket.rotate_ids()
+            rotated = next(iter(websocket._active_subscriptions))
+
+            # The reconciler asks for the id Twitch reports, which the pool
+            # has never seen.
+            await pool.delete(rotated)
+
+            assert twitch.deleted == [rotated]
+            assert websocket._active_subscriptions == {}
+            assert websocket._callbacks == {}
+            assert pool._slots == {}
+            assert pool.occupancy() == {"0": 0}
+
+        asyncio.run(run())
+
+    def test_a_connection_that_never_comes_up_does_not_wedge_the_pool(self):
+        """`start()` busy-waits on a flag only session_welcome sets.
+
+        A socket thread that dies on the way up never sets it, so `start()`
+        spins for the life of the process. Holding the growth lock across an
+        unbounded wait would freeze every later create, and with it the
+        reconciler.
+        """
+
+        class NeverConnects(FakeWebsocket):
+            def start(self):
+                self._startup_complete = False
+                while not self._startup_complete:
+                    time.sleep(0.01)
+
+        async def run():
+            pool = make_pool(connect_timeout_seconds=0.3)
+            pool._connection_factory = NeverConnects
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+
+            # The lock is free, so the pool still works once connects recover.
+            pool._connection_factory = FakeWebsocket
+            assert await pool.create(7)
+            assert pool.occupancy() == {"0": 1}
+
+        asyncio.run(run())
+
+
+class TestDegradedWithoutUserAuth:
+    """A missing token file must not crash-loop the container."""
+
+    def test_a_missing_token_file_leaves_the_poller_running(self):
+        """The pool resolves the auth user through get_users(), which an app
+        token cannot do -- so building it would raise and take the container
+        down in a restart loop. The warning this path logs promises the
+        service keeps running with chat off, so it has to actually do that.
+
+        This drives the real `initialize()`, because the branch under test is
+        inside it and a test that re-implements the branch tests itself.
+        """
+
+        async def run():
+            twitch = MagicMock()
+            twitch.authenticate_app = AsyncMock()
+            credentials = MagicMock()
+            credentials.load.side_effect = FileNotFoundError("no token file")
+
+            service = StreamMonitoringService()
+            with patch.object(stream_monitoring_service, "Twitch", AsyncMock(return_value=twitch)), \
+                 patch.object(stream_monitoring_service, "get_credentials", return_value=credentials), \
+                 patch.object(stream_monitoring_service, "Producer"), \
+                 patch.object(stream_monitoring_service.psycopg2.pool, "ThreadedConnectionPool"), \
+                 patch.object(stream_monitoring_service.redis, "from_url", return_value=MagicMock()), \
+                 patch.object(stream_monitoring_service, "start_http_server"), \
+                 patch.object(StreamMonitoringService, "_build_transport", AsyncMock()) as build_transport:
+                await service.initialize()
+
+            build_transport.assert_not_called()
+            assert service.transport is None
+            assert service.reconciler is None
+            # The poll job is still scheduled: intent keeps being written.
+            assert service.scheduler.get_job("poll_streams") is not None
+
+        asyncio.run(run())
+
+    def test_start_does_not_launch_a_reconciler_that_was_never_built(self):
+        async def run():
+            service = StreamMonitoringService()
+            service.reconciler = None
+            service.scheduler = MagicMock()
+            service.running = False
+            with patch.object(StreamMonitoringService, "initialize", AsyncMock()):
+                await service.start()
+            assert service._reconciler_task is None
+
+        asyncio.run(run())
+
+
 class TestEventSubMessageMapping:
     """T020 / T021 / FR-008, FR-009 -- the payload the Flink job consumes."""
 
@@ -2700,8 +2857,13 @@ class TestRefusalCache:
 # the deployed table. It skips when there is no database to talk to.
 
 TEST_SCHEMA = "spec004_selfheal_test"
+# Deliberately localhost, not the deployed host. The fixture runs DDL --
+# CREATE SCHEMA and DROP SCHEMA CASCADE -- and defaulting that at the live
+# database would put every `pytest` run on production, and put its credential
+# in this file. `docker compose --profile local-db up postgres` gives a local
+# one; set TEST_POSTGRES_URL to point somewhere else on purpose.
 TEST_POSTGRES_URL = os.getenv(
-    "TEST_POSTGRES_URL", "postgresql://twitch:twitch_password@100.112.97.111:5432/twitch"
+    "TEST_POSTGRES_URL", "postgresql://twitch:twitch_password@localhost:5432/twitch"
 )
 
 

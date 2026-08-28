@@ -251,9 +251,11 @@ class StreamMonitoringService:
         self._consecutive_dead_chat_polls = 0
         self.reconciler: Optional[Reconciler] = None
         self.transport: Optional[EventSubPoolTransport] = None
-        # Set from the token file in initialize(). False means every chat
-        # subscription is going to refuse, for one reason that has nothing to
-        # do with the broadcasters.
+        # Both set from the token file in initialize(). No user auth at all
+        # means no chat transport can be built; user auth without
+        # user:read:chat means every chat subscription is going to refuse, for
+        # one reason that has nothing to do with the broadcasters.
+        self.has_user_auth = False
         self.has_chat_scope = False
         self._reconciler_task: Optional[asyncio.Task] = None
 
@@ -284,6 +286,7 @@ class StreamMonitoringService:
                 logger.warning("Token file carries scopes this service does not map", extra={
                     "scopes": unknown_scopes
                 })
+            self.has_user_auth = True
             self.has_chat_scope = AuthScope.USER_READ_CHAT in auth_scopes
             if not self.has_chat_scope:
                 logger.error(
@@ -312,6 +315,7 @@ class StreamMonitoringService:
             })
             # Fall back to app-only auth for streams API
             await self.twitch.authenticate_app([])
+            self.has_user_auth = False
 
         # Initialize Kafka producer
         self.kafka_producer = Producer({
@@ -338,6 +342,22 @@ class StreamMonitoringService:
 
         # Build the reconciler. It reads the desired set this service writes
         # and owns every network call that used to happen inside the poll tick.
+        # Without user auth there is no transport to build: the pool resolves
+        # the auth user through get_users(), which an app token cannot do. The
+        # warning above promises the service keeps running with chat off, so
+        # honour that instead of crash-looping the container on a missing
+        # token file.
+        if not self.has_user_auth:
+            logger.error(
+                "No user authentication, so no chat transport and no reconciler. "
+                "The poll job still runs and writes the desired set. "
+                "Run 'python seed_twitch_tokens.py' and restart to ingest chat"
+            )
+            self._build_scheduler()
+            start_http_server(PROMETHEUS_PORT)
+            logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
+            return
+
         self.transport = await self._build_transport()
         self.reconciler = Reconciler(
             transport=self.transport,
@@ -350,7 +370,13 @@ class StreamMonitoringService:
             refusal_store=self._build_refusal_store(),
         )
 
-        # Initialize scheduler
+        self._build_scheduler()
+
+        # Start Prometheus metrics server
+        start_http_server(PROMETHEUS_PORT)
+        logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
+
+    def _build_scheduler(self):
         self.scheduler = AsyncIOScheduler()
         self.scheduler.add_job(
             self.poll_top_streams,
@@ -359,10 +385,6 @@ class StreamMonitoringService:
             id="poll_streams",
             next_run_time=datetime.now(timezone.utc)
         )
-
-        # Start Prometheus metrics server
-        start_http_server(PROMETHEUS_PORT)
-        logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
 
     def _build_refusal_store(self):
         """The durable refusal cache, or None when it would do harm.
@@ -450,7 +472,8 @@ class StreamMonitoringService:
         # The reconciler is a task in this process, beside the poll job. It is
         # not a separate container: it shares this process's /health endpoint
         # and this logger.
-        self._reconciler_task = asyncio.create_task(self.reconciler.run())
+        if self.reconciler is not None:
+            self._reconciler_task = asyncio.create_task(self.reconciler.run())
 
         logger.info("Stream Monitoring Service started")
 
@@ -930,9 +953,16 @@ class StreamMonitoringService:
         turned clip creation off once was never looked at again, even after
         turning it back on. A mark older than CLIPPING_RECHECK_DAYS is now
         treated as stale and left OUT of this set, so the broadcaster
-        re-enters the ranking and the Flink job gets one more real attempt.
-        That attempt either succeeds -- `mark_clipping_allowed` clears the
-        flag -- or refuses again and resets the timestamp (FR-013, D5).
+        re-enters the ranking (FR-013, D5).
+
+        What resolves it is a real clip attempt, which needs a spike: success
+        clears the flag, a fresh 403 re-stamps the timestamp and starts the
+        seven days again. So a stale mark is an un-skip, not a bounded retry
+        -- a broadcaster who never trends holds a monitored slot from the
+        moment the mark goes stale until they do. That is the rule
+        `data-model.md` specifies; it is worth knowing it is not self-limiting
+        the way the reconciler's refusal re-check is, where every refusal
+        re-stamps.
 
         A NULL `clipping_disabled_at` beside a FALSE flag means the row
         predates the column and was not caught by the migration backfill.
