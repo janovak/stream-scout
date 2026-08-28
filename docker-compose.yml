@@ -402,6 +402,7 @@ services:
     volumes:
       - ./secrets:/app/secrets:rw
       - ./services/stream-monitoring/stream_monitoring_service.py:/app/stream_monitoring_service.py:ro
+      - ./services/stream-monitoring/reconciler.py:/app/reconciler.py:ro
       - ./services/stream-monitoring/token_manager.py:/app/token_manager.py:ro
     depends_on:
       postgres:

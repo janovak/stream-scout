@@ -17,10 +17,176 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import reconciler as reconciler_module
 import stream_monitoring_service
 import token_manager
-from stream_monitoring_service import StreamMonitoringService
+from reconciler import (
+    DESIRED_GENERATION_KEY,
+    DESIRED_IDS_KEY,
+    DESIRED_KEY,
+    RateLimitedError,
+    Reconciler,
+    ReconcilerConfig,
+    StubTransport,
+    TransportError,
+)
+from stream_monitoring_service import StreamMonitoringService, compute_desired_set
 from token_manager import TokenRecord, TwitchCredentials
+
+
+class FakeRedis:
+    """Enough Redis for the poller/reconciler seam, held in memory.
+
+    Both sides of the seam use one instance in these tests, so a test
+    exercises the real key layout rather than an assumption about it. Every
+    operation is recorded in `calls`, which is what the FR-003 test counts: a
+    pipeline records one `pipeline.execute`, because that is one round trip
+    however many commands it carries.
+    """
+
+    def __init__(self):
+        self.strings = {}
+        self.zsets = {}
+        self.hashes = {}
+        self.calls = []
+        self.fail_on = set()
+        self._recording = True
+
+    def _record(self, name):
+        if name in self.fail_on:
+            raise ConnectionError(f"simulated Redis failure on {name}")
+        if self._recording:
+            self.calls.append(name)
+
+    def exists(self, key):
+        self._record("exists")
+        return 1 if key in self.strings or key in self.zsets or key in self.hashes else 0
+
+    def setex(self, key, ttl, value):
+        self._record("setex")
+        self.strings[key] = str(value)
+
+    def get(self, key):
+        self._record("get")
+        return self.strings.get(key)
+
+    def incr(self, key):
+        self._record("incr")
+        self.strings[key] = str(int(self.strings.get(key, 0)) + 1)
+        return int(self.strings[key])
+
+    def delete(self, *keys):
+        self._record("delete")
+        for key in keys:
+            self.strings.pop(key, None)
+            self.zsets.pop(key, None)
+            self.hashes.pop(key, None)
+
+    def zadd(self, key, mapping):
+        self._record("zadd")
+        self.zsets.setdefault(key, {}).update(
+            {member: float(score) for member, score in mapping.items()}
+        )
+
+    def zrange(self, key, start, end):
+        self._record("zrange")
+        ordered = sorted(self.zsets.get(key, {}).items(), key=lambda kv: (kv[1], kv[0]))
+        if end == -1:
+            end = len(ordered) - 1
+        return [member for member, _ in ordered[start:end + 1]]
+
+    def hset(self, key, mapping=None):
+        self._record("hset")
+        self.hashes.setdefault(key, {}).update(
+            {field: str(value) for field, value in (mapping or {}).items()}
+        )
+
+    def hgetall(self, key):
+        self._record("hgetall")
+        return dict(self.hashes.get(key, {}))
+
+    def pipeline(self):
+        return FakePipeline(self)
+
+
+class FakePipeline:
+    """A MULTI/EXEC that applies its queued commands as one round trip."""
+
+    def __init__(self, client):
+        self.client = client
+        self.queued = []
+
+    def delete(self, *keys):
+        self.queued.append(("delete", (keys), {}))
+        return self
+
+    def zadd(self, key, mapping):
+        self.queued.append(("zadd", (key, mapping), {}))
+        return self
+
+    def hset(self, key, mapping=None):
+        self.queued.append(("hset", (key,), {"mapping": mapping}))
+        return self
+
+    def incr(self, key):
+        self.queued.append(("incr", (key,), {}))
+        return self
+
+    def execute(self):
+        self.client._recording = False
+        try:
+            for name, args, kwargs in self.queued:
+                if name == "delete":
+                    self.client.delete(*args)
+                else:
+                    getattr(self.client, name)(*args, **kwargs)
+        finally:
+            self.client._recording = True
+        self.client.calls.append("pipeline.execute")
+        self.queued = []
+
+
+def make_stream(login, user_id):
+    """A stand-in for one Helix stream row."""
+    stream = MagicMock()
+    stream.user_login = login
+    stream.user_id = str(user_id)
+    return stream
+
+
+class FakeTwitch:
+    """Serves a fixed ranking through the auto-paginating get_streams API."""
+
+    def __init__(self, streams):
+        self.streams = streams
+
+    def get_streams(self, first=100):
+        async def pages():
+            for stream in self.streams:
+                yield stream
+
+        return pages()
+
+
+def make_poller(logins, fake_redis, reconciler=None):
+    """A StreamMonitoringService wired for a poll, with Postgres/Kafka mocked.
+
+    `logins` is the ranking, best first. Broadcaster ids are derived from the
+    position so a test can predict them.
+    """
+    service = StreamMonitoringService()
+    service.twitch = FakeTwitch([make_stream(login, 1000 + i) for i, login in enumerate(logins)])
+    service.redis_client = fake_redis
+    service.reconciler = reconciler
+    service._get_clipping_disabled_ids = MagicMock(return_value=set())
+    service._upsert_streamer = MagicMock()
+    service._publish_lifecycle_event = MagicMock()
+    service._manage_chat_connections = AsyncMock()
+    return service
+
+
+def broadcaster_id_for(logins, login):
+    return 1000 + logins.index(login)
 
 
 class TestTwitchCredentials:
@@ -750,6 +916,813 @@ class TestFetchBudget:
         pages, timeout = stream_monitoring_service.fetch_budget(2020)
         assert pages == 21
         assert timeout >= pages * 0.1 * 10
+
+
+def seed_desired(fake_redis, logins_with_ids):
+    """Write a desired set the way the poller writes it, for reconciler tests."""
+    fake_redis.zsets[DESIRED_KEY] = {
+        login: float(rank) for rank, (login, _) in enumerate(logins_with_ids, 1)
+    }
+    fake_redis.hashes[DESIRED_IDS_KEY] = {
+        login: str(broadcaster_id) for login, broadcaster_id in logins_with_ids
+    }
+    previous = int(fake_redis.strings.get(DESIRED_GENERATION_KEY, 0))
+    fake_redis.strings[DESIRED_GENERATION_KEY] = str(previous + 1)
+
+
+def make_reconciler(transport, fake_redis, **config_overrides):
+    """A reconciler with test-speed timings: no real backoff, no idle wait."""
+    settings = {
+        "concurrency": 10,
+        "idle_timeout_seconds": 0.01,
+        "rate_limit_backoff_seconds": 0.0,
+        "max_retry_rounds": 20,
+    }
+    settings.update(config_overrides)
+    return Reconciler(
+        transport=transport,
+        redis_client=fake_redis,
+        config=ReconcilerConfig(**settings),
+    )
+
+
+def counter_value(reason):
+    """Read one labelled Counter sample, for before/after deltas."""
+    return reconciler_module.subscription_create_failures_total.labels(
+        reason=reason
+    )._value.get()
+
+
+class TestDesiredSetHysteresis:
+    """T011 / FR-011 -- the hysteresis band survives the move.
+
+    The band used to live in the join loop, where `joined_channels` was the
+    state. It now lives in the desired-set computation, where the previous
+    desired set is the state. The behaviour must not change: entry at top
+    JOIN_THRESHOLD, exit only below top LEAVE_THRESHOLD, and the 16-30 band
+    retained in between.
+    """
+
+    @staticmethod
+    def _legacy_joined_after_poll(ranked, joined, join_threshold, leave_threshold):
+        """What `_manage_chat_connections` settled on, as set algebra.
+
+        Lifted straight from the old code path: join everything newly in the
+        top JOIN_THRESHOLD, leave everything joined that fell out of the top
+        LEAVE_THRESHOLD, keep the rest.
+        """
+        top_join = {login for rank, login in enumerate(ranked, 1) if rank <= join_threshold}
+        top_leave = {login for rank, login in enumerate(ranked, 1) if rank <= leave_threshold}
+        to_join = top_join - joined
+        to_leave = joined - top_leave
+        return (joined | to_join) - to_leave
+
+    def test_login_enters_on_reaching_the_join_threshold(self):
+        """Top JOIN_THRESHOLD is the entry condition."""
+        ranked = [f"s{i}" for i in range(1, 31)]
+
+        desired = compute_desired_set(ranked, previous_desired=set(), join_threshold=15,
+                                      leave_threshold=30)
+
+        assert "s1" in desired
+        assert "s15" in desired
+        assert desired["s15"] == 15
+
+    def test_login_in_the_band_cannot_enter(self):
+        """Rank 16-30 is a RETAINING band, not an entry one. A newcomer there
+        must stay out, or the band would quietly become the join threshold."""
+        ranked = [f"s{i}" for i in range(1, 31)]
+
+        desired = compute_desired_set(ranked, previous_desired=set(), join_threshold=15,
+                                      leave_threshold=30)
+
+        assert "s16" not in desired
+        assert "s30" not in desired
+        assert len(desired) == 15
+
+    def test_band_member_is_retained(self):
+        """A login already wanted stays through ranks 16-30. This is the whole
+        point of hysteresis: it protects the Flink baseline the channel built."""
+        ranked = ["newtop"] + [f"s{i}" for i in range(1, 30)]
+        # "s15" now sits at rank 16, inside the retained band.
+        assert ranked[15] == "s15"
+
+        desired = compute_desired_set(ranked, previous_desired={"s15"}, join_threshold=15,
+                                      leave_threshold=30)
+
+        assert "s15" in desired
+        assert desired["s15"] == 16
+
+    def test_login_leaves_only_after_exiting_the_leave_threshold(self):
+        """Falling past rank 30 is the exit condition, and nothing sooner."""
+        ranked = [f"s{i}" for i in range(1, 31)] + ["faller"]
+
+        retained = compute_desired_set(ranked[:30] + ["x"], previous_desired={"s30"},
+                                       join_threshold=15, leave_threshold=30)
+        dropped = compute_desired_set(["newcomer"] + ranked[:30], previous_desired={"s30"},
+                                      join_threshold=15, leave_threshold=30)
+
+        assert "s30" in retained, "rank 30 is still inside the band"
+        assert "s30" not in dropped, "rank 31 is outside the band"
+
+    def test_login_absent_from_the_ranking_is_dropped(self):
+        """A streamer that went offline leaves the set, band or no band."""
+        desired = compute_desired_set(["a", "b"], previous_desired={"a", "b", "gone"},
+                                      join_threshold=15, leave_threshold=30)
+
+        assert "gone" not in desired
+
+    def test_ranking_longer_than_the_leave_threshold_is_truncated(self):
+        """Nothing past LEAVE_THRESHOLD can be wanted, however long the list."""
+        ranked = [f"s{i}" for i in range(1, 51)]
+
+        desired = compute_desired_set(ranked, previous_desired=set(ranked), join_threshold=15,
+                                      leave_threshold=30)
+
+        assert max(desired.values()) == 30
+        assert len(desired) == 30
+
+    def test_matches_the_old_join_loop_on_random_rankings(self):
+        """Byte-equivalence to today, checked against the old set algebra over
+        many random rank shuffles rather than a handful of chosen cases."""
+        import random as _random
+
+        rng = _random.Random(20260828)
+        population = [f"s{i}" for i in range(60)]
+
+        for _ in range(300):
+            join_threshold = rng.randint(1, 20)
+            leave_threshold = join_threshold + rng.randint(0, 20)
+            ranked = rng.sample(population, leave_threshold)
+            previous = set(rng.sample(population, rng.randint(0, 30)))
+
+            new = set(compute_desired_set(ranked, previous, join_threshold, leave_threshold))
+            legacy = self._legacy_joined_after_poll(ranked, previous, join_threshold,
+                                                    leave_threshold)
+
+            assert new == legacy, (
+                f"diverged at join={join_threshold} leave={leave_threshold}: "
+                f"{new ^ legacy}"
+            )
+
+
+class TestPollWritesIntentOnly:
+    """T008 / T010 -- FR-002 and FR-003.
+
+    The poll ranks, writes intent, and returns. It makes no chat connection and
+    no subscription, and its cost does not follow the size of the change.
+    """
+
+    def test_poll_writes_the_desired_set_and_bumps_the_generation(self):
+        fake_redis = FakeRedis()
+        logins = [f"s{i}" for i in range(1, 31)]
+        service = make_poller(logins, fake_redis)
+
+        asyncio.run(service.poll_top_streams())
+
+        assert fake_redis.zrange(DESIRED_KEY, 0, -1) == logins[:15]
+        assert fake_redis.hgetall(DESIRED_IDS_KEY) == {
+            login: str(broadcaster_id_for(logins, login)) for login in logins[:15]
+        }
+        assert fake_redis.get(DESIRED_GENERATION_KEY) == "1"
+
+    def test_desired_set_is_scored_by_rank_best_first(self):
+        """The reconciler reads the set in score order to work highest rank
+        first, so the score must be the rank and 1 must be the top."""
+        fake_redis = FakeRedis()
+        logins = [f"s{i}" for i in range(1, 31)]
+        service = make_poller(logins, fake_redis)
+
+        asyncio.run(service.poll_top_streams())
+
+        assert fake_redis.zsets[DESIRED_KEY]["s1"] == 1.0
+        assert fake_redis.zsets[DESIRED_KEY]["s15"] == 15.0
+
+    def test_poll_makes_no_chat_connection_and_no_subscription(self):
+        """FR-002. The poll path must not touch the transport at all."""
+        fake_redis = FakeRedis()
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+        logins = [f"s{i}" for i in range(1, 31)]
+        service = make_poller(logins, fake_redis, reconciler=reconciler)
+
+        asyncio.run(service.poll_top_streams())
+
+        assert service.chat is None
+        assert transport.create_calls == []
+        assert transport.delete_calls == []
+        service._manage_chat_connections.assert_not_awaited()
+
+    def test_poll_signals_the_reconciler(self):
+        """The in-process fast path: the poller nudges the loop after writing."""
+        fake_redis = FakeRedis()
+        reconciler = make_reconciler(StubTransport(), fake_redis)
+        service = make_poller(["a", "b"], fake_redis, reconciler=reconciler)
+
+        asyncio.run(service.poll_top_streams())
+
+        assert reconciler._wake.is_set()
+
+    def test_poll_duration_does_not_scale_with_change_size(self):
+        """FR-003. Both polls rank 500 streams. The first changes all 500, the
+        second changes nothing. The work must be the same either way -- that is
+        what "the poller writes intent" has to mean in practice.
+
+        The operation count is the real assertion; wall clock is a loose
+        backstop, because a per-channel network loop would blow past it."""
+        logins = [f"s{i}" for i in range(1, 501)]
+        fake_redis = FakeRedis()
+
+        with patch.object(stream_monitoring_service, "JOIN_THRESHOLD", 500), \
+             patch.object(stream_monitoring_service, "LEAVE_THRESHOLD", 500):
+            service = make_poller(logins, fake_redis)
+
+            fake_redis.calls.clear()
+            start = time.perf_counter()
+            asyncio.run(service.poll_top_streams())
+            full_change_seconds = time.perf_counter() - start
+            full_change_calls = list(fake_redis.calls)
+
+            # Same ranking again: the desired set is already exactly right.
+            service.twitch = FakeTwitch(
+                [make_stream(login, 1000 + i) for i, login in enumerate(logins)]
+            )
+            fake_redis.calls.clear()
+            start = time.perf_counter()
+            asyncio.run(service.poll_top_streams())
+            no_change_seconds = time.perf_counter() - start
+            no_change_calls = list(fake_redis.calls)
+
+        assert len(fake_redis.zrange(DESIRED_KEY, 0, -1)) == 500
+        assert len(full_change_calls) == len(no_change_calls), (
+            "the poll did more work when more changed -- something in it "
+            "still scales with the change, not the set"
+        )
+        assert full_change_calls.count("pipeline.execute") == 1
+        assert no_change_calls.count("pipeline.execute") == 1
+        assert full_change_seconds < no_change_seconds * 5 + 0.5, (
+            f"500-change poll took {full_change_seconds:.4f}s against "
+            f"{no_change_seconds:.4f}s for a 0-change poll"
+        )
+
+    def test_hysteresis_survives_across_polls_through_redis(self):
+        """T011 end to end: the band is read back from Redis, so it survives a
+        restart instead of collapsing to the join threshold."""
+        fake_redis = FakeRedis()
+        logins = [f"s{i}" for i in range(1, 31)]
+        service = make_poller(logins, fake_redis)
+        asyncio.run(service.poll_top_streams())
+        assert fake_redis.zrange(DESIRED_KEY, 0, -1) == logins[:15]
+
+        # s15 slips to rank 16 -- inside the retained band, so it stays. A
+        # brand-new service instance reads the band from Redis, not memory.
+        reordered = ["newcomer"] + logins[:14] + ["s15"] + logins[15:]
+        restarted = make_poller(reordered, fake_redis)
+        asyncio.run(restarted.poll_top_streams())
+
+        wanted = fake_redis.zrange(DESIRED_KEY, 0, -1)
+        assert "s15" in wanted, "the retained band did not survive the poll"
+        assert "newcomer" in wanted
+        assert "s16" not in wanted, "a newcomer entered through the band"
+
+    def test_streamer_falling_out_of_the_band_is_dropped(self):
+        fake_redis = FakeRedis()
+        logins = [f"s{i}" for i in range(1, 31)]
+        asyncio.run(make_poller(logins, fake_redis).poll_top_streams())
+
+        # s1 disappears from the ranking altogether.
+        asyncio.run(make_poller(logins[1:], fake_redis).poll_top_streams())
+
+        assert "s1" not in fake_redis.zrange(DESIRED_KEY, 0, -1)
+
+
+class TestReconcilerDiff:
+    """T014a -- the diff, adoption, revocation, and mid-pass changes."""
+
+    def test_creates_everything_missing(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert sorted(transport.subscriptions) == [1, 2, 3]
+        assert reconciler.subscription_count == 3
+
+    def test_works_highest_rank_first(self):
+        """Rank order matters at cold start: the busiest channels come up
+        first, so coverage is useful before the ramp finishes."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("top", 1), ("middle", 2), ("bottom", 3)])
+        transport = StubTransport(latency_seconds=0.001)
+        reconciler = make_reconciler(transport, fake_redis, concurrency=1)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert transport.create_calls == [1, 2, 3]
+
+    def test_drops_what_is_no_longer_wanted(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+        asyncio.run(reconciler.reconcile_once())
+
+        seed_desired(fake_redis, [("a", 1)])
+        asyncio.run(reconciler.reconcile_once())
+
+        assert sorted(transport.subscriptions) == [1]
+        assert len(transport.delete_calls) == 1
+
+    def test_adopts_an_existing_subscription_instead_of_recreating_it(self):
+        """FR-005. A restart must not duplicate what is already there."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2)])
+        transport = StubTransport()
+        asyncio.run(transport.create(1))  # already subscribed before we start
+        transport.create_calls.clear()
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert transport.create_calls == [2], "channel 1 was re-created, not adopted"
+        assert len(transport.subscriptions) == 2
+
+    def test_revoked_subscription_is_recreated(self):
+        """T014. A revoked subscription is not live, so it counts as absent."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        transport = StubTransport()
+        asyncio.run(transport.create(1))
+        transport.revoke(1)
+        transport.create_calls.clear()
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert transport.create_calls == [1]
+        assert transport.statuses[1] == "enabled"
+
+    def test_channel_that_leaves_mid_pass_is_not_created(self):
+        """T014. A poll landing during a long cold ramp must be picked up
+        through the generation counter, not acted on a pass too late."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3)])
+
+        class ShrinkingTransport(StubTransport):
+            """The poller lands right after the first create and shrinks the set."""
+
+            reconciler = None
+
+            async def create(self, broadcaster_id):
+                result = await super().create(broadcaster_id)
+                if len(self.create_calls) == 1:
+                    seed_desired(fake_redis, [("a", 1)])
+                    self.reconciler.notify_desired_changed()
+                return result
+
+        transport = ShrinkingTransport(latency_seconds=0.001)
+        reconciler = make_reconciler(transport, fake_redis, concurrency=1)
+        transport.reconciler = reconciler
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert transport.create_calls == [1], "kept creating channels nobody wants"
+        assert reconciler.subscription_count == 1
+
+    def test_converges_from_empty_partial_and_drifted(self):
+        """FR-005 -- the same pass has to work from any starting state."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())            # from empty
+        assert sorted(transport.subscriptions) == [1, 2, 3]
+
+        transport.revoke(2)                                  # drift
+        transport.subscriptions.pop(3)                       # socket death
+        reconciler._adoption_complete = False                # forces re-enumeration
+        asyncio.run(reconciler.reconcile_once())
+
+        assert sorted(transport.subscriptions) == [1, 2, 3]
+        assert all(status == "enabled" for status in transport.statuses.values())
+
+    def test_desired_login_without_an_id_is_skipped_not_crashed(self):
+        """The poller writes both keys in one transaction, so this should not
+        happen. If it ever does, skip the login rather than guess an id."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2)])
+        del fake_redis.hashes[DESIRED_IDS_KEY]["b"]
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert sorted(transport.subscriptions) == [1]
+
+
+class TestReconcilerRateLimit:
+    """D2 -- the 429 retry loop is load-bearing past about 400 channels."""
+
+    def test_rate_limited_channels_are_retried_never_dropped(self):
+        fake_redis = FakeRedis()
+        channels = [(f"s{i}", i) for i in range(1, 201)]
+        seed_desired(fake_redis, channels)
+        # A burst budget like the measured one: creates succeed until it runs
+        # out, then 429 until the backoff refills it.
+        transport = StubTransport(burst_budget=50, budget_refill_seconds=0.0)
+        reconciler = make_reconciler(transport, fake_redis)
+        before = counter_value("rate_limited")
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert len(transport.subscriptions) == 200, "channels were dropped on a 429"
+        assert counter_value("rate_limited") > before, "429s were not counted"
+
+    def test_refusal_is_counted_and_does_not_block_the_rest(self):
+        """About 1.5% of channels refuse. One refusal must not stall the ramp."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3)])
+        transport = StubTransport(refuse={2})
+        reconciler = make_reconciler(transport, fake_redis)
+        before = counter_value("refused")
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert sorted(transport.subscriptions) == [1, 3]
+        assert counter_value("refused") == before + 1
+
+    def test_backoff_honours_the_retry_after_the_transport_offers(self):
+        reconciler = make_reconciler(StubTransport(), FakeRedis())
+
+        backoff = reconciler._backoff_for([(1, RateLimitedError(retry_after=7.0))])
+
+        assert 7.0 <= backoff <= 7.7
+
+
+class TestReconcilerAdoption:
+    """T013 and T014b -- rebuilding the actual set, including a partial read."""
+
+    def test_partial_enumeration_keeps_what_it_saw(self):
+        """NFR-003. Pagination raising part way must not lose the entries
+        already read, and must not present the unread ones as absent."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [])
+        transport = StubTransport()
+        for broadcaster_id in (1, 2, 3, 4):
+            asyncio.run(transport.create(broadcaster_id))
+        transport.list_fails_after = 2
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert reconciler.subscription_count == 2, "the partial read was thrown away"
+        assert reconciler._adoption_complete is False
+
+    def test_partial_enumeration_never_deletes(self):
+        """The dangerous move is deleting on an incomplete picture: an unseen
+        subscription is not an unwanted one."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [])  # nothing is wanted -- everything looks droppable
+        transport = StubTransport()
+        for broadcaster_id in (1, 2, 3, 4):
+            asyncio.run(transport.create(broadcaster_id))
+        transport.list_fails_after = 2
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert transport.delete_calls == [], "deleted on an incomplete view"
+        assert len(transport.subscriptions) == 4
+
+    def test_enumeration_is_retried_until_one_succeeds(self):
+        """Once the view is whole, the held-back drops go through."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [])
+        transport = StubTransport()
+        for broadcaster_id in (1, 2, 3, 4):
+            asyncio.run(transport.create(broadcaster_id))
+        transport.list_fails_after = 2
+        reconciler = make_reconciler(transport, fake_redis)
+        asyncio.run(reconciler.reconcile_once())
+
+        transport.list_fails_after = None
+        asyncio.run(reconciler.reconcile_once())
+
+        assert reconciler._adoption_complete is True
+        assert transport.subscriptions == {}
+        assert len(transport.delete_calls) == 4
+
+    def test_only_enabled_subscriptions_are_adopted(self):
+        """A lingering `websocket_disconnected` entry is not a live one."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [])
+        transport = StubTransport()
+        asyncio.run(transport.create(1))
+        asyncio.run(transport.create(2))
+        transport.statuses[2] = "websocket_disconnected"
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler._adopt())
+
+        assert reconciler.subscription_count == 1
+
+
+class TestReconcilerResilience:
+    """T014c -- NFR-002. A Redis fault is a skipped pass, not a dead service."""
+
+    def test_redis_failure_skips_the_pass_without_crashing(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+        fake_redis.fail_on = {"zrange"}
+
+        asyncio.run(reconciler.reconcile_once())  # must not raise
+
+        assert transport.create_calls == []
+
+    def test_redis_failure_drops_no_live_subscription(self):
+        """The failure path must never look like "nothing is wanted"."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+        asyncio.run(reconciler.reconcile_once())
+        assert len(transport.subscriptions) == 2
+
+        fake_redis.fail_on = {"zrange"}
+        asyncio.run(reconciler.reconcile_once())
+
+        assert len(transport.subscriptions) == 2, "a Redis fault dropped live work"
+        assert transport.delete_calls == []
+
+    def test_the_next_pass_recovers(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+        fake_redis.fail_on = {"zrange"}
+        asyncio.run(reconciler.reconcile_once())
+
+        fake_redis.fail_on = set()
+        asyncio.run(reconciler.reconcile_once())
+
+        assert sorted(transport.subscriptions) == [1]
+
+    def test_a_transport_failure_does_not_stop_the_other_channels(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3)])
+
+        class FlakyTransport(StubTransport):
+            async def create(self, broadcaster_id):
+                if broadcaster_id == 2:
+                    raise TransportError("boom")
+                return await super().create(broadcaster_id)
+
+        transport = FlakyTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert sorted(transport.subscriptions) == [1, 3]
+
+    def test_the_loop_keeps_running_across_a_failing_pass(self):
+        """The asyncio task must outlive a bad pass, or a stalled reconciler
+        would look exactly like a healthy one."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis, idle_timeout_seconds=0.01)
+        fake_redis.fail_on = {"zrange"}
+
+        async def run_briefly():
+            task = asyncio.create_task(reconciler.run())
+            await asyncio.sleep(0.05)
+            fake_redis.fail_on = set()
+            await asyncio.sleep(0.05)
+            reconciler.stop()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(run_briefly())
+
+        assert sorted(transport.subscriptions) == [1], "the loop did not recover"
+
+
+class TestReconcilerConcurrencyBound:
+    """T014d -- NFR-001. No task or thread per channel."""
+
+    def test_task_count_stays_bounded_at_500_channels(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [(f"s{i}", i) for i in range(1, 501)])
+
+        class TaskCountingTransport(StubTransport):
+            max_tasks = 0
+
+            async def create(self, broadcaster_id):
+                TaskCountingTransport.max_tasks = max(
+                    TaskCountingTransport.max_tasks, len(asyncio.all_tasks())
+                )
+                return await super().create(broadcaster_id)
+
+        transport = TaskCountingTransport(latency_seconds=0.0005)
+        reconciler = make_reconciler(transport, fake_redis, concurrency=10)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert len(transport.subscriptions) == 500
+        assert TaskCountingTransport.max_tasks <= 10 + 5, (
+            f"{TaskCountingTransport.max_tasks} tasks alive for 500 channels -- "
+            "the reconciler is spawning per-channel work"
+        )
+
+    def test_worker_pool_never_exceeds_the_configured_concurrency(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [(f"s{i}", i) for i in range(1, 101)])
+
+        class ConcurrencyProbe(StubTransport):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.in_flight = 0
+                self.peak = 0
+
+            async def create(self, broadcaster_id):
+                self.in_flight += 1
+                self.peak = max(self.peak, self.in_flight)
+                try:
+                    return await super().create(broadcaster_id)
+                finally:
+                    self.in_flight -= 1
+
+        transport = ConcurrencyProbe(latency_seconds=0.001)
+        reconciler = make_reconciler(transport, fake_redis, concurrency=4)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert transport.peak <= 4
+
+
+class TestReconcilerMetrics:
+    """T015 and T016 -- FR-012. A stalled reconciler must be visible while the
+    polls keep succeeding (US2 acceptance scenario 2)."""
+
+    def test_subscription_count_tracks_the_actual_set(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2)])
+        reconciler = make_reconciler(StubTransport(), fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert reconciler_module.eventsub_subscription_count._value.get() == 2
+
+    def test_last_success_timestamp_advances_on_a_good_pass(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        reconciler = make_reconciler(StubTransport(), fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert reconciler_module.reconcile_last_success_timestamp._value.get() > 0
+
+    def test_last_success_timestamp_stalls_when_the_pass_fails(self):
+        """This is the signal that separates "reconciler dead" from "poll
+        dead". It must not move on a pass that could not read the intent."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        reconciler = make_reconciler(StubTransport(), fake_redis)
+        asyncio.run(reconciler.reconcile_once())
+        stalled_at = reconciler_module.reconcile_last_success_timestamp._value.get()
+
+        fake_redis.fail_on = {"zrange"}
+        asyncio.run(reconciler.reconcile_once())
+
+        assert reconciler_module.reconcile_last_success_timestamp._value.get() == stalled_at
+
+    def test_connection_occupancy_is_published(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3)])
+        reconciler = make_reconciler(StubTransport(connections=2), fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        total = sum(
+            reconciler_module.eventsub_connection_occupancy.labels(connection=str(i))._value.get()
+            for i in range(2)
+        )
+        assert total == 3
+
+    def test_reconcile_duration_is_observed(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        reconciler = make_reconciler(StubTransport(), fake_redis)
+        before = reconciler_module.reconcile_duration_seconds._sum.get()
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert reconciler_module.reconcile_duration_seconds._sum.get() >= before
+
+    def test_active_stream_count_follows_the_reconciler_not_joined_channels(self):
+        """joined_channels is no longer maintained, so the old gauge would sit
+        at zero forever. It has to follow the subscriptions that exist."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3)])
+        observed = []
+        reconciler = Reconciler(
+            transport=StubTransport(),
+            redis_client=fake_redis,
+            config=ReconcilerConfig(concurrency=4, idle_timeout_seconds=0.01),
+            on_pass_complete=observed.append,
+        )
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert observed == [3]
+
+
+class TestReconcilerLifecycle:
+    """T012 -- the reconciler is a task in THIS process, started from start().
+
+    Not a separate container: it shares the process /health endpoint and this
+    logger. It must also be stopped before Redis closes underneath it.
+    """
+
+    def test_start_launches_the_reconciler_task(self):
+        service = StreamMonitoringService()
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        transport = StubTransport()
+
+        async def fake_initialize():
+            service.redis_client = fake_redis
+            service.scheduler = MagicMock()
+            service.reconciler = make_reconciler(transport, fake_redis)
+
+        async def run_briefly():
+            service.initialize = fake_initialize
+            service.running = False  # start() returns once its keep-alive sees this
+            await service.start()
+            assert service._reconciler_task is not None
+            assert not service._reconciler_task.done()
+            await asyncio.sleep(0.05)
+            return service._reconciler_task
+
+        task = asyncio.run(run_briefly())
+
+        assert sorted(transport.subscriptions) == [1], "the task never reconciled"
+        assert task.cancelled() or task.done(), "the loop outlived its event loop"
+
+    def test_stop_cancels_the_reconciler_before_closing_redis(self):
+        service = StreamMonitoringService()
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        service.redis_client = MagicMock()
+        service.reconciler = make_reconciler(StubTransport(), fake_redis)
+
+        async def run_and_stop():
+            service._reconciler_task = asyncio.create_task(service.reconciler.run())
+            await asyncio.sleep(0.03)
+            await service.stop()
+            return service._reconciler_task
+
+        task = asyncio.run(run_and_stop())
+
+        assert task.done()
+        assert service.reconciler.running is False
+        service.redis_client.close.assert_called_once()
+
+
+class TestReconcilerConfig:
+    """Settings are validated up front, the way resolve_thresholds is."""
+
+    def test_defaults_match_the_measured_decision(self):
+        config = reconciler_module.resolve_reconciler_config({})
+        assert config.concurrency == 10
+        assert config.idle_timeout_seconds == 5.0
+        assert config.rate_limit_backoff_seconds == 10.0
+
+    def test_concurrency_is_read_from_the_environment(self):
+        config = reconciler_module.resolve_reconciler_config({"RECONCILE_CONCURRENCY": "15"})
+        assert config.concurrency == 15
+
+    def test_zero_concurrency_is_rejected(self):
+        """A pool of nothing would never converge, and would do it silently."""
+        with pytest.raises(ValueError, match="RECONCILE_CONCURRENCY must be >= 1"):
+            reconciler_module.resolve_reconciler_config({"RECONCILE_CONCURRENCY": "0"})
+
+    def test_zero_idle_timeout_is_rejected(self):
+        with pytest.raises(ValueError, match="RECONCILE_IDLE_TIMEOUT_SECONDS"):
+            reconciler_module.resolve_reconciler_config({"RECONCILE_IDLE_TIMEOUT_SECONDS": "0"})
+
+    def test_transport_interface_cannot_be_used_directly(self):
+        """The seam is abstract on purpose: Phase 2 supplies the real pool."""
+        with pytest.raises(TypeError):
+            reconciler_module.SubscriptionTransport()
 
 
 if __name__ == "__main__":
