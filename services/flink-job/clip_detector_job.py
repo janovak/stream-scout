@@ -492,20 +492,53 @@ class PostgresClient:
     def mark_clipping_disabled(self, broadcaster_id: int):
         """Record that a broadcaster does not allow clip creation.
 
-        stream-monitoring checks this flag before joining/staying in a
-        broadcaster's chat, so we stop spending a chat connection on
-        someone we can never successfully clip.
+        stream-monitoring drops this broadcaster from the ranking, so we stop
+        spending a subscription on someone we can never successfully clip.
+
+        `clipping_disabled_at` is written in the same UPDATE as the boolean, so
+        the two can never disagree. The timestamp is what lets the skip expire:
+        stream-monitoring lets a broadcaster back into the ranking once the
+        mark is more than 7 days old, which gives a broadcaster who has since
+        turned clipping on a way back (spec 004 D5, FR-013). Without it the
+        boolean is a life sentence.
         """
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE streamers SET allows_clipping = FALSE WHERE streamer_id = %s
+                    UPDATE streamers
+                    SET allows_clipping = FALSE, clipping_disabled_at = NOW()
+                    WHERE streamer_id = %s
                 """, (broadcaster_id,))
                 conn.commit()
                 logger.info(f"Marked broadcaster {broadcaster_id} as allows_clipping=FALSE")
         except Exception as e:
             logger.error(f"Failed to mark broadcaster {broadcaster_id} as clipping-disabled: {e}")
+            conn.rollback()
+
+    def mark_clipping_allowed(self, broadcaster_id: int):
+        """Undo a `allows_clipping = FALSE` mark after a clip actually worked.
+
+        Only touches rows that are currently FALSE, so the ordinary case --
+        a broadcaster who has always allowed clipping -- costs one UPDATE that
+        matches nothing rather than a write per clip. The 7-day re-check hands
+        a stale-disabled broadcaster one more attempt; this is what happens
+        when that attempt succeeds.
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE streamers
+                    SET allows_clipping = TRUE, clipping_disabled_at = NULL
+                    WHERE streamer_id = %s AND allows_clipping = FALSE
+                """, (broadcaster_id,))
+                healed = cur.rowcount
+                conn.commit()
+            if healed:
+                logger.info(f"Broadcaster {broadcaster_id} allows clipping again; cleared the mark")
+        except Exception as e:
+            logger.error(f"Failed to clear the clipping-disabled mark for {broadcaster_id}: {e}")
             conn.rollback()
 
     def close(self):
@@ -914,6 +947,9 @@ class ClipCreator(ProcessFunction):
         logger.info(f"Storing clip {result.clip_id} in database...")
         with self._postgres_lock:
             self.postgres_client.insert_clip(clip_result)
+            # A clip just succeeded, so whatever made us mark this broadcaster
+            # clipping-disabled is no longer true (FR-013).
+            self.postgres_client.mark_clipping_allowed(broadcaster_id)
 
         with self._metrics_lock:
             _init_metrics(self.subtask_index)

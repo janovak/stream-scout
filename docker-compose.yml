@@ -394,6 +394,13 @@ services:
       - REDIS_URL=redis://redis:6379
       - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
       - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+      # Scopes this service needs on the token, seeded by
+      # seed_twitch_tokens.py REQUIRED_SCOPES:
+      #   user:read:chat -- EventSub channel.chat.message (the chat transport)
+      #   clips:edit     -- clip creation, shared with the Flink job
+      #   chat:read      -- IRC only, and IRC is gone after spec 004 Phase 3
+      # A token without user:read:chat makes every chat subscription refuse;
+      # the service logs that at ERROR on start-up rather than going quiet.
       - TWITCH_TOKEN_FILE=/app/secrets/twitch_user_tokens.json
       - TWITCH_TOKEN_GID=9999
       - PROMETHEUS_PORT=9100
@@ -403,6 +410,7 @@ services:
       - ./secrets:/app/secrets:rw
       - ./services/stream-monitoring/stream_monitoring_service.py:/app/stream_monitoring_service.py:ro
       - ./services/stream-monitoring/reconciler.py:/app/reconciler.py:ro
+      - ./services/stream-monitoring/eventsub_pool.py:/app/eventsub_pool.py:ro
       - ./services/stream-monitoring/token_manager.py:/app/token_manager.py:ro
     depends_on:
       postgres:

@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,8 +32,21 @@ TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
 TOKEN_FILE_PATH = Path(__file__).parent / "secrets" / "twitch_user_tokens.json"
 
-# Required scopes for chat reading and clip creation
-REQUIRED_SCOPES = [AuthScope.CHAT_READ, AuthScope.CLIPS_EDIT]
+# stream-monitoring (root) and the Flink containers (uid 9999) share this
+# file. token_manager._write_atomic() keeps every container's write readable
+# to the others by chowning to a shared group -- see KNOWN_ISSUES.md Issue 1.
+# The seed runs on the host as an ordinary user who is usually not in that
+# group, so it cannot reproduce the chown. It must therefore not narrow the
+# mode either, or the first Flink read after a re-seed fails.
+TWITCH_TOKEN_GID = int(os.getenv("TWITCH_TOKEN_GID", "9999"))
+
+# Required scopes.
+#
+# `user:read:chat` is what EventSub's `channel.chat.message` subscription
+# needs (spec 004 T017). It replaces IRC's `chat:read`, which Phase 3 drops
+# once IRC is gone -- both are seeded until then, so a re-seed cannot leave
+# the running IRC transport without its scope.
+REQUIRED_SCOPES = [AuthScope.CHAT_READ, AuthScope.USER_READ_CHAT, AuthScope.CLIPS_EDIT]
 
 
 def save_tokens(access_token: str, refresh_token: str, scopes: list[str]) -> None:
@@ -46,10 +60,42 @@ def save_tokens(access_token: str, refresh_token: str, scopes: list[str]) -> Non
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
-    with open(TOKEN_FILE_PATH, "w") as f:
-        json.dump(token_data, f, indent=2)
+    # Write a new file and rename it over the old one, the way
+    # token_manager._write_atomic does. Two reasons, both real here:
+    #
+    # - A re-seed replaces a file the containers own. The live token is
+    #   0640 uid 9999 (the Flink base image's user), which the host user
+    #   running this script cannot open for writing. Replacing the name
+    #   needs write permission on the directory, which it does have.
+    # - A reader never sees a half-written token.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=TOKEN_FILE_PATH.parent, prefix=".tmp-tokens-", suffix=".json"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(token_data, f, indent=2)
 
-    print(f"\nTokens saved to: {TOKEN_FILE_PATH}")
+        # Hand the file to the shared group when this process is allowed to,
+        # and otherwise leave it group- and world-readable. Either way all
+        # three containers can read it (KNOWN_ISSUES Issue 1). A 0640 file
+        # owned by the seeding host user is the one combination that locks the
+        # Flink containers out, so never narrow the mode without the chown.
+        try:
+            os.chown(tmp_path, -1, TWITCH_TOKEN_GID)
+            os.chmod(tmp_path, 0o640)
+            shared = f"group {TWITCH_TOKEN_GID}, mode 0640"
+        except PermissionError:
+            os.chmod(tmp_path, 0o644)
+            shared = (
+                f"mode 0644 -- this user is not in gid {TWITCH_TOKEN_GID}, so the "
+                "file stays world-readable until a container rewrites it"
+            )
+        os.replace(tmp_path, TOKEN_FILE_PATH)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+
+    print(f"\nTokens saved to: {TOKEN_FILE_PATH} ({shared})")
 
 
 async def seed_tokens() -> None:
