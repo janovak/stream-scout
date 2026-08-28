@@ -667,5 +667,90 @@ class TestGracefulShutdown:
         assert len(shutdown_order) == 6
 
 
+class TestChannelThresholdConfig:
+    """Tests for the env-configurable monitored-set size.
+
+    These call resolve_thresholds() directly with an env mapping rather than
+    reloading the module: module-level Prometheus collectors cannot be
+    registered twice in one process, so the module is not reloadable.
+    """
+
+    def test_thresholds_default_to_15_and_30(self):
+        """Absent env vars, the shipped defaults are unchanged."""
+        assert stream_monitoring_service.resolve_thresholds({}) == (15, 30)
+
+    def test_thresholds_read_from_environment(self):
+        """The monitored set can be ramped without editing code."""
+        join, leave = stream_monitoring_service.resolve_thresholds(
+            {"JOIN_THRESHOLD": "300", "LEAVE_THRESHOLD": "500"}
+        )
+        assert (join, leave) == (300, 500)
+
+    def test_inverted_band_is_rejected(self):
+        """LEAVE below JOIN leaves no hysteresis, so every joined channel would
+        be instantly leave-eligible -- thrashing chat once per poll."""
+        with pytest.raises(ValueError, match="must be >= JOIN_THRESHOLD"):
+            stream_monitoring_service.resolve_thresholds(
+                {"JOIN_THRESHOLD": "100", "LEAVE_THRESHOLD": "50"}
+            )
+
+    def test_equal_thresholds_are_allowed(self):
+        """A zero-width band is degenerate but not incoherent -- it is the
+        no-hysteresis case, and the operator may want it while ramping."""
+        assert stream_monitoring_service.resolve_thresholds(
+            {"JOIN_THRESHOLD": "50", "LEAVE_THRESHOLD": "50"}
+        ) == (50, 50)
+
+    def test_zero_join_threshold_is_rejected(self):
+        """Monitoring nothing is a misconfiguration, not a valid state."""
+        with pytest.raises(ValueError, match="JOIN_THRESHOLD must be >= 1"):
+            stream_monitoring_service.resolve_thresholds(
+                {"JOIN_THRESHOLD": "0", "LEAVE_THRESHOLD": "30"}
+            )
+
+    def test_module_defaults_match_shipped_values(self):
+        """The imported module still ships 15/30 for anyone not setting env."""
+        assert stream_monitoring_service.JOIN_THRESHOLD == 15
+        assert stream_monitoring_service.LEAVE_THRESHOLD == 30
+
+
+class TestFetchBudget:
+    """Tests for the paginated fetch budget.
+
+    Regression guard: fetch_count was previously min(..., 100), which silently
+    capped the monitored set at 100 however high LEAVE_THRESHOLD was set.
+    """
+
+    def test_single_page_keeps_the_original_timeout(self):
+        """At the shipped 15/30 the behaviour is unchanged: one page, 10s."""
+        pages, timeout = stream_monitoring_service.fetch_budget(50)
+        assert pages == 1
+        assert timeout == stream_monitoring_service.GET_STREAMS_TIMEOUT_SECONDS
+
+    def test_fetch_count_above_100_needs_multiple_pages(self):
+        """Helix caps `first` at 100, so a larger set must paginate."""
+        pages, _ = stream_monitoring_service.fetch_budget(520)
+        assert pages == 6
+
+    def test_timeout_scales_with_pages(self):
+        """A larger threshold must not trip a bound sized for a single page."""
+        _, one = stream_monitoring_service.fetch_budget(50)
+        _, six = stream_monitoring_service.fetch_budget(520)
+        assert six > one
+
+    def test_timeout_never_reaches_the_poll_interval(self):
+        """A stalled fetch must not eat several poll cycles at any threshold."""
+        for fetch_count in (50, 520, 2020, 100_000):
+            _, timeout = stream_monitoring_service.fetch_budget(fetch_count)
+            assert timeout < stream_monitoring_service.POLL_INTERVAL_SECONDS
+
+    def test_capped_timeout_still_far_exceeds_measured_cost(self):
+        """The cap must stay a wide margin over the ~0.1s-per-page measurement,
+        or a healthy large fetch would start timing out."""
+        pages, timeout = stream_monitoring_service.fetch_budget(2020)
+        assert pages == 21
+        assert timeout >= pages * 0.1 * 10
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
