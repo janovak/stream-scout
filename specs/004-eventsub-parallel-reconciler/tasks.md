@@ -111,37 +111,55 @@ open -- see `research.md`. 154 stream-monitoring tests, 110 flink-job tests.
 **No dual-transport period.** Delete IRC once EventSub carries traffic
 (Phase 2 checkpoint met). This is what keeps the service simple.
 
-- [ ] T029 **[FR-001]** Delete `_manage_chat_connections`, `joined_channels`, `_on_chat_ready`, `_on_chat_message`, the `Chat` client, and the `ChatEvent`/`Chat` imports from `stream_monitoring_service.py`
-- [ ] T030 Delete `DEAD_CHAT_CONFIRMATION_POLLS`, `_consecutive_dead_chat_polls`, and the dead-chat recovery path — it exists only for IRC's connection-oriented membership
-- [ ] T031 Delete `services/stream-monitoring/patches/twitchapi_leave_room_timeout.py` and its two Dockerfile lines (`COPY` + `RUN`). It works around a PART-confirmation hang EventSub cannot have
-- [ ] T032 Remove `CHAT_READ` from the scope mapping in `stream_monitoring_service.py` and `chat:read` from required scopes if nothing else needs it (T017 added `user:read:chat`)
-- [ ] T033 Delete the `GET_STREAMS_TIMEOUT_SECONDS` chat-hang comment block that references the deleted patch; keep the timeout itself
-- [ ] T034 [P] Remove IRC-specific tests from `test_stream_monitoring.py` (join/leave, dead-connection recovery, hysteresis-via-`_manage_chat_connections`); the FR-011 behaviour is now covered by T011
-- [ ] T035 Update `KNOWN_ISSUES.md` — IRC-specific entries (the JOIN bucket, the `leave_room` hang, dead-chat recovery) become moot. It is untracked in git; edit it in place
+- [x] T029 **[FR-001]** DONE 2026-08-28 (commit `f9c989e`, PR #47) — `_manage_chat_connections`, `_on_chat_ready`, `_on_chat_message`, the `Chat` client and its `stop()` block, `joined_channels`, `broadcaster_ids` and the `twitchAPI.chat` / `ChatEvent` imports all deleted. The offline-lifecycle path now reads the poll's local `broadcaster_ids` dict
+- [x] T030 DONE 2026-08-28 (commit `f9c989e`) — `DEAD_CHAT_CONFIRMATION_POLLS` and `_consecutive_dead_chat_polls` deleted with the recovery path
+- [x] T031 DONE 2026-08-28 (commit `f9c989e`) — `patches/twitchapi_leave_room_timeout.py` and its two Dockerfile lines deleted
+- [x] T032 DONE 2026-08-28 (commit `f9c989e`) — `chat:read` / `AuthScope.CHAT_READ` dropped from `seed_twitch_tokens.py` and `SCOPE_MAP`. `has_chat_scope` (EventSub's `USER_READ_CHAT`) untouched
+- [x] T033 DONE 2026-08-28 (commit `f9c989e`) — chat-hang paragraph dropped, `GET_STREAMS_TIMEOUT_SECONDS` itself kept
+- [x] T034 [P] DONE 2026-08-28 (commit `f9c989e`) — `TestChatRoomManagement`, `TestChatConnectionRecovery` and the two IRC-vs-EventSub payload-equivalence tests removed (their reference, the live IRC handler, is gone). 154 → 144 tests
+- [x] T035 DONE 2026-08-28 (commit `f9c989e`) — `KNOWN_ISSUES.md` Issue 5 and the JOIN-bucket / `leave_room` notes marked moot. Untracked, edited in place
+
+**Checkpoint**: DONE 2026-08-28, merged as PR #47. **Deployed 2026-08-29 03:48 UTC**, not at merge time: `stream_monitoring_service.py` is bind-mounted as a single file, so the running container kept the old inode across the `git checkout` and went on executing the Phase-2-era code. `docker compose up -d --force-recreate` was needed. See `research.md` "Deployment trap found while verifying"; `OPERATIONS.md` should carry it (T055).
 
 ---
 
 ## Phase 4: Watermark and detection
 
-- [ ] T036 [US3] **[D4, FR-010]** Set `WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2` in `services/flink-job/spike_detector.py`. Update the comment to cite the T002 measurement, not KNOWN_ISSUES Issue 4. `clip_detector_job.py` and `tools/replay.py` read the same constant
-- [ ] T037 [US3] Update the KNOWN_ISSUES Issue 4 "Post-deploy validation" delay arithmetic for the +1 s change
-- [ ] T038 [US3] **[SC-005]** Measure the residual late-drop rate at 500 channels with the 2 s watermark, from Flink's late-records-dropped metric on the `chat-messages` source (`numLateRecordsDropped` / total). Record it in `research.md`. It must be below 0.1%
-- [ ] T039 [US3] **[US3 Independent Test]** Replay a post-cutover capture through `tools/replay.py` and compare anomaly rate and character against the pre-cutover corpus. Not byte-identical — the input differs — but the rate and shape must be consistent
+- [x] T036 [US3] **[D4, FR-010]** DONE 2026-08-29 — constant is 2, comment rewritten around T002 (delivery lag at 414 channels, one message in 59,405 past 2 s). `WATERMARK_IDLENESS_SECONDS` untouched at 10. Also fixed a stale `now_seconds+1..+5` literal in `clip_detector_job.py` left over from the 5 s era. Deployed 02:52 UTC (job `586d5750`); measured `watermarkLag` ceiling moved to 2,356–2,804 ms
+- [x] T037 [US3] DONE 2026-08-29 — `KNOWN_ISSUES.md` Issue 4 now carries the bookkeeping for both the 5 → 1 and the 1 → 2 moves. That section had never recorded the 5 → 1 step, so both gaps closed together. Doc only (the file is untracked)
+- [x] T038 [US3] **[SC-005]** DONE 2026-08-29 — **`numLateRecordsDropped` does not exist for this job**: Flink emits it from windowing operators and this job is a `KeyedProcessFunction` with per-second timers. Confirmed against the job's REST API. Measured the equivalent quantity directly on the live topic instead — per partition, in offset order: **0.000% past 2 s over 27,218 records** (0.0147% at 1 s), budget 0.1%. **Measured at 24 broadcasters, not 500** — see `research.md` "What was NOT measured at 500"
+- [x] T039 [US3] **[US3 Independent Test]** DONE 2026-08-29 — 195,110-record post-cutover capture vs `corpus/dev-slice.jsonl`. Per-hour rates differ 0.30×, but the post window is 4.6× less dense per broadcaster; **normalised by volume the rates agree to 4%** (21.14 vs 22.04 spikes/100k messages) and every shape measure agrees to 6% (mean intensity 5.20 vs 5.51). Replay is deterministic across runs
 - [x] T040 [US3] **[R1, FR-014]** SKIPPED 2026-08-28 — T004 measured 0.00% ramp loss and no opening-baseline depression. No warm-up gate is built. Re-open only if twitchAPI is upgraded past 4.5.0 (the synchronous-callback behaviour is version-specific — `research.md` R1)
+
+**Checkpoint**: DONE 2026-08-29. The watermark is 2 s in the deployed job and the
+measured `watermarkLag` ceiling moved with it (2,356–2,804 ms). Detection is
+unchanged on the new value: replayed against the pre-cutover corpus, the
+volume-normalised anomaly rate agrees to 4% and every shape measure to 6%.
 
 ---
 
 ## Phase 5: Verify
 
-- [ ] T041 [US1] **[SC-001]** Cold start to 500 channels: measure time to full coverage. Target under 60 s; fail over 120 s
-- [ ] T042 [US2] **[SC-002]** Poll duration flat against desired-set change size (re-run T010 at 500 channels live)
-- [ ] T043 **[SC-003]** No `Bucket channel_join got rate limited` anywhere in the logs — the IRC bucket is gone
-- [ ] T044 [US1] **[SC-004]** 500 channels sustained for 30+ minutes: `eventsub_subscription_count` within ±1% of the desired-set size, every delta attributable to a logged refusal, a reconnect, or a desired-set change
-- [ ] T044a **[SC-007]** Confirm every FR-012 metric (`eventsub_subscription_count`, `reconcile_duration_seconds`, `subscription_create_failures_total`, `eventsub_connection_occupancy`, `reconcile_last_success_timestamp`) is present on `/metrics` and populated while the reconciler runs
-- [ ] T045 [US4] **[SC-006]** Kill the service mid-ramp, restart, confirm convergence with no duplicate subscriptions
-- [ ] T046 [US3] Confirm `sent_at` in live Kafka messages is epoch ms and within the 2 s watermark of ingestion `timestamp`
-- [ ] T047 Run the full `test_stream_monitoring.py` suite; every test passes
-- [ ] T048 Run `test_replay.py` and `test_spike_detector.py` unmodified after the T036 constant change; adjust only tests that assert the old `1` value, and only to `2`
+- [x] T041 [US1] **[SC-001]** **PASS** 2026-08-29 — 500 channels via the synthetic driver (real `Reconciler` + real `EventSubPoolTransport`): 50% at 7.5 s, 90% at 48.6 s, 95% at 50.1 s, **99% at 51.1 s**, plateau 499/500. Inside the 60 s target
+- [x] T042 [US2] **[SC-002]** **PASS** 2026-08-29 — real `_write_desired_set` against a real Redis at 500: change-nothing p50 9.975 ms vs change-everything (two disjoint 500-member sets, full turnover every write) p50 10.391 ms = **1.042×**, and an identical **6 Redis commands** per write either way. The command count is the assertion; wall clock is the backstop
+- [x] T043 **[SC-003]** **PASS** 2026-08-29 — zero occurrences, and zero rate-limit lines of any kind. Structural, not incidental: the deployed service no longer imports `twitchAPI.chat` at all. Checked after force-recreating the container, because it had been running stale pre-Phase-3 code (see `research.md` "Deployment trap")
+- [x] T044 [US1] **[SC-004]** **PASS** 2026-08-29 — 31 minutes, 26 one-minute samples, subscriptions **499 constant** against a desired 500. Deviation **0.2%** against the ±1% budget, 0 lost-socket events, 181,180 messages received across two connections (300 + 199, the pool grew at the 301st as D6 designs). The single delta is one channel refusing on every pass — attributable to a logged refusal
+- [x] T044a **[SC-007]** **PASS** 2026-08-29 — all five present with HELP/TYPE and live values while the reconciler runs (`reconcile_last_success_timestamp` within 3 s of now). `subscription_create_failures_total` shows HELP/TYPE with no series at zero failures, which is this exporter's register-on-first-increment behaviour; it was seen populating as `{reason="refused"} 1.0` during the driver runs
+- [x] T045 [US4] **[SC-006]** **PASS** 2026-08-29 — `SIGKILL` mid-ramp at ~250–350 of 500, no teardown; restart converged to **499/500 in 74 s** with **499 live broadcasters and 0 duplicates**. Slower than the 51 s cold start because the killed ramp had already spent part of the create budget (the T003b shape). Also done on production: killed and restarted, converged 21/21, Twitch's own pages showing 21 enabled on one session across 21 distinct broadcasters, no duplicate
+- [x] T046 [US3] DONE 2026-08-29 — 27,218 live records: `sent_at` an epoch-ms int in every one, 0 null, 0 non-int. Skew against ingestion `timestamp` min 101 / p50 166 / p95 231 / p99 269 / max 1,258 ms, **0 outside the 2 s tolerance**
+- [x] T047 DONE 2026-08-29 — 136 passed, 8 skipped (the pre-existing Postgres self-heal skips: the host has no `twitch` role)
+- [x] T048 DONE 2026-08-29 — 83 passed in those two files; whole flink-job suite 106 passed, 4 skipped. **One change**: `test_replay.py` fed the literal `1002 * 1000 + 1` to push the watermark past bucket 1001, which is `1001 * 1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1` evaluated at the old 1 s. It is symbolic now, like every other feed in the file. No assertion was touched, and the expression is identical to the old one at the old value
+
+**Checkpoint**: DONE 2026-08-29. **All seven success criteria pass.** SC-001,
+SC-002, SC-004 and SC-006 were measured at a real 500 channels through a
+synthetic driver running the real `Reconciler` and `EventSubPoolTransport`
+against real Twitch — production stays at 15/30 by the operator's decision.
+SC-003 and SC-007 are production checks. **SC-005 is the one criterion taken at
+the operating point (24 broadcasters) rather than 500**, because a 500-channel
+late-drop number needs Flink in the path, which means ~25× traffic through a
+parallelism-4 job and `ClipCreator` loose on a set the clip budget cannot serve
+— the change spec.md defers to spec 005. `research.md` "What was NOT measured at
+500" states the gap and the argument that closes it, as an argument.
 
 ---
 

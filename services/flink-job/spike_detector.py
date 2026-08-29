@@ -57,17 +57,35 @@ from typing import List, Mapping, Optional, Tuple
 # simulated watermark share this value. The two must compute event-time
 # readiness in the same way.
 #
-# Was 5 from Phase 2 through 2026-08-27 -- a generic round-number default set
-# when event-time processing was introduced, not derived from a measurement.
-# KNOWN_ISSUES.md Issue 4 later measured real out-of-orderness on the live
-# `chat-messages` topic directly (per-partition, in offset order): worst
-# observed inversion 226ms, zero records more than 1s out of order across the
-# investigation's full sample. 1s keeps roughly 4x that margin. This trims the
-# deliberate floor of the peak-to-clip-request delay (KNOWN_ISSUES.md Issue 4,
-# "Post-deploy validation") by the same 4 seconds it removes here -- it does
-# not touch the separate, larger, still-open sparse-partition/idleness
-# component of that delay.
-WATERMARK_OUT_OF_ORDERNESS_SECONDS = 1
+# History. The value was 5 from Phase 2 through 2026-08-27. That was a round
+# number with no measurement behind it. It became 1 on 2026-08-27, while chat
+# arrived over IRC: KNOWN_ISSUES.md Issue 4 measured the live `chat-messages`
+# topic per partition, in offset order, and found a worst inversion of 226ms
+# and no record more than 1s out of order.
+#
+# The value is 2 from 2026-08-29. The transport changed. This is not a
+# correction of the IRC number. Chat now arrives over EventSub (spec 004), and
+# EventSub delivery lag is a different quantity from IRC inversion depth. It is
+# the time between Twitch writing `metadata.message_timestamp` and this
+# pipeline receiving the record. Spec 004 Phase 0 T002 measured that lag over
+# 59,405 messages at 414 channels: p50 163ms, p95 217ms, p99 257ms,
+# p99.9 415ms, p99.99 1,255ms. The tail did not grow against the 394-channel
+# spike (154 / 220). One message went past 2s. That is 0.0017%.
+#
+# A 2s bound therefore drops about 0.0017% of records. The SC-005 budget is
+# 0.1%, so 2s stays about 60 times below it. A 1s bound drops about 0.039% on
+# the same data. That is also below the budget, but it keeps no margin for the
+# 414-to-500 channel gap that T002 did not measure. The T002 figure is an upper
+# bound as well: its measurement consumer did receive and bookkeeping on one
+# asyncio loop, so that loop's scheduling jitter is inside these numbers.
+#
+# The cost is 1 second. It adds that second to the deliberate floor of the
+# peak-to-clip-request delay (KNOWN_ISSUES.md Issue 4, "Post-deploy
+# validation"). It does not change the separate, larger sparse-partition and
+# idleness component of that delay.
+#
+# See specs/004-eventsub-parallel-reconciler/research.md D4.
+WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2
 
 # KNOWN_ISSUES.md Issue 4: how long a source split can go silent before
 # with_idleness() lets the operator watermark advance past it. Through

@@ -720,8 +720,9 @@ class AnomalyDetector(KeyedProcessFunction):
             # adds these counts and cannot accept one.
             all_counts = {ts: c for ts, c in self.message_counts.items() if c is not None}
 
-            # A message for second now_seconds+1..+5 can already be in
-            # MapState by the time now_seconds's timer fires -- its own timer
+            # A message for a second after now_seconds -- up to
+            # now_seconds + WATERMARK_OUT_OF_ORDERNESS_SECONDS -- can already be
+            # in MapState by the time now_seconds's timer fires. Its own timer
             # only requires the watermark to pass now_seconds, but the
             # watermark itself only advances that far once messages up to
             # ~now_seconds + WATERMARK_OUT_OF_ORDERNESS_SECONDS have already

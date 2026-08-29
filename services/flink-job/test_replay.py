@@ -131,7 +131,9 @@ def test_future_buckets_already_in_state_are_excluded_from_evaluate():
     # only one second wide here (see the comment above), so it ages out of
     # the 5-second window quickly and a longer tail would let the episode
     # already retire before this assertion ever ran.
-    evaluations.extend(replayer.feed(1, sent_at_ms=1002 * 1000 + 1))
+    evaluations.extend(
+        replayer.feed(1, sent_at_ms=1001 * 1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1)
+    )
     assert replayer._states[1].hold is not None
     assert replayer._states[1].hold.peak_at == 1001
 

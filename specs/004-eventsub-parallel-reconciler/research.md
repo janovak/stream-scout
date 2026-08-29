@@ -33,6 +33,10 @@ watermark → **PASS. Phase 2 unblocked.**
   before the harness added backoff. 414 ≈ the 394-channel spike; the lag
   distribution is the relevant output and it is clean. Re-confirm the tail at a
   full, stable 500 during Phase 5 (T044 / T038).
+  **Outcome (2026-08-29)**: T044 confirmed the transport at a stable 500 for
+  31 minutes, and T038 measured the late rate at 24 channels as 0.000%. The
+  tail was **not** re-measured at 500, because that needs Flink in the path.
+  See the honesty note at the end of Phase 5.
 - T002's lag tail includes scheduling jitter from a single-process measurement
   consumer (one asyncio loop doing receive + bookkeeping). The real Kafka
   producer path is lighter, so 0.0017% over 2 s is an **upper bound**.
@@ -147,6 +151,266 @@ carry a claim about 500 channels; that claim is Phase 5's to make, and the
 414→500 gap is the one thing standing between this gate and an unconditional
 pass.
 
+## Phase 4 — watermark move (COMPLETE, 2026-08-29)
+
+**T036**: `WATERMARK_OUT_OF_ORDERNESS_SECONDS` 1 → **2** in
+`services/flink-job/spike_detector.py`, with the comment block rewritten to
+cite T002 rather than KNOWN_ISSUES Issue 4. `clip_detector_job.py` and
+`tools/replay.py` import the same constant, so all three moved together.
+`WATERMARK_IDLENESS_SECONDS` was not touched and is still 10.
+
+One stale literal was corrected alongside it: `clip_detector_job.py`'s
+"a message for second now_seconds+1..+5" comment still carried the pre-2026-08-27
+value of 5. It now names the constant instead of a number.
+
+**Deployed 2026-08-29 02:52 UTC** (job `586d5750`). Application Mode: the four
+job `.py` files are bind-mounted, so restarting `flink-jobmanager` reruns the
+job with the new value. Confirmed from inside the container
+(`WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2`, `WATERMARK_IDLENESS_SECONDS = 10`).
+No state to migrate, because checkpointing is off.
+
+**Effect on the watermark, measured.**
+`max_over_time(flink_taskmanager_job_task_operator_watermarkLag[20m])` reads
+**2,356 / 2,515 / 2,804 ms** across the reporting subtasks — the out-of-orderness
+term plus processing, with the idleness timeout not firing. This is the +1 s
+cost the decision accepted, visible directly.
+
+**T037**: `KNOWN_ISSUES.md` Issue 4 "Post-deploy validation" now carries the
+bookkeeping for both the 5 → 1 and 1 → 2 moves. The delay figures there were
+measured at 5 s; the current value subtracts 3 s from each. That section had
+never recorded the 5 → 1 step either, so both gaps are closed together.
+
+### T038 [SC-005] — the metric named in the task does not exist
+
+`tasks.md` says to take the residual late-drop rate from Flink's
+`numLateRecordsDropped` on the chat-messages source. **That metric is not
+emitted by this job, and not because it is zero.** Flink reports it from
+windowing operators (and CEP). `clip_detector_job.py` uses a
+`KeyedProcessFunction` with per-second event-time timers and no window
+operator. Confirmed against the running job's REST API: `/jobs/<id>/vertices/
+<id>/metrics` lists no late-record metric on either vertex, and Prometheus has
+no such series to query.
+
+So **Flink drops nothing here.** A late record still reaches `process_element`
+and still increments its bucket. What it loses is its own second's evaluation,
+because `on_timer` for that bucket has already run. The quantity SC-005 is
+really about is therefore *the fraction of records that arrive after their own
+bucket's timer fired*, which is delivery lag beyond the watermark tolerance.
+
+Measured directly on the live topic, the same way Issue 4 measured
+out-of-orderness — per partition, in offset order, against a running maximum of
+`sent_at`. This is an **upper bound**: Flink's watermark is per split and the
+operator watermark is the minimum across splits, always at or below any one
+partition's, so a record counted late here may still be in time for the job.
+
+**600 s sample, 27,218 records, 24 broadcasters, all four partitions, on the
+deployed 2 s watermark:**
+
+| Bound | Records past it | Rate |
+|---|---|---|
+| 500 ms | 12 | 0.044% |
+| 1,000 ms | 4 | 0.0147% |
+| **2,000 ms** | **0** | **0.000%** |
+| 5,000 ms | 0 | 0.000% |
+
+Worst inversion 1,082 ms; inversion p99 87 ms, p99.9 207 ms.
+**SC-005 budget is 0.1%. At 2 s the measured rate is 0.000% — PASS.**
+
+The 1 s column is the useful one for D4: at the previous value this window
+would have dropped 0.0147%. Still inside budget, but non-zero, against 0 at
+2 s. That is the margin the extra second was bought for.
+
+**Channel count: this was measured at 24 broadcasters, not 500.** The
+500-channel measurement is carried by T044 below, which exercised the
+reconciler and the sockets at 500 but not Flink — see the honesty note at the
+end of Phase 5.
+
+### T039 [US3] — replay comparison, pre- and post-cutover
+
+`corpus/dev-slice.jsonl` (IRC, 2026-08-15, 264,867 records, 23 broadcasters,
+1.17 h) against a post-cutover capture drained from the live `chat-messages`
+topic (EventSub, 2026-08-29, 195,110 records, 30 broadcasters, 3.00 h). Both
+replayed through `tools/replay.py` with production's detector config.
+
+| | Pre (IRC) | Post (EventSub) | Ratio |
+|---|---|---|---|
+| Spikes | 56 | 43 | — |
+| Per hour | 48.0 | 14.3 | 0.30× |
+| Per broadcaster-hour | 2.09 | 0.48 | 0.23× |
+| **Per 100k messages** | **21.14** | **22.04** | **1.042×** |
+| Mean intensity | 5.20 | 5.51 | 1.06× |
+| Median intensity | 4.58 | 4.79 | 1.05× |
+| Messages per spike (mean) | 61.4 | 63.5 | 1.03× |
+
+**The per-hour rates differ; the anomaly character and the volume-normalised
+rate do not.** The gap is a property of the two inputs, not of the transport:
+the pre-cutover corpus runs at 9,871 messages per broadcaster-hour and the
+post-cutover capture at 2,167, a 4.6× difference in density. Normalise by chat
+volume and the rates agree to within 4%, and every shape measure — intensity
+mean, median, and messages per spike — agrees to within 6%.
+
+The replay is deterministic: two runs over the same capture diff empty, which
+is the harness contract this comparison depends on.
+
+This is the reproducible version of the live comparison the Phase 2 gate
+already made (40 clips/h at mean intensity 5.84 on EventSub against 45.7/h at
+5.63 over the preceding three IRC hours).
+
+**T040**: skipped, 2026-08-28. T004 measured 0.00% ramp loss.
+
+## Phase 5 — verification (COMPLETE, 2026-08-29)
+
+### How the scale-dependent criteria were measured
+
+Production runs at `JOIN_THRESHOLD` 15 / `LEAVE_THRESHOLD` 30 — 19 to 24
+channels — and the operator's 2026-08-28 decision is to leave it there. SC-001,
+SC-002 and SC-004 ask for 500. The operator chose (2026-08-29) a **synthetic
+driver** over raising production: `services/stream-monitoring/phase5/driver.py`,
+throwaway and untracked, in the same style as the Phase 0 harnesses.
+
+It runs the **real `Reconciler` and the real `EventSubPoolTransport`** against a
+500-channel desired set, so the code under measurement is the code that ships.
+It leaves out everything downstream of the socket — no Kafka producer, no Flink,
+no `ClipCreator`. Received messages are counted and dropped. That is deliberate:
+500 channels detect far more anomalies than the clip budget can act on, which is
+spec 005's problem, and pulling it in here would damage production for a
+verification number.
+
+Two facts about sharing, checked before the run:
+
+- The driver uses `secrets/phase0_tokens.json`, which is **the same Twitch user
+  as production** (48754970). Subscriptions still do not collide:
+  `EventSubPoolTransport.list()` yields only subscriptions on a session the pool
+  itself holds, so neither side sees or drops the other's.
+- The create rate limit **is** shared — it is a per-token burst budget of roughly
+  360–420 (T003b). A ramp here can 429 a production create landing in the same
+  window; production backs off ~10 s and retries and never drops a channel (D2).
+  The operator accepted this on 2026-08-29.
+
+Redis is logical **db 15** on the local container, which production does not use
+at all: production's `REDIS_URL` points at a different instance entirely.
+
+### Results
+
+| SC | Task | Result | Measured at |
+|---|---|---|---|
+| **SC-001** | T041 | **PASS**. Cold start to 500: 50% at 7.5 s, 90% at 48.6 s, 95% at 50.1 s, **99% at 51.1 s**, plateau 499/500. Target 60 s, ceiling 120 s | **500 channels** |
+| **SC-002** | T042 | **PASS**. Poll write at 500: change-nothing p50 9.975 ms, change-everything (500 of 500 members replaced) p50 10.391 ms — **1.042×**, and an identical **6 Redis commands** per write either way | **500 channels** |
+| **SC-003** | T043 | **PASS**. Zero `Bucket channel_join got rate limited`, and zero rate-limit lines of any kind | production, 21–24 channels |
+| **SC-004** | T044 | **PASS**. 31 minutes, 26 one-minute samples, subscriptions **499 constant** against a desired 500. Deviation **0.2%** against a ±1% budget, 0 lost-socket events, 181,180 messages received | **500 channels** |
+| **SC-005** | T038 | **PASS**. 0.000% of records past the 2 s watermark over 27,218 records; budget 0.1% | 24 broadcasters |
+| **SC-006** | T045 | **PASS**. Killed mid-ramp at ~250–350 of 500 with `SIGKILL`; restart converged to **499/500 in 74 s**, **499 live broadcasters, 0 duplicates** | **500 channels** |
+| **SC-007** | T044a | **PASS**. All five FR-012 metrics present on `/metrics` with HELP/TYPE and live values | production |
+
+**SC-004's single delta is attributed.** The 499-vs-500 gap held constant for
+all 26 samples and is one channel that refuses with `subscription missing
+proper authorization` on every pass. With the driver's refusal store switched
+off, that channel is retried each pass and refuses each pass: the refusal log
+accumulates at 11–12 lines per minute against ~12 passes per minute, which is
+exactly one channel. SC-004 allows a delta attributable to a logged refusal.
+
+**SC-006 detail.** The production half was checked too: the container was
+`SIGKILL`ed and restarted, converged to 21 of 21, and Twitch's own subscription
+pages showed 21 enabled on one session across 21 distinct broadcasters with no
+duplicate. The 500-channel restart took 74 s against the 51 s cold start
+because the killed ramp had already spent part of the create budget — the
+behaviour T003b measured, not a regression.
+
+**T044a detail.** `subscription_create_failures_total` carries HELP and TYPE but
+no series while nothing has failed, which is this exporter's
+register-on-first-increment behaviour, not a placeholder. It was observed
+populating as `{reason="refused"} 1.0` during the driver runs.
+
+**T046**: `sent_at` is an epoch-millisecond int in every one of 27,218 live
+records — 0 null, 0 non-int. Skew against the ingestion `timestamp`: min 101,
+p50 166, p95 231, p99 269, max 1,258 ms. **0 records outside the 2 s
+tolerance.**
+
+**T047**: `test_stream_monitoring.py` — 136 passed, 8 skipped (the pre-existing
+Postgres self-heal skips, which need a `twitch` role the host does not have).
+
+**T048**: `test_replay.py` and `test_spike_detector.py` — 83 passed; whole
+flink-job suite 106 passed, 4 skipped. **One test needed a change.**
+`test_replay.py` fed `1002 * 1000 + 1` to push the watermark past bucket 1001.
+That literal is `1001 * 1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1` evaluated at
+the old 1 s, and every other feed in the file already writes that symbolically.
+It now does too. The assertions were not touched, and the expression is
+identical to the old one at the old value.
+
+### Two incidental observations
+
+- One `received event for unknown subscription` was logged across the whole
+  T045 run, inside the resubscribe window. This is the R1 race, and it matches
+  the qualification already recorded under the Phase 2 gate: real, narrow, and
+  worth one chat message. R1 stays closed.
+- The library logged `EventSubSubscriptionError: websocket session has already
+  disconnected` twice during a 500-channel ramp, from twitchAPI's own internal
+  `_resubscribe`. The reconciler recovered without help: the sustain that
+  followed held 499 for all 26 samples with `lost_events` 0.
+
+### What was NOT measured at 500, stated plainly
+
+**SC-005 is the one criterion still taken at the production operating point.**
+The driver deliberately has no Kafka producer and no Flink, so it cannot
+produce a 500-channel late-drop number. Getting one would mean pushing roughly
+25× the current traffic through a parallelism-4 job and letting `ClipCreator`
+loose on a monitored set far larger than the clip budget can serve — the
+change spec.md defers to spec 005.
+
+What the 414 → 500 gap now looks like:
+
+- T002 measured the delivery-lag distribution at **414** channels and found one
+  message in 59,405 past 2 s (0.0017%).
+- T038 measures the resulting late rate at **24** channels: 0.000%.
+- T044 confirms the transport itself is stable at **500** for 31 minutes, with
+  the sockets carrying 181,180 real messages — so the 500-channel claim that is
+  missing is narrowly about *Flink's* residual drop rate, not about whether the
+  reconciler or the pool hold up at 500.
+
+The lag tail did not grow between the 394-channel spike (p50 154 / p95 220 ms)
+and 414 channels (p50 163 / p95 217 ms), and the 24-channel production figure
+(p50 166 / p95 231 ms) sits on the same line. Nothing in three measurements at
+three scales suggests the tail grows with channel count. **That is an argument,
+not a measurement, and it is recorded here as one.**
+
+### A self-inflicted incident worth recording
+
+The first version of the T039 capture script drained every `chat-messages`
+partition from its log start — roughly 4 million records — instead of bounding
+the read. Pulling them at once drove the host load average to **123**, broke
+Docker's DNS resolution for the `kafka` hostname
+(`java.net.UnknownHostException: kafka`), timed out the Flink TaskManager's
+heartbeat, and **failed the running detector job** (2026-08-29 03:20 UTC, job
+`586d5750`). `NoRestartBackoffTimeStrategy` meant no in-job recovery; the
+container's restart policy brought it back as job `179f85c0` at 03:21:51, about
+a minute of lost detection.
+
+Two things came out of it:
+
+- The capture script now starts each partition a bounded number of records back
+  from its high watermark. The rerun took 195,110 records at a load average of
+  1.4.
+- A 900 s late-record sample that overlapped the incident is **discarded**. It
+  showed `timestamp - sent_at` skew at p95 309 s and max 319 s, which is the
+  producer itself being starved of CPU, not a transport property. Worth noting
+  that even in that window the SC-005 quantity held: 0% past 1 s and 2 s, max
+  inversion 988 ms. Inversions depend on the relative order of `sent_at`, and a
+  uniform ingestion delay does not create them.
+
+### Deployment trap found while verifying
+
+Production was running **stale service code**. `docker-compose.yml` bind-mounts
+`stream_monitoring_service.py` as a single file, and a single-file bind mount
+follows the **inode**. `git checkout` replaces the file rather than editing it,
+so the container kept executing the Phase-2-era version — with the IRC client
+still in it — for the whole time Phase 3 sat merged. `docker compose restart`
+does not fix this; mounts resolve at container creation.
+`docker compose up -d --force-recreate stream-monitoring` does, and was used to
+deploy Phase 3 before T043 and T045 were checked, so both were verified against
+the code that is actually running. The other three bind-mounted modules matched
+already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
+(T055).
+
 ## Decisions
 
 ### D1 — Transport: websocket, not webhook
@@ -236,10 +500,17 @@ pass.
   margin for the untested 414→500 gap. Raise to 5 s (the pre-2026-08-27 value,
   a round number with no measurement behind it — over-corrects and slows every
   detection).
-- **Acceptance**: the residual late-drop rate at a stable 500 channels must be
-  below 0.1% (SC-005), measured in Phase 5 from Flink's `numLateRecordsDropped`
-  (T038). T002 confirms the tail has not grown past 2 s at 414; the 414→500
-  re-check is a Phase 5 item.
+- **Acceptance — settled 2026-08-29, and not the way this line first said.**
+  The planned check was Flink's `numLateRecordsDropped` at a stable 500
+  channels. **That metric does not exist for this job**: Flink emits it from
+  windowing operators, and `clip_detector_job.py` uses a `KeyedProcessFunction`
+  with per-second timers and no window operator, so nothing ever drops a late
+  record. The equivalent quantity — records arriving after their own bucket's
+  timer fired — was measured directly on the live topic instead:
+  **0.000% past 2 s over 27,218 records**, against the 0.1% budget. The channel
+  count is 24, not 500; the 500-channel part of the claim is carried by T044's
+  transport measurement and is argued, not measured. See Phase 4 T038 and the
+  honesty note at the end of Phase 5.
 
 ### D5 — Refusal cache and `allows_clipping`: shared 7-day re-check
 
