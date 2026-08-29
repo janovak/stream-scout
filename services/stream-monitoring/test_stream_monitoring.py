@@ -7,6 +7,7 @@ Tests token management, message processing, and service components.
 
 import asyncio
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -991,6 +992,36 @@ class TestPollWritesIntentOnly:
             f"{no_change_seconds:.4f}s for a 0-change poll"
         )
 
+    def test_offline_lifecycle_events_carry_the_real_broadcaster_id(self):
+        """A login only leaves the desired set by dropping out of this poll's
+        ranking, so this poll never has an id for it. That made every offline
+        event publish `broadcaster_id: 0` and key every one of them to
+        partition b"0". Before Phase 3 an instance dict carried ids across
+        polls; it went with the IRC client. The id map the last poll wrote to
+        Redis has it."""
+        fake_redis = FakeRedis()
+        logins = [f"s{i}" for i in range(1, 31)]
+        service = make_poller(logins, fake_redis)
+        asyncio.run(service.poll_top_streams())
+        expected_id = broadcaster_id_for(logins, "s15")
+
+        # s15 leaves the ranking, and its online key has expired at
+        # REDIS_STREAMER_TTL -- which is what makes the poll call it offline.
+        fake_redis.delete("streamer:online:s15")
+        remaining = [login for login in logins if login != "s15"]
+        later = make_poller(remaining, fake_redis)
+        asyncio.run(later.poll_top_streams())
+
+        offline = [
+            call for call in later._publish_lifecycle_event.call_args_list
+            if call.args[0] == "offline"
+        ]
+        assert [call.args[2] for call in offline] == ["s15"]
+        assert offline[0].args[1] == expected_id, (
+            "the offline event published a placeholder id, so every offline "
+            "event keys to the same Kafka partition"
+        )
+
     def test_hysteresis_survives_across_polls_through_redis(self):
         """T011 end to end: the band is read back from Redis, so it survives a
         restart instead of collapsing to the join threshold."""
@@ -1206,6 +1237,42 @@ class TestReconcilerAdoption:
 
         assert reconciler.subscription_count == 2, "the partial read was thrown away"
         assert reconciler._adoption_complete is False
+
+    def test_a_loss_during_enumeration_is_not_swallowed_by_the_completion(self):
+        """`transport.list()` has awaits in it and the pool's supervisor runs
+        on the same loop, so a socket can die *while* the actual set is being
+        rebuilt. Marking the adoption complete afterwards threw that signal
+        away: the walk's snapshot still held the dead session, so its channels
+        stayed recorded as covered while nothing delivered for them, and
+        nothing re-enumerated until some later, unrelated loss."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [])
+        transport = StubTransport()
+        for broadcaster_id in (1, 2, 3, 4):
+            asyncio.run(transport.create(broadcaster_id))
+        reconciler = make_reconciler(transport, fake_redis)
+
+        # A connection dies part way through the walk, exactly as the pool's
+        # supervisor would report it.
+        original_list = transport.list
+
+        def list_with_a_loss_midway():
+            async def wrapped():
+                index = 0
+                async for subscription in original_list():
+                    if index == 1:
+                        reconciler.invalidate_actual_set()
+                    index += 1
+                    yield subscription
+            return wrapped()
+
+        transport.list = list_with_a_loss_midway
+        asyncio.run(reconciler.reconcile_once())
+
+        assert reconciler._adoption_complete is False, (
+            "the completion overwrote the invalidation, so nothing will "
+            "re-enumerate and the lost channels stay recorded as covered"
+        )
 
     def test_partial_enumeration_never_deletes(self):
         """The dangerous move is deleting on an incomplete picture: an unseen
@@ -2045,11 +2112,65 @@ class TestPoolErrorClassification:
             with pytest.raises(TransportError) as caught:
                 await pool.create(5)
             assert not isinstance(caught.value, RateLimitedError)
-            assert pool._connections[0].full is True
+            assert pool._connections[0].full_at == 0
             # And it is out of routing, so the next create opens a connection.
             pool._connections[0].websocket.raise_on_subscribe = None
             await pool.create(5)
             assert len(pool._connections) == 2
+
+        asyncio.run(run())
+
+    def test_a_connection_that_reported_full_returns_to_routing_when_it_drains(self):
+        """`full` used to be a permanent flag, so one report retired a socket
+        from routing for the life of the process. Under ordinary hysteresis
+        churn the pool then opened fresh sockets while drained ones sat idle,
+        growing the socket count without bound."""
+
+        async def run():
+            pool = make_pool()
+            await pool._grow()
+            connection = pool._connections[0]
+            # Three channels land, then Twitch calls the session full.
+            for broadcaster_id in range(3):
+                await pool.create(broadcaster_id)
+            connection.websocket.raise_on_subscribe = (
+                eventsub_pool.EventSubSubscriptionError("subscription limit reached")
+            )
+            with pytest.raises(TransportError):
+                await pool.create(99)
+            assert connection.full_at == 3
+            assert pool.route(99) is not connection
+
+            # Deleting one takes it back under the level it refused at.
+            connection.websocket.raise_on_subscribe = None
+            subscription_id = next(iter(connection.subscription_ids))
+            await pool.delete(subscription_id)
+            assert connection.occupancy == 2
+            assert pool.route(99) is connection
+
+        asyncio.run(run())
+
+    def test_an_unclassified_error_is_logged_with_its_raw_message(self, caplog):
+        """The marker lists are string matches against wording nobody has seen
+        from a full session. A miss must leave a diagnosable trace."""
+
+        async def run():
+            pool = make_pool()
+            await pool._grow()
+            pool._connections[0].websocket.raise_on_subscribe = (
+                eventsub_pool.EventSubSubscriptionError("some entirely new wording")
+            )
+            with caplog.at_level(logging.WARNING, logger="stream_monitoring"):
+                with pytest.raises(TransportError):
+                    await pool.create(5)
+            # The raw text rides in `extra`, which is what the JSON handler
+            # ships and what makes the miss diagnosable.
+            unclassified = [
+                record for record in caplog.records
+                if "Unclassified" in record.getMessage()
+            ]
+            assert len(unclassified) == 1
+            assert unclassified[0].error == "some entirely new wording"
 
         asyncio.run(run())
 
@@ -2067,6 +2188,52 @@ class TestPoolErrorClassification:
                     await pool.create(broadcaster_id)
             assert pool._connections[0].reserved == 0
             assert len(pool._connections) == 1
+
+        asyncio.run(run())
+
+    def test_the_reservation_is_held_until_the_subscription_is_recorded(self):
+        """`load` must never dip between giving up the slot and recording the
+        subscription.
+
+        It used to: `_release` and the record block took the lock separately,
+        so `reserved` fell to 0 while `subscription_ids` was still empty. A
+        worker already queued on the lock at that moment -- which is the
+        ordinary case at concurrency 10 -- is granted it before the record
+        block runs, routes against the dip, and reserves a slot that is
+        already spoken for. The session then goes one past its cap and Twitch
+        refuses the overflow.
+
+        The dip is what makes that possible, so the dip is what this asserts.
+        Sampling at every lock release covers the whole create, including the
+        window between the two acquisitions the old code left open.
+        """
+
+        async def run():
+            pool = make_pool(cap=2)
+            await pool._grow()
+            connection = pool._connections[0]
+            await pool.create(1)          # one recorded, so load starts at 1
+
+            samples = []
+            real_lock = pool._lock
+
+            class ProbedLock:
+                async def __aenter__(self):
+                    await real_lock.acquire()
+
+                async def __aexit__(self, *exc):
+                    samples.append(connection.load)
+                    real_lock.release()
+
+            pool._lock = ProbedLock()
+            await pool.create(2)
+
+            assert samples, "the create took no lock at all"
+            assert min(samples) == 2, (
+                f"load dipped to {min(samples)} mid-create (samples {samples}); "
+                "a worker routing in that window would oversubscribe the session"
+            )
+            assert (connection.occupancy, connection.reserved) == (2, 0)
 
         asyncio.run(run())
 
@@ -2315,6 +2482,44 @@ class TestDegradedWithoutUserAuth:
             assert service.transport is None
             assert service.reconciler is None
             # The poll job is still scheduled: intent keeps being written.
+            assert service.scheduler.get_job("poll_streams") is not None
+
+        asyncio.run(run())
+
+    def test_a_transport_failure_degrades_instead_of_crash_looping(self):
+        """`_build_transport()` calls get_users(). A transient Twitch 5xx there
+        used to propagate out of `initialize()` and kill the process -- and it
+        ran BEFORE the metrics server started, so the FR-012 gauges an operator
+        is told to check were unreachable at exactly the moment the service was
+        failing."""
+
+        async def run():
+            twitch = MagicMock()
+            credentials = MagicMock()
+            record = MagicMock()
+            record.access_token = "a"
+            record.refresh_token = "r"
+            record.scopes = ["user:read:chat", "clips:edit"]
+            credentials.load.return_value = record
+            twitch.set_user_authentication = AsyncMock()
+
+            service = StreamMonitoringService()
+            with patch.object(stream_monitoring_service, "Twitch", AsyncMock(return_value=twitch)), \
+                 patch.object(stream_monitoring_service, "get_credentials", return_value=credentials), \
+                 patch.object(stream_monitoring_service, "Producer"), \
+                 patch.object(stream_monitoring_service.psycopg2.pool, "ThreadedConnectionPool"), \
+                 patch.object(stream_monitoring_service.redis, "from_url", return_value=MagicMock()), \
+                 patch.object(stream_monitoring_service, "start_http_server") as metrics, \
+                 patch.object(
+                     StreamMonitoringService, "_build_transport",
+                     AsyncMock(side_effect=RuntimeError("twitch 503")),
+                 ):
+                await service.initialize()   # must not raise
+
+            metrics.assert_called_once()
+            assert service.transport is None
+            assert service.reconciler is None
+            # The poll job still runs and still writes the desired set.
             assert service.scheduler.get_job("poll_streams") is not None
 
         asyncio.run(run())

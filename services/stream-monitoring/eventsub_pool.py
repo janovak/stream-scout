@@ -107,8 +107,25 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 30.0
 _REFUSAL_MARKERS = ("missing proper authorization", "not authorized", "forbidden")
 _RATE_LIMIT_MARKERS = ("too many", "rate limit", "429", "exceeded")
 # A full session answers 400, not 429. Retrying that channel on the same
-# socket can never work, so it must not look like a rate limit.
-_SESSION_FULL_MARKERS = ("subscription limit", "too many subscriptions")
+# socket can never work, so it must not look like a rate limit -- and the
+# rate-limit list below matches the very generic "exceeded", which a full
+# message could easily contain. These are checked FIRST for that reason.
+#
+# Nobody has seen Twitch's actual wording at the 301st subscription; the spike
+# measured the count, not the message. So the list is deliberately wide. The
+# trade changed when `full_at` replaced the old permanent `full` flag: a false
+# positive now only skips the connection until deletes bring it below that
+# level, while a false negative classifies the error as a 429 and burns the
+# reconciler's whole retry budget -- 20 rounds of 10 s backoff -- on a create
+# that can never succeed.
+_SESSION_FULL_MARKERS = (
+    "subscription limit",
+    "too many subscriptions",
+    "maximum number of subscriptions",
+    "subscriptions per websocket",
+    "websocket session",
+    "session limit",
+)
 
 
 def _score(broadcaster_id: int, connection_id: int) -> int:
@@ -221,8 +238,13 @@ class _Connection:
     # the pool oversubscribes a session and Twitch rejects the overflow.
     reserved: int = 0
     # Set when Twitch says the session is full at a lower number than the cap
-    # this module believes in. Routing then skips it for good.
-    full: bool = False
+    # this module believes in: the occupancy it refused at. Routing skips the
+    # connection while it still holds that many, and takes it back once
+    # deletes bring it below. This used to be a bool that nothing ever
+    # cleared, so one report retired a socket from routing for the life of
+    # the process -- under ordinary hysteresis churn the pool then opened
+    # fresh sockets while drained ones sat idle and unusable.
+    full_at: Optional[int] = None
 
     @property
     def occupancy(self) -> int:
@@ -319,9 +341,16 @@ class EventSubPoolTransport(SubscriptionTransport):
             except asyncio.CancelledError:
                 pass
             self._supervisor = None
+        # `_retire`, not `websocket.stop()`. `stop()` blocks on a future the
+        # socket's own loop has to complete, so a session whose loop is wedged
+        # -- half-open TCP, a failed close -- hangs SIGTERM shutdown for ever
+        # with this service's event loop frozen. `_retire` schedules the same
+        # teardown on the socket's loop without awaiting it, which is why it
+        # exists; shutdown has no more reason to block on a dead socket than
+        # the supervisor does.
         for connection in list(self._connections):
             try:
-                await connection.websocket.stop()
+                self._retire(connection)
             except Exception as e:
                 logger.warning(
                     "Error stopping an EventSub connection",
@@ -346,6 +375,7 @@ class EventSubPoolTransport(SubscriptionTransport):
             self._forget_slot(existing)
 
         connection = await self._reserve(broadcaster_id)
+        subscription_id = None
         try:
             subscription_id = await connection.websocket.listen_channel_chat_message(
                 str(broadcaster_id), self.user_id, self._on_event
@@ -364,9 +394,19 @@ class EventSubPoolTransport(SubscriptionTransport):
         except TwitchAPIException as e:
             raise TransportError(str(e)) from e
         finally:
-            await self._release(connection)
+            # Only the failure paths release here. On success the reservation
+            # is given up in the SAME critical section that records the
+            # subscription, below. Releasing it first drops `load` by one
+            # before `subscription_ids` grows, and `_release` and the record
+            # block take the lock separately -- so another worker routing in
+            # that window sees a free slot that is already spoken for and
+            # pushes the session one past the 300 cap. Twitch then refuses,
+            # and the connection is marked full at the cap it was already at.
+            if subscription_id is None:
+                await self._release(connection)
 
         async with self._lock:
+            connection.reserved = max(0, connection.reserved - 1)
             if self._connection_by_id(connection.connection_id) is None:
                 # The supervisor retired this connection while the create was
                 # in flight -- it runs on this loop and the create above is an
@@ -508,7 +548,9 @@ class EventSubPoolTransport(SubscriptionTransport):
             reverse=True,
         )
         for connection in ordered:
-            if not connection.full and connection.load < self.cap:
+            if connection.full_at is not None and connection.load >= connection.full_at:
+                continue
+            if connection.load < self.cap:
                 return connection
         return None
 
@@ -650,12 +692,17 @@ class EventSubPoolTransport(SubscriptionTransport):
             # believes in. Retrying the same channel would route it straight
             # back here, so take the connection out of routing and let the
             # next pass place the channel elsewhere.
-            connection.full = True
+            # Remember the level it refused at, not a permanent flag, so
+            # deletes can bring the connection back into routing. A session
+            # that reports full while holding nothing can hold nothing, so
+            # `full_at = 0` excluding it for good is the right answer there.
+            connection.full_at = connection.occupancy
             logger.error(
                 "EventSub connection reported full below the configured cap",
                 extra={
                     "connection": connection.connection_id,
                     "occupancy": connection.occupancy,
+                    "full_at": connection.full_at,
                     "cap": self.cap,
                     "error": message,
                 },
@@ -665,6 +712,22 @@ class EventSubPoolTransport(SubscriptionTransport):
             # 429. No Retry-After survives the library, so the reconciler
             # falls back to its configured backoff (D2).
             return RateLimitedError(message)
+
+        # Nothing matched. The marker lists are string matches against wording
+        # nobody has seen from a genuinely full websocket session -- the spike
+        # measured the 300 count, not the message Twitch sends at 301 -- so a
+        # miss here is the likeliest way this classifier is wrong. Log the raw
+        # text at WARNING: an unclassified full-session error routes the
+        # channel straight back to the same saturated socket every pass, and
+        # this line is what turns that into a five-minute diagnosis.
+        logger.warning(
+            "Unclassified EventSub subscription error, treating it as retryable",
+            extra={
+                "connection": connection.connection_id,
+                "occupancy": connection.occupancy,
+                "error": message,
+            },
+        )
         return TransportError(message)
 
     async def _adopt_conflict(self, broadcaster_id: int) -> str:

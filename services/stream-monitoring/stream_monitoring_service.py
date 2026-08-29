@@ -322,6 +322,14 @@ class StreamMonitoringService:
         # warning above promises the service keeps running with chat off, so
         # honour that instead of crash-looping the container on a missing
         # token file.
+        # Start the metrics server BEFORE anything that can fail. Building the
+        # transport calls get_users(), so a transient Twitch 5xx or a network
+        # blip there used to propagate out of initialize() and kill the process
+        # before this line ran -- taking down the FR-012 gauges an operator is
+        # told to check at exactly the moment the service is failing.
+        start_http_server(PROMETHEUS_PORT)
+        logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
+
         if not self.has_user_auth:
             logger.error(
                 "No user authentication, so no chat transport and no reconciler. "
@@ -329,11 +337,24 @@ class StreamMonitoringService:
                 "Run 'python seed_twitch_tokens.py' and restart to ingest chat"
             )
             self._build_scheduler()
-            start_http_server(PROMETHEUS_PORT)
-            logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
             return
 
-        self.transport = await self._build_transport()
+        try:
+            self.transport = await self._build_transport()
+        except Exception as e:
+            # Same contract as the missing-token case above: the poll job still
+            # runs and still writes the desired set, so the service degrades to
+            # "no chat ingestion" instead of crash-looping. The next restart
+            # retries the transport.
+            logger.error(
+                "Could not build the chat transport, running without chat ingestion",
+                extra={"error": str(e), "error_type": type(e).__name__},
+            )
+            twitch_api_errors_total.labels(error_type="build_transport").inc()
+            self.transport = None
+            self._build_scheduler()
+            return
+
         self.reconciler = Reconciler(
             transport=self.transport,
             redis_client=self.redis_client,
@@ -345,10 +366,6 @@ class StreamMonitoringService:
         )
 
         self._build_scheduler()
-
-        # Start Prometheus metrics server
-        start_http_server(PROMETHEUS_PORT)
-        logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
 
     def _build_scheduler(self):
         self.scheduler = AsyncIOScheduler()
@@ -560,6 +577,7 @@ class StreamMonitoringService:
             # restart keeps the retained band instead of collapsing coverage
             # to the top JOIN_THRESHOLD.
             previous_desired = self._read_previous_desired()
+            previous_ids = self._read_previous_ids()
 
             for login in disabled_logins:
                 if login in previous_desired:
@@ -599,12 +617,15 @@ class StreamMonitoringService:
 
             # Streamers that went offline. A login leaves `desired` only when
             # it drops out of the top LEAVE_THRESHOLD, so it is no longer in
-            # this poll's ranking and `broadcaster_ids` has no id for it.
+            # this poll's ranking and `broadcaster_ids` never has an id for it
+            # -- fall back to the map the last poll wrote, which does.
             for login in previous_desired:
                 if login not in desired:
                     redis_key = f"streamer:online:{login}"
                     if not self.redis_client.exists(redis_key):
-                        broadcaster_id = broadcaster_ids.get(login, 0)
+                        broadcaster_id = broadcaster_ids.get(
+                            login, previous_ids.get(login, 0)
+                        )
                         self._publish_lifecycle_event("offline", broadcaster_id, login, 0)
                         logger.info("Streamer offline", extra={
                             "broadcaster_login": login,
@@ -636,6 +657,30 @@ class StreamMonitoringService:
             login.decode("utf-8") if isinstance(login, bytes) else login
             for login in self.redis_client.zrange(DESIRED_KEY, 0, -1)
         }
+
+    def _read_previous_ids(self) -> Dict[str, int]:
+        """The login-to-id map the last poll wrote, for logins leaving the set.
+
+        A login only leaves the desired set by dropping out of this poll's
+        ranking, so this poll has no id for it -- which is why the offline
+        lifecycle event used to publish `broadcaster_id: 0` for every
+        streamer, and key every one of them to partition `b"0"`. Before
+        Phase 3 an instance-level dict carried ids across polls and supplied
+        it; that dict went with the IRC client.
+
+        The id is still on hand: the poller wrote it to `chat:desired:ids` in
+        the same transaction as the set it is leaving. Read it before
+        `_write_desired_set` overwrites both.
+        """
+        raw = self.redis_client.hgetall(DESIRED_IDS_KEY) or {}
+        ids = {}
+        for login, broadcaster_id in raw.items():
+            login = login.decode("utf-8") if isinstance(login, bytes) else login
+            try:
+                ids[login] = int(broadcaster_id)
+            except (TypeError, ValueError):
+                continue
+        return ids
 
     def _write_desired_set(self, desired: Dict[str, int], broadcaster_ids: Dict[str, int]):
         """Publish the desired set for the reconciler, in one transaction.

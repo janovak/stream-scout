@@ -528,6 +528,10 @@ class Reconciler:
         # False until one enumeration finishes. While it is False the
         # reconciler knows its view of the world has holes.
         self._adoption_complete = False
+        # Bumped by every `invalidate_actual_set()`. `_adopt` reads it before
+        # and after its enumeration so a loss that lands mid-walk is not
+        # thrown away by the completion that follows it.
+        self._invalidations = 0
         # The live desired view. Workers read it, so that a channel which
         # leaves the set part way through a pass is not created (T014).
         self._desired_ids: Set[int] = set()
@@ -559,6 +563,7 @@ class Reconciler:
         re-enumerate cannot turn into a mass delete.
         """
         self._adoption_complete = False
+        self._invalidations += 1
         self._wake.set()
 
     def notify_desired_changed(self):
@@ -720,6 +725,15 @@ class Reconciler:
         not treated as absent, and drops stay switched off until a full pass
         succeeds (NFR-003).
         """
+        # `transport.list()` is a paginated walk with awaits in it, and the
+        # pool's supervisor runs on this same loop. A socket can die *during*
+        # the enumeration and call `invalidate_actual_set()`, and marking the
+        # adoption complete afterwards would throw that signal away: the
+        # enumeration's snapshot still holds the dead session, so its channels
+        # are recorded as covered while nothing delivers for them, and nothing
+        # re-enumerates until some later, unrelated loss. Count invalidations
+        # and re-check at the end.
+        invalidations_before = self._invalidations
         adopted: Dict[int, str] = {}
         skipped_status = 0
         complete = True
@@ -738,9 +752,21 @@ class Reconciler:
                 extra={"error": str(e), "seen": len(adopted)},
             )
 
-        if complete:
+        invalidated_during = self._invalidations != invalidations_before
+
+        if complete and not invalidated_during:
             self._actual = adopted
             self._adoption_complete = True
+        elif complete:
+            # A connection was lost while this enumeration ran. What it saw is
+            # still the freshest view available, so keep it -- but leave the
+            # adoption incomplete so the next pass re-enumerates and drops stay
+            # held back until one clean walk succeeds (NFR-003).
+            self._actual = adopted
+            logger.warning(
+                "Subscriptions were lost while enumerating, re-enumerating next pass",
+                extra={"adopted": len(adopted)},
+            )
         else:
             # Keep both views. A subscription seen before is still real, and
             # one seen now is new information.
