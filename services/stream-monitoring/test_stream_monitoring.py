@@ -192,7 +192,6 @@ def make_poller(logins, fake_redis, reconciler=None):
     service._get_clipping_disabled_ids = MagicMock(return_value=set())
     service._upsert_streamer = MagicMock()
     service._publish_lifecycle_event = MagicMock()
-    service._manage_chat_connections = AsyncMock()
     return service
 
 
@@ -577,184 +576,6 @@ class TestKafkaDelivery:
         assert decoded["broadcaster_id"] == 12345
 
 
-class TestChatRoomManagement:
-    """Tests for chat room connection management logic."""
-
-    def test_channels_to_join_calculation(self):
-        """Should correctly calculate which channels to join."""
-        joined_channels = {"streamer1", "streamer2"}
-        target_channels = {"streamer2", "streamer3", "streamer4"}
-
-        channels_to_join = target_channels - joined_channels
-        channels_to_leave = joined_channels - target_channels
-
-        assert channels_to_join == {"streamer3", "streamer4"}
-        assert channels_to_leave == {"streamer1"}
-
-    def test_no_changes_when_channels_match(self):
-        """No joins or leaves when channel sets match."""
-        current = {"streamer1", "streamer2"}
-        target = {"streamer1", "streamer2"}
-
-        to_join = target - current
-        to_leave = current - target
-
-        assert len(to_join) == 0
-        assert len(to_leave) == 0
-
-    def test_broadcaster_id_mapping(self):
-        """Broadcaster ID mapping should store login to ID pairs."""
-        broadcaster_ids = {}
-
-        # Simulate adding streamers
-        broadcaster_ids["ninja"] = 19571641
-        broadcaster_ids["shroud"] = 37402112
-
-        assert broadcaster_ids.get("ninja") == 19571641
-        assert broadcaster_ids.get("shroud") == 37402112
-        assert broadcaster_ids.get("nonexistent") is None
-
-
-class TestChatConnectionRecovery:
-    """Tests for recreating a chat client whose underlying connection died
-    for good. pyTwitchAPI's Chat gives up reconnecting after exhausting a
-    bounded backoff list and never retries again; from that point
-    join_room()/leave_room() fail forever against the dead socket with no
-    other symptom, so _manage_chat_connections must detect and recover from
-    it rather than trust that self.chat existing means it still works.
-
-    is_connected() also reads False for the whole span of a still-in-progress
-    reconnect the library would complete on its own, so recreation only fires
-    after DEAD_CHAT_CONFIRMATION_POLLS consecutive dead readings."""
-
-    @staticmethod
-    def _make_dead_chat():
-        dead_chat = MagicMock()
-        dead_chat.is_connected.return_value = False
-        dead_chat.join_room = AsyncMock()
-        dead_chat.leave_room = AsyncMock()
-        return dead_chat
-
-    @staticmethod
-    def _make_fresh_chat():
-        fresh_chat = MagicMock()
-        fresh_chat.register_event = MagicMock()
-        fresh_chat.start = MagicMock()
-        fresh_chat.join_room = AsyncMock()
-        fresh_chat.leave_room = AsyncMock()
-        return fresh_chat
-
-    def test_does_not_recreate_before_confirmation_threshold(self):
-        """A dead reading alone isn't enough -- it could still be a
-        still-in-progress reconnect the library would finish on its own."""
-        service = StreamMonitoringService()
-        service.twitch = MagicMock()
-        dead_chat = self._make_dead_chat()
-        service.chat = dead_chat
-        service.joined_channels = {"stalechannel"}
-
-        for _ in range(stream_monitoring_service.DEAD_CHAT_CONFIRMATION_POLLS - 1):
-            asyncio.run(service._manage_chat_connections(
-                join_eligible={"stalechannel"},
-                leave_eligible={"stalechannel"},
-            ))
-
-        dead_chat.stop.assert_not_called()
-        assert service.chat is dead_chat
-
-    def test_recreates_chat_after_confirmation_threshold(self):
-        """Once the connection has looked dead for DEAD_CHAT_CONFIRMATION_POLLS
-        consecutive polls, the dead chat is stopped, replaced, and the stale
-        room list is dropped so no leave_room() is attempted against the new
-        client for channels the old, gone socket used to hold."""
-        service = StreamMonitoringService()
-        service.twitch = MagicMock()
-        dead_chat = self._make_dead_chat()
-        service.chat = dead_chat
-        service.joined_channels = {"stalechannel"}
-        fresh_chat = self._make_fresh_chat()
-
-        with patch("stream_monitoring_service.Chat", AsyncMock(return_value=fresh_chat)):
-            for _ in range(stream_monitoring_service.DEAD_CHAT_CONFIRMATION_POLLS):
-                asyncio.run(service._manage_chat_connections(
-                    join_eligible={"newchannel"},
-                    leave_eligible={"newchannel"},
-                ))
-
-        dead_chat.stop.assert_called_once()
-        assert service.chat is fresh_chat
-        fresh_chat.leave_room.assert_not_awaited()
-        fresh_chat.join_room.assert_awaited_once_with("newchannel")
-        assert service.joined_channels == {"newchannel"}
-        assert service._consecutive_dead_chat_polls == 0
-
-    def test_recreate_preserves_hysteresis_band_not_just_join_eligible(self):
-        """Recovery must rejoin the whole surviving LEAVE_THRESHOLD band, not
-        just the narrower JOIN_THRESHOLD set -- otherwise every outage
-        silently shrinks coverage from top-30 to top-15 and never restores
-        it, defeating the point of the hysteresis band."""
-        service = StreamMonitoringService()
-        service.twitch = MagicMock()
-        dead_chat = self._make_dead_chat()
-        service.chat = dead_chat
-        # "midbandchannel" is joined and still within the wider leave-eligible
-        # band, but is NOT in join_eligible (it's not freshly entering the
-        # top-JOIN_THRESHOLD set) -- exactly the rank-16-30 case.
-        service.joined_channels = {"midbandchannel"}
-        fresh_chat = self._make_fresh_chat()
-
-        with patch("stream_monitoring_service.Chat", AsyncMock(return_value=fresh_chat)):
-            for _ in range(stream_monitoring_service.DEAD_CHAT_CONFIRMATION_POLLS):
-                asyncio.run(service._manage_chat_connections(
-                    join_eligible={"topchannel"},
-                    leave_eligible={"topchannel", "midbandchannel"},
-                ))
-
-        fresh_chat.join_room.assert_any_await("midbandchannel")
-        fresh_chat.join_room.assert_any_await("topchannel")
-        assert service.joined_channels == {"topchannel", "midbandchannel"}
-
-    def test_reconnect_before_threshold_resets_the_counter(self):
-        """A dead reading followed by a healthy one must not carry over --
-        otherwise a couple of isolated blips days apart could eventually
-        accumulate past the threshold and trigger a bogus recreate."""
-        service = StreamMonitoringService()
-        service.twitch = MagicMock()
-        flaky_chat = self._make_dead_chat()
-        service.chat = flaky_chat
-
-        asyncio.run(service._manage_chat_connections(join_eligible=set(), leave_eligible=set()))
-        assert service._consecutive_dead_chat_polls == 1
-
-        flaky_chat.is_connected.return_value = True
-        asyncio.run(service._manage_chat_connections(join_eligible=set(), leave_eligible=set()))
-        assert service._consecutive_dead_chat_polls == 0
-        assert service.chat is flaky_chat
-        flaky_chat.stop.assert_not_called()
-
-    def test_leaves_healthy_chat_untouched(self):
-        """A connected chat is reused as-is; no stop/recreate happens."""
-        service = StreamMonitoringService()
-        service.twitch = MagicMock()
-
-        healthy_chat = MagicMock()
-        healthy_chat.is_connected.return_value = True
-        healthy_chat.join_room = AsyncMock()
-        healthy_chat.leave_room = AsyncMock()
-        service.chat = healthy_chat
-        service.joined_channels = {"existingchannel"}
-
-        asyncio.run(service._manage_chat_connections(
-            join_eligible={"existingchannel"},
-            leave_eligible={"existingchannel"},
-        ))
-
-        healthy_chat.stop.assert_not_called()
-        assert service.chat is healthy_chat
-        healthy_chat.join_room.assert_not_awaited()
-        healthy_chat.leave_room.assert_not_awaited()
-
-
 class TestRedisKeyManagement:
     """Tests for Redis key patterns and TTL management."""
 
@@ -815,9 +636,6 @@ class TestGracefulShutdown:
         def stop_scheduler():
             shutdown_order.append("scheduler")
 
-        def stop_chat():
-            shutdown_order.append("chat")
-
         def close_twitch():
             shutdown_order.append("twitch")
 
@@ -832,7 +650,6 @@ class TestGracefulShutdown:
 
         # Execute shutdown
         stop_scheduler()
-        stop_chat()
         close_twitch()
         flush_kafka()
         close_db()
@@ -841,7 +658,7 @@ class TestGracefulShutdown:
         # Verify order
         assert shutdown_order[0] == "scheduler"
         assert shutdown_order[-1] == "redis"
-        assert len(shutdown_order) == 6
+        assert len(shutdown_order) == 5
 
 
 class TestChannelThresholdConfig:
@@ -976,7 +793,7 @@ class TestDesiredSetHysteresis:
 
     @staticmethod
     def _legacy_joined_after_poll(ranked, joined, join_threshold, leave_threshold):
-        """What `_manage_chat_connections` settled on, as set algebra.
+        """What the old IRC join loop settled on, as set algebra.
 
         Lifted straight from the old code path: join everything newly in the
         top JOIN_THRESHOLD, leave everything joined that fell out of the top
@@ -1119,10 +936,8 @@ class TestPollWritesIntentOnly:
 
         asyncio.run(service.poll_top_streams())
 
-        assert service.chat is None
         assert transport.create_calls == []
         assert transport.delete_calls == []
-        service._manage_chat_connections.assert_not_awaited()
 
     def test_poll_signals_the_reconciler(self):
         """The in-process fast path: the poller nudges the loop after writing."""
@@ -2518,7 +2333,7 @@ class TestDegradedWithoutUserAuth:
 
 
 class TestEventSubMessageMapping:
-    """T020 / T021 / FR-008, FR-009 -- the payload the Flink job consumes."""
+    """T020 / FR-008, FR-009 -- the payload the Flink job consumes."""
 
     def test_sent_at_is_epoch_milliseconds(self):
         moment = datetime(2026, 8, 28, 12, 0, 0, 500000, tzinfo=timezone.utc)
@@ -2580,42 +2395,6 @@ class TestEventSubMessageMapping:
         payload = map_chat_message(make_eventsub_event(message_id=None))
         assert payload["message_id"]
         assert isinstance(payload["message_id"], str)
-
-    def test_eventsub_and_irc_payloads_have_the_same_shape(self):
-        """T021 / FR-008 -- the Flink job must not need a change.
-
-        Keys and the types of the three fields the job actually reads, from
-        the two mappings that really run in production: `map_chat_message`,
-        and the IRC handler itself rather than a copy of it.
-        """
-        eventsub_payload = map_chat_message(
-            make_eventsub_event(
-                broadcaster_id=555,
-                text="hello",
-                badges=[("subscriber", "3"), ("moderator", "1")],
-            )
-        )
-        irc_payload = capture_irc_payload(broadcaster_id=555, text="hello")
-
-        assert eventsub_payload.keys() == irc_payload.keys()
-        assert eventsub_payload["metadata"].keys() == irc_payload["metadata"].keys()
-
-        for field in ("broadcaster_id", "timestamp", "sent_at", "text", "user_id"):
-            assert type(eventsub_payload[field]) is type(irc_payload[field]), field
-        assert isinstance(eventsub_payload["broadcaster_id"], int)
-        assert isinstance(eventsub_payload["text"], str)
-        assert isinstance(eventsub_payload["sent_at"], int)
-        for field in ("emotes", "badges", "is_subscriber", "is_mod"):
-            assert type(eventsub_payload["metadata"][field]) is type(
-                irc_payload["metadata"][field]
-            ), field
-
-    def test_both_payloads_survive_the_json_round_trip_the_producer_does(self):
-        eventsub_payload = map_chat_message(make_eventsub_event())
-        irc_payload = capture_irc_payload(broadcaster_id=555, text="hello")
-        assert json.loads(json.dumps(eventsub_payload)).keys() == json.loads(
-            json.dumps(irc_payload)
-        ).keys()
 
     def test_the_service_publishes_what_the_mapper_produced(self):
         """T022 -- the handler the pool calls reaches the existing producer."""
@@ -2686,27 +2465,6 @@ def make_eventsub_event(
             )(),
         },
     )()
-
-
-def capture_irc_payload(broadcaster_id, text):
-    """Run the real IRC handler and return the payload it would publish."""
-    service = StreamMonitoringService()
-    service.broadcaster_ids = {"a_channel": broadcaster_id}
-    captured = {}
-    service._publish_chat_message = lambda bid, msg: captured.update(msg)
-
-    msg = MagicMock()
-    msg.room.name = "A_Channel"
-    msg.text = text
-    msg.sent_timestamp = 1787918400000
-    msg.user.id = "456"
-    msg.user.name = "a_viewer"
-    msg.user.badges = {"subscriber": "3", "moderator": "1"}
-    msg.user.subscriber = True
-    msg.user.mod = True
-
-    asyncio.run(service._on_chat_message(msg))
-    return captured
 
 
 class FakeRefusalStore(RefusalStore):
@@ -3061,5 +2819,5 @@ class TestScopeGuard:
     def test_the_scope_map_covers_every_seeded_scope(self):
         """A scope in the seed script but not in the map is silently dropped,
         and the feature that needs it fails at run time instead of at start."""
-        seeded = {"chat:read", "user:read:chat", "clips:edit"}
+        seeded = {"user:read:chat", "clips:edit"}
         assert seeded <= set(stream_monitoring_service.SCOPE_MAP)

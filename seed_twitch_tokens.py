@@ -43,10 +43,9 @@ TWITCH_TOKEN_GID = int(os.getenv("TWITCH_TOKEN_GID", "9999"))
 # Required scopes.
 #
 # `user:read:chat` is what EventSub's `channel.chat.message` subscription
-# needs (spec 004 T017). It replaces IRC's `chat:read`, which Phase 3 drops
-# once IRC is gone -- both are seeded until then, so a re-seed cannot leave
-# the running IRC transport without its scope.
-REQUIRED_SCOPES = [AuthScope.CHAT_READ, AuthScope.USER_READ_CHAT, AuthScope.CLIPS_EDIT]
+# needs (spec 004 T017). It replaced IRC's `chat:read`, dropped in Phase 3
+# when the IRC transport was removed.
+REQUIRED_SCOPES = [AuthScope.USER_READ_CHAT, AuthScope.CLIPS_EDIT]
 
 
 def save_tokens(access_token: str, refresh_token: str, scopes: list[str]) -> None:
