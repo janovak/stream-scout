@@ -254,13 +254,25 @@ were.
 
 **And the constant that gap depends on is itself unmeasured.**
 `WATERMARK_IDLENESS_SECONDS` is 10 because the KNOWN_ISSUES Issue 4 fix needed
-something far below 60, not because anyone measured how long a live
-broadcaster's chat can fall silent — the quantity that actually bounds it.
-Spec 004 did not change the value; it is outside this feature's scope, it is
-working (5+ hours on the deployed job with zero `hold_regressed` events), and
-lowering it is the risky direction. But the old justification in its comment
-was wrong and removing it did not supply a right one, so the constant now
-carries an explicit "unmeasured, and here is what would measure it" note.
+something far below 60, not because anyone measured the quantity that bounds
+it. Spec 004 did not change the value: it is outside this feature's scope, it
+is working (5+ hours on the deployed job with zero `hold_regressed` events),
+and raising it is the direction that reopens Issue 4. But the old justification
+in its comment was wrong, and removing it did not supply a right one, so the
+constant now carries an explicit "unmeasured, and here is what would measure
+it" note.
+
+**A split is a partition, not a broadcaster**, and getting that backwards
+inverts the conclusion. `with_idleness` acts per source split; `chat-messages`
+has 4 partitions and the producer keys on `broadcaster_id`, so each partition
+carries roughly 5 broadcasters at the current operating point. A split goes
+idle only when *every* broadcaster on it is silent for the full timeout at
+once — a far shorter gap than any one broadcaster's, and shorter still as the
+monitored set grows. Measuring a single broadcaster's inter-message gaps would
+suggest 10 s is much too low and argue for raising it back toward 30–60 s,
+which is exactly the watermark freeze Issue 4 was opened for. Measure
+per-partition gaps.
+
 Recorded here so SC-005's headroom is not read as covering a case it does not.
 
 **Getting the test right took two corrections**, both found in code review, and
@@ -377,7 +389,10 @@ Production runs at `JOIN_THRESHOLD` 15 / `LEAVE_THRESHOLD` 30 — 19 to 24
 channels — and the operator's 2026-08-28 decision is to leave it there. SC-001,
 SC-002 and SC-004 ask for 500. The operator chose (2026-08-29) a **synthetic
 driver** over raising production: `services/stream-monitoring/phase5/driver.py`,
-throwaway and untracked, in the same style as the Phase 0 harnesses.
+written in the style of the Phase 0 harnesses but **tracked**, unlike them —
+it produced four of the seven success-criteria results below, and evidence
+nobody can re-run is weak evidence. Its captured Kafka slices are gitignored
+(~63 MB); the scripts are not.
 
 It runs the **real `Reconciler` and the real `EventSubPoolTransport`** against a
 500-channel desired set, so the code under measurement is the code that ships.

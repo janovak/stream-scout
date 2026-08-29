@@ -113,35 +113,43 @@ WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2
 #
 # What bounds this value is NOT out-of-orderness, despite what this comment
 # used to say. This timeout decides how long a LIVE split may be silent before
-# Flink stops waiting for it. Too low and a quiet-but-live broadcaster's split
-# is marked idle while it is still sending: the operator watermark then runs
-# ahead of that split, and that broadcaster's next messages arrive late. Too
-# high and one quiet split freezes the clock for everyone, which is the 60s
-# bug this issue was opened for. So it is bounded below by the longest gap a
-# live broadcaster can plausibly leave between messages -- seconds, not
-# milliseconds -- and above by how much detection delay a genuinely dead split
-# may add. 10s sits between those.
+# Flink stops waiting for it. Too low and a still-active split is marked idle:
+# the operator watermark then runs ahead of it, and its next records arrive
+# late. Too high and one quiet split freezes the clock for everyone, which is
+# the 60s bug this issue was opened for.
+#
+# A SPLIT IS A PARTITION, NOT A BROADCASTER. with_idleness() acts per source
+# split. chat-messages has 4 partitions and the producer keys on
+# broadcaster_id, so each partition carries several broadcasters -- about 5 at
+# the current 20-channel operating point. A split therefore goes idle only
+# when EVERY broadcaster hashed to it has been silent for the full timeout at
+# once. That is a much shorter gap than any single broadcaster's, and it gets
+# shorter as the monitored set grows.
+#
+# Do not size this off one broadcaster's inter-message gaps. Those run to tens
+# of seconds in quiet chat, and reasoning from them argues for raising this
+# back toward 30-60s -- which is precisely the watermark freeze that cutting
+# it to 10 fixed. The quantity that bounds it is the silence gap of a whole
+# partition, over the union of the broadcasters on it.
 #
 # The 226ms IRC out-of-orderness figure this comment used to cite is the wrong
-# input for that choice, and it is also stale: spec 004 measured worst
-# inversions above 1s on EventSub (research.md, Phase 4 T038). Do not size
-# this constant off either number.
+# input as well, and it is also stale: spec 004 measured worst inversions
+# above 1s on EventSub (research.md, Phase 4 T038).
 #
 # UNMEASURED, and deliberately left so (spec 004, 2026-08-29). Removing the
 # wrong justification did not supply a right one: 10 is inherited from the
 # KNOWN_ISSUES Issue 4 fix, where the only requirement was "far below 60".
-# Nothing has measured the distribution of inter-message gaps for a live
-# broadcaster, which is the quantity that actually bounds this. It is left at
-# 10 because it is working -- 5+ hours on the deployed job with zero
-# `hold_regressed` events -- and because lowering it is the risky direction.
+# Nobody has measured the per-partition silence gap. It is left at 10 because
+# it is working -- 5+ hours on the deployed job with zero `hold_regressed`
+# events -- and because raising it is the direction that reopens Issue 4.
 #
 # This is a real hole in SC-005's guarantee, not a cosmetic one: a split
 # marked idle leaves the watermark minimum, so the operator watermark can run
 # AHEAD of that split, and records arriving after that are late in a way the
 # 0.0041% figure does not bound (research.md, Phase 4 T038, the idleness
-# exception). Measuring it needs per-broadcaster silence-gap data. Whoever
-# picks that up: measure the gaps first, then set this, and do not reuse an
-# out-of-orderness number for it.
+# exception). Whoever picks that up: measure per-partition gaps, not
+# per-broadcaster ones, and remember the answer depends on partition count and
+# on how many channels are monitored.
 #
 # Not shared with tools/replay.py: that
 # harness fires timers off a min-heap in strictly non-decreasing order and

@@ -75,19 +75,34 @@ plans/
 # services/flink-job/tools/cut_dev_slice.py from ~/stream-scout-corpus/
 services/flink-job/corpus/
 
-# Spec 004 measurement harnesses. Throwaway by design, like phase0/ beside
-# them, and they hold captured Kafka slices -- phase5/ alone is ~63 MB, most
-# of it one post-cutover.jsonl. Both directories describe themselves as
-# untracked; this is what makes that true, so one `git add -A` cannot commit
-# a large blob into history permanently.
-services/stream-monitoring/phase0/
-services/stream-monitoring/phase5/
+# Captured Kafka slices from the spec 004 measurement harnesses -- ~63 MB in
+# phase5/ (mostly one post-cutover.jsonl) and ~5 MB in phase0/. These are the
+# blobs that must never reach history; one `git add -A` was all it took.
+#
+# Deliberately NOT ignoring the harness scripts beside them. phase5/driver.py
+# is what produced the SC-001, SC-002, SC-004 and SC-006 numbers in
+# specs/004-eventsub-parallel-reconciler/research.md, and excluding the whole
+# directory would leave those unreproducible by anyone else. The scripts are
+# throwaway, but they should stay addable.
+services/stream-monitoring/phase0/*.jsonl
+services/stream-monitoring/phase5/*.jsonl
+# Regenerable measurement output from those scripts.
+services/stream-monitoring/phase5/*.json
 
 # Local working notes, never meant to be tracked. The file has said so since
 # 2026-08-24 and also recorded that nothing enforced it -- it sat one
 # `git add -A` from being committed, and it carries token-file permission
-# internals and host paths. This is the rule it asked for.
-KNOWN_ISSUES.md
+# internals and host paths. This is the rule it asked for. Anchored, so a
+# future services/*/KNOWN_ISSUES.md is not silently ignored too.
+#
+# Tension worth knowing about, and older than this rule: several tracked files
+# cite this one as the record of record, including a log line the Flink job
+# emits to operators (clip_detector_job.py, "See KNOWN_ISSUES.md Issue 3
+# follow-up"). It has never been committed on any ref, so those references
+# were already dangling in a fresh clone -- this rule makes the situation
+# explicit rather than creating it. The file's own header says the fix is to
+# promote anything that must outlive this machine into a tracked doc.
+/KNOWN_ISSUES.md
 
 # Agent-created git worktrees (full duplicate checkouts)
 .claude/worktrees/
