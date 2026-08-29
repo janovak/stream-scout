@@ -161,11 +161,17 @@ class EventTimeReplayer:
         # by the time second's timer fires (its timer only needs the
         # watermark to pass `second`, which itself only advances that far
         # once later messages have already arrived and been counted in
-        # feed()). evaluate() has no upper bound on ts_bucket -- that
-        # invariant used to be guaranteed by the caller when now_seconds was
-        # real wall-clock time -- so future buckets must be filtered out here
-        # or they'd leak into "second"'s baseline/window. Mirrors
-        # clip_detector_job.py AnomalyDetector.on_timer.
+        # feed()).
+        #
+        # This filter is defensive, not load-bearing: evaluate() bounds the
+        # window with `elif ts_bucket <= second`, so a future bucket falls
+        # through every branch there too, and its docstring says so. Deleting
+        # this line changes no test outcome. It stays because evaluate()'s
+        # docstring states the other half of the contract -- "the caller must
+        # not supply buckets newer than `second`" -- and this is a caller
+        # holding up its end. Mirrors clip_detector_job.py
+        # AnomalyDetector.on_timer, which carries the same note; change both
+        # together, or neither.
         counts_as_of_second = {ts: c for ts, c in state.counts.items() if ts <= second}
         decision = evaluate(
             counts_as_of_second, second, state.hold, state.last_fire_second, self.config

@@ -75,5 +75,13 @@ plans/
 # services/flink-job/tools/cut_dev_slice.py from ~/stream-scout-corpus/
 services/flink-job/corpus/
 
+# Spec 004 measurement harnesses. Throwaway by design, like phase0/ beside
+# them, and they hold captured Kafka slices -- phase5/ alone is ~63 MB, most
+# of it one post-cutover.jsonl. Both directories describe themselves as
+# untracked; this is what makes that true, so one `git add -A` cannot commit
+# a large blob into history permanently.
+services/stream-monitoring/phase0/
+services/stream-monitoring/phase5/
+
 # Agent-created git worktrees (full duplicate checkouts)
 .claude/worktrees/

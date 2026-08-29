@@ -237,9 +237,20 @@ links straight to two issues that are still open.
 
 Measured directly on the live topic, the same way Issue 4 measured
 out-of-orderness — per partition, in offset order, against a running maximum of
-`sent_at`. This is an **upper bound**: Flink's watermark is per split and the
-operator watermark is the minimum across splits, always at or below any one
-partition's, so a record counted late here may still be in time for the job.
+`sent_at`. This is normally an **upper bound**: Flink's watermark is per split
+and the operator watermark is the minimum across splits, so it sits at or below
+any one partition's and a record counted late here may still be in time for the
+job.
+
+**With one exception, which `with_idleness` creates.** A split marked idle
+leaves the minimum, so the operator watermark can run *ahead* of that split's
+own. `WATERMARK_IDLENESS_SECONDS` is 10 and a live broadcaster's partition can
+go quiet on its own, so the case is real rather than hypothetical. Inside such
+a window a record this method calls on-time can be late in the job, and the
+headroom below is derived from a bound that does not hold there. Nothing in
+this sample lands in that window as far as the `hold_regressed` evidence below
+can tell, but the bound is not unconditional and should not be quoted as if it
+were.
 
 **Getting the test right took two corrections**, both found in code review, and
 both in the direction of flattering the result. Bucket `b`'s timer is at
@@ -596,6 +607,13 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
   margin for the untested 414→500 gap. Raise to 5 s (the pre-2026-08-27 value,
   a round number with no measurement behind it — over-corrects and slows every
   detection).
+  **Superseded 2026-08-29 — read the Acceptance bullet below before this one.**
+  The "1 s is under budget" reading came from T002's delivery-lag figure, which
+  omits the record's offset within its own second and so understates lateness.
+  Measured properly, 1 s is late on ~0.60% of records, six times over the
+  SC-005 budget, in two independent windows. **1 s is not an available option**;
+  keeping it would have failed SC-005. The bullet is left in place because it
+  records what was believed when the decision was taken.
 - **Acceptance — settled 2026-08-29, and not the way this line first said.**
   The planned check was Flink's `numLateRecordsDropped` at a stable 500
   channels. **That metric does not exist for this job**: Flink emits it from

@@ -81,12 +81,13 @@ from typing import List, Mapping, Optional, Tuple
 # T038 measured the thing itself, on the live topic under this value: 2
 # records in 48,915, across two 600s windows, arrived after their own bucket's
 # timer had fired. That is 0.0041% against an SC-005 budget of 0.1%, so 2s
-# holds with roughly 24x of headroom.
+# holds with roughly 24x of headroom. Worst inversion in the fully-corrected
+# window was 1,041ms over 21,502 records.
 #
 # Do not go back to 1s. The same samples put a 1s bound at about 0.60% -- more
-# than six times over the SC-005 budget, in both windows. 1s survived on IRC because IRC inversions
-# topped out at 226ms; it does not survive EventSub's delivery lag plus the
-# sub-second offset. This is the measurement that justifies the value, and it
+# than six times over the SC-005 budget, in both windows. 1s survived on IRC
+# because IRC inversions topped out at 226ms; it does not survive EventSub's
+# delivery lag plus the sub-second offset. This is the measurement that justifies the value, and it
 # is a stronger reason than the margin argument D4 was written on.
 #
 # The cost is 1 second. It adds that second to the deliberate floor of the
@@ -108,13 +109,23 @@ WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2
 # creates chat-messages at 4 partitions, matching parallelism), but this
 # timeout stays: a single broadcaster's own partition can still go quiet on
 # its own, independent of partition count, and this is what recovers the
-# watermark when it does. This only needs to be comfortably above the real
-# out-of-orderness on the topic, not anywhere near the 60s it used to be.
-# That figure was 226ms when measured over IRC. It is larger on EventSub:
-# spec 004 T038 measured worst inversions of 1,041-1,064ms and T046 a maximum
-# ingestion skew of 1,256ms over 48,915 live records. 10s is still safe, but
-# the margin is about 9x, not the ~40x the IRC number implied -- do not
-# shrink this value off the 226ms figure. Not shared with tools/replay.py: that
+# watermark when it does.
+#
+# What bounds this value is NOT out-of-orderness, despite what this comment
+# used to say. This timeout decides how long a LIVE split may be silent before
+# Flink stops waiting for it. Too low and a quiet-but-live broadcaster's split
+# is marked idle while it is still sending: the operator watermark then runs
+# ahead of that split, and that broadcaster's next messages arrive late. Too
+# high and one quiet split freezes the clock for everyone, which is the 60s
+# bug this issue was opened for. So it is bounded below by the longest gap a
+# live broadcaster can plausibly leave between messages -- seconds, not
+# milliseconds -- and above by how much detection delay a genuinely dead split
+# may add. 10s sits between those.
+#
+# The 226ms IRC out-of-orderness figure this comment used to cite is the wrong
+# input for that choice, and it is also stale: spec 004 measured worst
+# inversions above 1s on EventSub (research.md, Phase 4 T038). Do not size
+# this constant off either number. Not shared with tools/replay.py: that
 # harness fires timers off a min-heap in strictly non-decreasing order and
 # has no split-idleness concept to model.
 WATERMARK_IDLENESS_SECONDS = 10
