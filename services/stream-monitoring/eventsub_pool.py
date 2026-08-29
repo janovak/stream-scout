@@ -365,8 +365,31 @@ class EventSubPoolTransport(SubscriptionTransport):
     async def create(self, broadcaster_id: int) -> str:
         """Subscribe to one channel's chat, on the connection it routes to."""
         existing = self._slots.get(broadcaster_id)
-        if existing is not None and self._connection_by_id(existing.connection_id) is not None:
-            return existing.subscription_id
+        existing_connection = (
+            self._connection_by_id(existing.connection_id) if existing is not None else None
+        )
+        if existing is not None and existing_connection is not None:
+            # A live connection is not proof of a live subscription. When the
+            # library's `_resubscribe()` gives up part way through a reconnect
+            # the socket stays up while the channels past the failure point no
+            # longer exist on Twitch, and `_slots` still maps them to their
+            # pre-reconnect ids. Returning the recorded id here made no Twitch
+            # call, so the periodic re-adoption would drop the channel from
+            # `_actual`, ask for it again, be handed the ghost straight back,
+            # and count it as covered for ever. Check the library's registry,
+            # which is the only local record of what the socket really holds.
+            if self._connection_holds(existing_connection, broadcaster_id):
+                return existing.subscription_id
+            logger.warning(
+                "Recorded subscription is not on its connection any more, recreating",
+                extra={
+                    "broadcaster_id": broadcaster_id,
+                    "connection": existing_connection.connection_id,
+                    "subscription_id": existing.subscription_id,
+                },
+            )
+            self._forget_slot(existing)
+            existing = None
         if existing is not None:
             # The slot points at a connection that is gone. Returning its id
             # would report the channel as covered while no socket delivers
@@ -660,11 +683,26 @@ class EventSubPoolTransport(SubscriptionTransport):
         subscription_id = subscription.get("id")
         if not subscription_id or self._loop is None:
             return
+        # Take the broadcaster from the payload. The library pops the id out of
+        # `_active_subscriptions` and `_callbacks` BEFORE it calls this handler
+        # (`_handle_revocation`), so by now no local registry can resolve it --
+        # a lookup there is guaranteed to miss. Twitch sends the whole
+        # subscription object, condition included, so the channel is right here.
+        condition = subscription.get("condition") or {}
+        broadcaster_id = condition.get("broadcaster_user_id")
         self._loop.call_soon_threadsafe(
-            self._forget_revoked, subscription_id, subscription.get("status")
+            self._forget_revoked,
+            subscription_id,
+            subscription.get("status"),
+            broadcaster_id,
         )
 
-    def _forget_revoked(self, subscription_id: str, status: Optional[str]):
+    def _forget_revoked(
+        self,
+        subscription_id: str,
+        status: Optional[str],
+        broadcaster_id: Optional[str] = None,
+    ):
         slot = self._by_subscription.pop(subscription_id, None)
         if slot is None:
             # An id this pool does not recognise is NOT an id that is not ours.
@@ -676,7 +714,7 @@ class EventSubPoolTransport(SubscriptionTransport):
             # Returning here dropped the loss on the floor: nothing discarded
             # the channel, nothing invalidated the reconciler, and every count
             # went on reporting it as covered while no socket delivered for it.
-            slot = self._slot_for_rotated_id(subscription_id)
+            slot = self._slot_for_broadcaster(broadcaster_id)
         if slot is None:
             logger.error(
                 "Subscription revoked by Twitch, but the channel could not be "
@@ -859,28 +897,37 @@ class EventSubPoolTransport(SubscriptionTransport):
         except Exception as e:  # pragma: no cover -- a test double without them
             logger.debug("Could not tear down a socket", extra={"error": str(e)})
 
-    def _slot_for_rotated_id(self, subscription_id: str) -> Optional[_Slot]:
-        """Find the slot behind an id the pool has not recorded.
+    def _slot_for_broadcaster(self, broadcaster_id) -> Optional[_Slot]:
+        """The slot this pool holds for a channel, whatever id it recorded.
 
-        A reconnect rotates every id on a socket, and the library's own
-        registry -- keyed BY subscription id -- is the only place the new id
-        appears. Map it back to a broadcaster there, then return whatever slot
-        the pool still holds for that channel under its older id. Same lookup
-        `_forget_unrecognised` makes on the delete path.
+        Used when a revocation names an id the pool has never seen, which is
+        what a reconnect leaves behind: it rotates every id on the socket while
+        the pool keeps the ones it recorded at create time. The broadcaster
+        comes from the revocation payload rather than any local registry --
+        the library has already emptied those by the time it calls us.
         """
-        for connection in list(self._connections):
-            active = getattr(connection.websocket, "_active_subscriptions", None)
-            if not isinstance(active, dict) or subscription_id not in active:
-                continue
-            condition = (active[subscription_id].get("condition") or {})
-            broadcaster = condition.get("broadcaster_user_id")
-            if broadcaster is None:
-                return None
-            try:
-                return self._slots.get(int(broadcaster))
-            except (TypeError, ValueError):
-                return None
-        return None
+        if broadcaster_id is None:
+            return None
+        try:
+            return self._slots.get(int(broadcaster_id))
+        except (TypeError, ValueError):
+            return None
+
+    def _connection_holds(self, connection: _Connection, broadcaster_id: int) -> bool:
+        """Does the library still have a subscription for this channel here?
+
+        The registry is private, but it is the only local record of what a
+        socket really holds after a reconnect. A test double without one is
+        taken at its word rather than treated as empty.
+        """
+        active = getattr(connection.websocket, "_active_subscriptions", None)
+        if not isinstance(active, dict):
+            return True
+        wanted = str(broadcaster_id)
+        return any(
+            (subscription.get("condition") or {}).get("broadcaster_user_id") == wanted
+            for subscription in active.values()
+        )
 
     def _forget_slot(self, slot: _Slot):
         """Drop one slot from both indexes."""

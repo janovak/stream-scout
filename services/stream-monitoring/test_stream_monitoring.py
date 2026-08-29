@@ -2346,9 +2346,15 @@ class TestPoolSocketDeath:
         """A reconnect re-creates every subscription on the socket with new
         ids, and the pool keeps the ones it recorded at create time. So the
         revocation Twitch sends afterwards names an id `_by_subscription` has
-        never seen. That used to return early and drop the loss on the floor:
-        nothing discarded the channel, nothing invalidated the reconciler, and
-        every count went on reporting a channel no socket delivered for."""
+        never seen, and the channel must still be found.
+
+        The resolution has to come from the payload. `_handle_revocation` pops
+        the id out of `_active_subscriptions` and `_callbacks` BEFORE it calls
+        this handler, so any lookup in the library's registries is guaranteed
+        to miss -- this test models that by emptying the registry, which is
+        the state the handler really runs in. An earlier version of this test
+        re-inserted the rotated id by hand and so proved nothing.
+        """
 
         async def run():
             lost = []
@@ -2357,14 +2363,17 @@ class TestPoolSocketDeath:
             await pool.create(7)
             websocket = pool._connections[0].websocket
 
-            # The reconnect: same channel, brand-new id, pool not told.
-            stale_id = next(iter(websocket._active_subscriptions))
-            entry = websocket._active_subscriptions.pop(stale_id)
-            rotated_id = "rotated-sub-1"
-            websocket._active_subscriptions[rotated_id] = entry
+            # The reconnect rotated the id; the library has already forgotten
+            # it by the time the revocation reaches us.
+            websocket._active_subscriptions.clear()
+            websocket._callbacks.clear()
 
             await pool._on_revocation({
-                "subscription": {"id": rotated_id, "status": "authorization_revoked"}
+                "subscription": {
+                    "id": "rotated-sub-1",
+                    "status": "authorization_revoked",
+                    "condition": {"broadcaster_user_id": "7"},
+                }
             })
             await asyncio.sleep(0)
 
@@ -2376,9 +2385,9 @@ class TestPoolSocketDeath:
 
     def test_an_unresolvable_revocation_still_reports_the_loss(self):
         """Twitch only delivers revocations for subscriptions on this pool's
-        own sessions, so an id nothing can resolve is still a channel this
-        pool has lost track of. Re-enumerating costs one listing; staying
-        quiet costs a permanently dark channel."""
+        own sessions, so a revocation carrying no usable condition is still a
+        channel this pool has lost track of. Re-enumerating costs one listing;
+        staying quiet costs a permanently dark channel."""
 
         async def run():
             lost = []
@@ -2388,6 +2397,38 @@ class TestPoolSocketDeath:
             await pool._on_revocation({"subscription": {"id": "not-ours"}})
             await asyncio.sleep(0)
             assert lost == [1]
+
+        asyncio.run(run())
+
+    def test_a_ghost_subscription_is_recreated_rather_than_handed_back(self):
+        """`create()` short-circuits on the id it recorded, and a live
+        connection is not proof of a live subscription: when the library's
+        `_resubscribe()` gives up part way through a reconnect the socket stays
+        up while the channels past the failure point no longer exist.
+
+        Handing the recorded id back made no Twitch call, so the periodic
+        re-adoption would drop the channel, ask for it again, be given the
+        ghost straight back, and count it as covered for ever -- defeating the
+        re-adoption that exists to catch exactly this.
+        """
+
+        async def run():
+            pool = make_pool()
+            await pool.start()
+            first_id = await pool.create(7)
+            websocket = pool._connections[0].websocket
+
+            # The reconnect dropped this channel and never restored it.
+            websocket._active_subscriptions.clear()
+            websocket._callbacks.clear()
+
+            second_id = await pool.create(7)
+
+            assert second_id != first_id, (
+                "create() handed back the id of a subscription that no longer "
+                "exists, without contacting Twitch"
+            )
+            assert pool.occupancy() == {"0": 1}
 
         asyncio.run(run())
 
@@ -2605,6 +2646,97 @@ class TestDegradedWithoutUserAuth:
             assert service.reconciler is None
             # The poll job is still scheduled: intent keeps being written.
             assert service.scheduler.get_job("poll_streams") is not None
+
+        asyncio.run(run())
+
+    def test_a_bad_token_degrades_instead_of_crash_looping(self):
+        """The fallback promised "running without user auth", but only
+        FileNotFoundError reached it. A token that expired and cannot refresh
+        raises InvalidTokenException, a scope-reduced one MissingScopeException,
+        and a truncated file raises out of `credentials.load()` -- all of them
+        far likelier than a missing file, and all of them used to crash-loop
+        the container."""
+
+        async def run():
+            for failure in (
+                ValueError("expired and could not refresh"),
+                KeyError("access_token"),
+            ):
+                twitch = MagicMock()
+                twitch.authenticate_app = AsyncMock()
+                credentials = MagicMock()
+                credentials.load.side_effect = failure
+
+                service = StreamMonitoringService()
+                with patch.object(stream_monitoring_service, "Twitch", AsyncMock(return_value=twitch)), \
+                     patch.object(stream_monitoring_service, "get_credentials", return_value=credentials), \
+                     patch.object(stream_monitoring_service, "Producer"), \
+                     patch.object(stream_monitoring_service.psycopg2.pool, "ThreadedConnectionPool"), \
+                     patch.object(stream_monitoring_service.redis, "from_url", return_value=MagicMock()), \
+                     patch.object(stream_monitoring_service, "start_http_server"), \
+                     patch.object(StreamMonitoringService, "_build_transport", AsyncMock()):
+                    await service.initialize()   # must not raise
+
+                assert service.has_user_auth is False
+                assert service.scheduler.get_job("poll_streams") is not None
+
+        asyncio.run(run())
+
+    def test_the_metrics_server_starts_before_anything_that_can_fail(self):
+        """Whatever kills start-up, /metrics has to be up first -- it is where
+        the operator is sent to diagnose the failure."""
+
+        async def run():
+            service = StreamMonitoringService()
+            with patch.object(
+                stream_monitoring_service, "Twitch",
+                AsyncMock(side_effect=RuntimeError("twitch is down")),
+            ), \
+                 patch.object(stream_monitoring_service, "start_http_server") as metrics:
+                with pytest.raises(RuntimeError):
+                    await service.initialize()
+
+            metrics.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_the_refresh_callback_is_registered_before_authenticating(self):
+        """`set_user_authentication` refreshes internally on a 401 and invokes
+        the callback during that call. Assigned afterwards it is still None at
+        that moment, so the rotated refresh token is dropped and the file keeps
+        the old one -- which locks the service out at the next restart."""
+
+        async def run():
+            seen = []
+            twitch = MagicMock()
+
+            async def set_user_authentication(*args, **kwargs):
+                seen.append(twitch.user_auth_refresh_callback)
+
+            twitch.set_user_authentication = set_user_authentication
+            twitch.user_auth_refresh_callback = None
+
+            credentials = MagicMock()
+            record = MagicMock()
+            record.access_token = "a"
+            record.refresh_token = "r"
+            record.scopes = ["user:read:chat", "clips:edit"]
+            credentials.load.return_value = record
+
+            service = StreamMonitoringService()
+            with patch.object(stream_monitoring_service, "Twitch", AsyncMock(return_value=twitch)), \
+                 patch.object(stream_monitoring_service, "get_credentials", return_value=credentials), \
+                 patch.object(stream_monitoring_service, "Producer"), \
+                 patch.object(stream_monitoring_service.psycopg2.pool, "ThreadedConnectionPool"), \
+                 patch.object(stream_monitoring_service.redis, "from_url", return_value=MagicMock()), \
+                 patch.object(stream_monitoring_service, "start_http_server"), \
+                 patch.object(StreamMonitoringService, "_build_transport", AsyncMock()):
+                await service.initialize()
+
+            assert seen and seen[0] is not None, (
+                "a refresh during set_user_authentication would have dropped "
+                "the rotated refresh token"
+            )
 
         asyncio.run(run())
 

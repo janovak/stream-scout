@@ -244,6 +244,14 @@ class StreamMonitoringService:
         """Initialize all connections and services."""
         logger.info("Initializing Stream Monitoring Service")
 
+        # The metrics server comes up FIRST, before the token, Kafka, Postgres,
+        # Redis or the transport -- every one of which can fail on a bad day.
+        # It used to start last, so any of those failures killed the process
+        # with no /metrics at all, taking down the FR-012 gauges an operator is
+        # told to check at exactly the moment the service is failing.
+        start_http_server(PROMETHEUS_PORT)
+        logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
+
         # Initialize Twitch API with app credentials
         self.twitch = await Twitch(TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET)
 
@@ -270,24 +278,37 @@ class StreamMonitoringService:
                     extra={"scopes": record.scopes},
                 )
 
-            # Set user authentication with loaded tokens
+            # Register the refresh callback BEFORE authenticating, not after.
+            # `set_user_authentication` validates the token and, on a 401,
+            # refreshes it internally and invokes this callback (twitch.py:716
+            # -721). Assigned afterwards it is still None at that moment, so
+            # the rotated refresh token is dropped on the floor and the file
+            # keeps the old one -- the exact failure `token_manager`'s
+            # `test_refresh_stores_rotated_refresh_token` exists to prevent.
+            self.twitch.user_auth_refresh_callback = self._on_token_refresh
+
             await self.twitch.set_user_authentication(
                 record.access_token,
                 auth_scopes,
                 record.refresh_token
             )
 
-            # Register callback for token refresh
-            self.twitch.user_auth_refresh_callback = self._on_token_refresh
-
             logger.info("User authentication configured with pre-seeded tokens", extra={
                 "scopes": record.scopes
             })
 
-        except FileNotFoundError as e:
-            logger.warning("Token file not found, running without user auth (chat will not work)", extra={
-                "error": str(e)
-            })
+        except Exception as e:
+            # Every way the token can fail, not just a missing file. A token
+            # that expired and cannot refresh raises InvalidTokenException, a
+            # scope-reduced one raises MissingScopeException, and a truncated
+            # or hand-edited file raises out of `credentials.load()`. All of
+            # those used to propagate and crash-loop the container, which is
+            # the opposite of what the fallback below promises -- and they are
+            # far likelier than the missing file this only used to catch.
+            logger.warning(
+                "No usable user token, running without user auth (chat will not work)",
+                extra={"error": str(e), "error_type": type(e).__name__},
+            )
             # Fall back to app-only auth for streams API
             await self.twitch.authenticate_app([])
             self.has_user_auth = False
@@ -322,14 +343,6 @@ class StreamMonitoringService:
         # warning above promises the service keeps running with chat off, so
         # honour that instead of crash-looping the container on a missing
         # token file.
-        # Start the metrics server BEFORE anything that can fail. Building the
-        # transport calls get_users(), so a transient Twitch 5xx or a network
-        # blip there used to propagate out of initialize() and kill the process
-        # before this line ran -- taking down the FR-012 gauges an operator is
-        # told to check at exactly the moment the service is failing.
-        start_http_server(PROMETHEUS_PORT)
-        logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
-
         if not self.has_user_auth:
             logger.error(
                 "No user authentication, so no chat transport and no reconciler. "
