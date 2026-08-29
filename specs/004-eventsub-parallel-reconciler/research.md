@@ -34,7 +34,7 @@ watermark → **PASS. Phase 2 unblocked.**
   distribution is the relevant output and it is clean. Re-confirm the tail at a
   full, stable 500 during Phase 5 (T044 / T038).
   **Outcome (2026-08-29)**: T044 confirmed the transport at a stable 500 for
-  31 minutes, and T038 measured the late rate at 24 channels as 0.000%. The
+  31 minutes, and T038 measured the late rate at 23 channels as 0.0073%. The
   tail was **not** re-measured at 500, because that needs Flink in the path.
   See the honesty note at the end of Phase 5.
 - T002's lag tail includes scheduling jitter from a single-process measurement
@@ -163,11 +163,23 @@ One stale literal was corrected alongside it: `clip_detector_job.py`'s
 "a message for second now_seconds+1..+5" comment still carried the pre-2026-08-27
 value of 5. It now names the constant instead of a number.
 
-**Deployed 2026-08-29 02:52 UTC** (job `586d5750`). Application Mode: the four
-job `.py` files are bind-mounted, so restarting `flink-jobmanager` reruns the
-job with the new value. Confirmed from inside the container
-(`WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2`, `WATERMARK_IDLENESS_SECONDS = 10`).
+**Deployed 2026-08-29 02:52 UTC** (job `586d5750`). Application Mode: starting
+the `flink-jobmanager` container *is* starting the job, so a restart reruns it.
 No state to migrate, because checkpointing is off.
+
+**Do not treat "restart picks up the edit" as a rule.** Those four job files are
+bind-mounted **individually** (`docker-compose.yml`, the `flink-jobmanager` and
+`flink-taskmanager` `volumes:` blocks), and a single-file bind mount follows the
+inode — the same trap recorded under "Deployment trap found while verifying"
+below, which had left the stream-monitoring container running pre-Phase-3 code.
+It happened to work here because the edit was made in place. Any edit that
+replaces the inode — `git checkout`, `sed -i`, an editor that writes and renames
+— leaves the containers on the old constant while the host file reads the new
+one, and `docker compose restart` will not fix it.
+
+**So the deploy was established by checking, not by assuming**: read from inside
+the running container, `WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2` and
+`WATERMARK_IDLENESS_SECONDS = 10`. Do that after any change to these files.
 
 **Effect on the watermark, measured.**
 `max_over_time(flink_taskmanager_job_task_operator_watermarkLag[20m])` reads
@@ -201,11 +213,27 @@ operator. Confirmed against the running job's REST API: `/jobs/<id>/vertices/
 <id>/metrics` lists no late-record metric on either vertex, and Prometheus has
 no such series to query.
 
-So **Flink drops nothing here.** A late record still reaches `process_element`
-and still increments its bucket. What it loses is its own second's evaluation,
-because `on_timer` for that bucket has already run. The quantity SC-005 is
-really about is therefore *the fraction of records that arrive after their own
-bucket's timer fired*, which is delivery lag beyond the watermark tolerance.
+So **Flink drops nothing here** — and what happens instead is worse than
+losing the record, not better. A late record reaches `process_element`, which
+increments its bucket and **re-registers that bucket's timer unconditionally**
+(`clip_detector_job.py:704`). Flink does not compare a newly-registered
+event-time timer against the current watermark, so a timer for a second the
+watermark has already passed fires on the very next `advanceWatermark`. The
+late record therefore does not lose its evaluation; it forces the
+already-evaluated second to be **re-evaluated backwards in time**.
+
+That is the `hold_regressed` path: when a hold is open and the re-fired second
+sits behind the hold's own recorded peak, `evaluate()` passes the hold through
+unmeasured, and `clip_detector_job.py` logs a warning and increments
+`hold_regressed_total` (KNOWN_ISSUES.md Issue 3, and the replay mechanism
+Issue 4's "Change B" was written against).
+
+So the quantity SC-005 bounds here is *the fraction of records that arrive
+after their own bucket's timer fired* — records that cause an extra
+out-of-order re-evaluation, not records that are lost. Either way it is
+delivery lag beyond the watermark tolerance, and either way the budget is the
+right one to hold; but the failure it buys off is a regressed hold, and that
+links straight to two issues that are still open.
 
 Measured directly on the live topic, the same way Issue 4 measured
 out-of-orderness — per partition, in offset order, against a running maximum of
@@ -213,24 +241,41 @@ out-of-orderness — per partition, in offset order, against a running maximum o
 operator watermark is the minimum across splits, always at or below any one
 partition's, so a record counted late here may still be in time for the job.
 
-**600 s sample, 27,218 records, 24 broadcasters, all four partitions, on the
+**The test has to include the record's offset within its own second.** Bucket
+`b`'s timer is registered at `b*1000` and fires when the watermark reaches it,
+so with `sent_at = b*1000 + rem` and `behind = max_sent_at - sent_at`, the
+bucket has already fired when `behind + rem >= OOO_MS + 1`. A first version of
+this measurement tested `behind > OOO_MS` alone and so undercounted lateness by
+up to a full second. The numbers below are from the corrected test.
+
+**600 s sample, 27,413 records, 23 broadcasters, all four partitions, on the
 deployed 2 s watermark:**
 
 | Bound | Records past it | Rate |
 |---|---|---|
-| 500 ms | 12 | 0.044% |
-| 1,000 ms | 4 | 0.0147% |
-| **2,000 ms** | **0** | **0.000%** |
+| 500 ms | 14,038 | 51.21% |
+| 1,000 ms | 170 | 0.620% |
+| **2,000 ms** | **2** | **0.0073%** |
 | 5,000 ms | 0 | 0.000% |
 
-Worst inversion 1,082 ms; inversion p99 87 ms, p99.9 207 ms.
-**SC-005 budget is 0.1%. At 2 s the measured rate is 0.000% — PASS.**
+Worst inversion 1,064 ms; inversion p99 90 ms, p99.9 158 ms.
+**SC-005 budget is 0.1%. At the deployed 2 s the measured rate is 0.0073% —
+PASS, with about 14× of headroom.**
 
-The 1 s column is the useful one for D4: at the previous value this window
-would have dropped 0.0147%. Still inside budget, but non-zero, against 0 at
-2 s. That is the margin the extra second was bought for.
+**The 1 s column is the finding.** At the previous value this window would have
+been late on 0.620% of records — **more than six times over the SC-005 budget**.
+The 1 → 2 move was not buying margin against an untested channel count, as D4
+supposed when it was written; on the deployed traffic 1 s does not meet SC-005
+at all. D4 reached the right decision for a weaker reason than the one that
+actually holds.
 
-**Channel count: this was measured at 24 broadcasters, not 500.** The
+The 500 ms row looks alarming and is not a defect: at a sub-second tolerance
+the bucket's timer fires before the second it covers has finished arriving, so
+roughly half of all records land after it — `rem >= 501` with `behind` of 0 is
+already late. It is recorded because it shows the shape of the function, and
+because it is the reason the `rem` term cannot be dropped.
+
+**Channel count: this was measured at 23 broadcasters, not 500.** The
 500-channel measurement is carried by T044 below, which exercised the
 reconciler and the sockets at 500 but not Flink — see the honesty note at the
 end of Phase 5.
@@ -253,11 +298,25 @@ replayed through `tools/replay.py` with production's detector config.
 | Messages per spike (mean) | 61.4 | 63.5 | 1.03× |
 
 **The per-hour rates differ; the anomaly character and the volume-normalised
-rate do not.** The gap is a property of the two inputs, not of the transport:
-the pre-cutover corpus runs at 9,871 messages per broadcaster-hour and the
-post-cutover capture at 2,167, a 4.6× difference in density. Normalise by chat
-volume and the rates agree to within 4%, and every shape measure — intensity
-mean, median, and messages per spike — agrees to within 6%.
+rate do not.** The conclusion rests on the volume-normalised row: **21.14 vs
+22.04 spikes per 100k messages, 1.042×**, with every shape measure — intensity
+mean, median, and messages per spike — inside 6%.
+
+**The two per-hour rows are not comparable and should not be read as a
+finding.** The capture reads an equal record count from each Kafka partition,
+so each partition's slice reaches a different distance back in wall-clock time,
+and the file's nominal 3.00 h span is not a span every broadcaster is present
+for. Dividing the whole file by that span and by all 30 broadcasters
+understates density by an unknown factor. Measured per broadcaster over each
+broadcaster's *own* observed span, the median is 9,922 messages per
+broadcaster-hour pre-cutover against 4,688 post — a **2.1×** density difference,
+not the 4.6× a whole-file division suggests, and still not enough on its own to
+account for a 0.23× spike rate. The residue is the warm-up gate: a broadcaster
+present for only part of the capture spends more of its span below the 240 s of
+baseline the detector needs before it can fire at all.
+
+Volume normalisation sidesteps every one of those sampling artefacts, which is
+why it is the row the conclusion is drawn from.
 
 The replay is deterministic: two runs over the same capture diff empty, which
 is the harness contract this comparison depends on.
@@ -308,7 +367,7 @@ at all: production's `REDIS_URL` points at a different instance entirely.
 | **SC-002** | T042 | **PASS**. Poll write at 500: change-nothing p50 9.975 ms, change-everything (500 of 500 members replaced) p50 10.391 ms — **1.042×**, and an identical **6 Redis commands** per write either way | **500 channels** |
 | **SC-003** | T043 | **PASS**. Zero `Bucket channel_join got rate limited`, and zero rate-limit lines of any kind | production, 21–24 channels |
 | **SC-004** | T044 | **PASS**. 31 minutes, 26 one-minute samples, subscriptions **499 constant** against a desired 500. Deviation **0.2%** against a ±1% budget, 0 lost-socket events, 181,180 messages received | **500 channels** |
-| **SC-005** | T038 | **PASS**. 0.000% of records past the 2 s watermark over 27,218 records; budget 0.1% | 24 broadcasters |
+| **SC-005** | T038 | **PASS**. 0.0073% of records past the 2 s watermark over 27,413 records, budget 0.1%. The same sample puts 1 s at 0.620%, over budget | 23 broadcasters |
 | **SC-006** | T045 | **PASS**. Killed mid-ramp at ~250–350 of 500 with `SIGKILL`; restart converged to **499/500 in 74 s**, **499 live broadcasters, 0 duplicates** | **500 channels** |
 | **SC-007** | T044a | **PASS**. All five FR-012 metrics present on `/metrics` with HELP/TYPE and live values | production |
 
@@ -331,9 +390,9 @@ no series while nothing has failed, which is this exporter's
 register-on-first-increment behaviour, not a placeholder. It was observed
 populating as `{reason="refused"} 1.0` during the driver runs.
 
-**T046**: `sent_at` is an epoch-millisecond int in every one of 27,218 live
-records — 0 null, 0 non-int. Skew against the ingestion `timestamp`: min 101,
-p50 166, p95 231, p99 269, max 1,258 ms. **0 records outside the 2 s
+**T046**: `sent_at` is an epoch-millisecond int in every one of 27,413 live
+records — 0 null, 0 non-int. Skew against the ingestion `timestamp`: min 99,
+p50 168, p95 235, p99 270, max 1,219 ms. **0 records outside the 2 s
 tolerance.**
 
 **T047**: `test_stream_monitoring.py` — 136 passed, 8 skipped (the pre-existing
@@ -344,8 +403,14 @@ flink-job suite 106 passed, 4 skipped. **One test needed a change.**
 `test_replay.py` fed `1002 * 1000 + 1` to push the watermark past bucket 1001.
 That literal is `1001 * 1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1` evaluated at
 the old 1 s, and every other feed in the file already writes that symbolically.
-It now does too. The assertions were not touched, and the expression is
-identical to the old one at the old value.
+It now does too. The assertions were not touched, and that expression is
+identical to the old literal at the old value.
+
+One knock-on worth naming: a *different* feed in the same test, already
+symbolic, sits `WATERMARK_OUT_OF_ORDERNESS_MS + 1` past second 1000, so it
+moved from bucket 1001 to bucket 1002 with the constant. The test still passes
+and still proves what it was written to prove, but its comment described the
+1 s behaviour and has been corrected.
 
 ### Two incidental observations
 
@@ -360,7 +425,8 @@ identical to the old one at the old value.
 
 ### What was NOT measured at 500, stated plainly
 
-**SC-005 is the one criterion still taken at the production operating point.**
+**SC-005 is the one criterion still taken at the production operating point**
+(23 broadcasters).
 The driver deliberately has no Kafka producer and no Flink, so it cannot
 produce a 500-channel late-drop number. Getting one would mean pushing roughly
 25× the current traffic through a parallelism-4 job and letting `ClipCreator`
@@ -371,7 +437,7 @@ What the 414 → 500 gap now looks like:
 
 - T002 measured the delivery-lag distribution at **414** channels and found one
   message in 59,405 past 2 s (0.0017%).
-- T038 measures the resulting late rate at **24** channels: 0.000%.
+- T038 measures the resulting late rate at **23** channels: 0.0073%.
 - T044 confirms the transport itself is stable at **500** for 31 minutes, with
   the sockets carrying 181,180 real messages — so the 500-channel claim that is
   missing is narrowly about *Flink's* residual drop rate, not about whether the
@@ -379,7 +445,7 @@ What the 414 → 500 gap now looks like:
 
 The lag tail did not grow between the 394-channel spike (p50 154 / p95 220 ms)
 and 414 channels (p50 163 / p95 217 ms), and the 24-channel production figure
-(p50 166 / p95 231 ms) sits on the same line. Nothing in three measurements at
+(p50 168 / p95 235 ms) sits on the same line. Nothing in three measurements at
 three scales suggests the tail grows with channel count. **That is an argument,
 not a measurement, and it is recorded here as one.**
 
@@ -517,8 +583,10 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
   with per-second timers and no window operator, so nothing ever drops a late
   record. The equivalent quantity — records arriving after their own bucket's
   timer fired — was measured directly on the live topic instead:
-  **0.000% past 2 s over 27,218 records**, against the 0.1% budget. The channel
-  count is 24, not 500; the 500-channel part of the claim is carried by T044's
+  **0.0073% past 2 s over 27,413 records**, against the 0.1% budget. The same
+  measurement puts the *previous* 1 s value at 0.620% — six times over budget —
+  so the move to 2 s was necessary for SC-005, not merely prudent. The channel
+  count is 23, not 500; the 500-channel part of the claim is carried by T044's
   transport measurement and is argued, not measured. See Phase 4 T038 and the
   honesty note at the end of Phase 5.
 

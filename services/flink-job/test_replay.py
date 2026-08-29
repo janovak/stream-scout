@@ -107,11 +107,13 @@ def test_future_buckets_already_in_state_are_excluded_from_evaluate():
 
     # A heavy burst for second 1001 lands in state before bucket 1000's timer
     # becomes due (needs watermark >= 1000000, i.e.
-    # max_sent_at_ms >= 1000*1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1). A
-    # narrower out-of-orderness bound leaves room for only one future second
-    # to land ahead of the boundary crossing, not several -- that's still
-    # enough to prove the filter, since one leaked future bucket is exactly
-    # what it must exclude.
+    # max_sent_at_ms >= 1000*1000 + WATERMARK_OUT_OF_ORDERNESS_MS + 1). At
+    # least one future second is therefore in state when second 1000 fires,
+    # which is what the filter must exclude. How many depends on the bound:
+    # the pushing feed below sits WATERMARK_OUT_OF_ORDERNESS_MS + 1 past
+    # second 1000, so at 1s it landed in bucket 1001 and joined the burst,
+    # and at 2s it lands in bucket 1002 and makes a second future bucket.
+    # Either way second 1000 sees only its own steady traffic.
     for _ in range(100):
         evaluations.extend(replayer.feed(1, sent_at_ms=1001 * 1000))
 

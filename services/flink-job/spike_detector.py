@@ -72,12 +72,21 @@ from typing import List, Mapping, Optional, Tuple
 # p99.9 415ms, p99.99 1,255ms. The tail did not grow against the 394-channel
 # spike (154 / 220). One message went past 2s. That is 0.0017%.
 #
-# A 2s bound therefore drops about 0.0017% of records. The SC-005 budget is
-# 0.1%, so 2s stays about 60 times below it. A 1s bound drops about 0.039% on
-# the same data. That is also below the budget, but it keeps no margin for the
-# 414-to-500 channel gap that T002 did not measure. The T002 figure is an upper
-# bound as well: its measurement consumer did receive and bookkeeping on one
-# asyncio loop, so that loop's scheduling jitter is inside these numbers.
+# T002 measures delivery lag, which is not quite the quantity that matters. A
+# record is late when its own second's timer has already fired, and that timer
+# fires when the watermark passes the START of the second. So a record is late
+# once `delivery_lag + (sent_at % 1000) > this constant`. The offset inside the
+# second counts, and T002 does not include it.
+#
+# T038 measured the thing itself, on the live topic under this value: over
+# 27,413 records, 0.0073% arrived after their own bucket's timer had fired.
+# The SC-005 budget is 0.1%, so 2s holds with about 14x of headroom.
+#
+# Do not go back to 1s. The same sample puts a 1s bound at 0.620% -- more than
+# six times over the SC-005 budget. 1s survived on IRC because IRC inversions
+# topped out at 226ms; it does not survive EventSub's delivery lag plus the
+# sub-second offset. This is the measurement that justifies the value, and it
+# is a stronger reason than the margin argument D4 was written on.
 #
 # The cost is 1 second. It adds that second to the deliberate floor of the
 # peak-to-clip-request delay (KNOWN_ISSUES.md Issue 4, "Post-deploy
@@ -98,9 +107,13 @@ WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2
 # creates chat-messages at 4 partitions, matching parallelism), but this
 # timeout stays: a single broadcaster's own partition can still go quiet on
 # its own, independent of partition count, and this is what recovers the
-# watermark when it does. Measured real out-of-orderness on the live topic
-# tops out at 226ms, so this only needs to be comfortably above that, not
-# anywhere near the 60s it used to be. Not shared with tools/replay.py: that
+# watermark when it does. This only needs to be comfortably above the real
+# out-of-orderness on the topic, not anywhere near the 60s it used to be.
+# That figure was 226ms when measured over IRC. It is larger on EventSub:
+# spec 004 T038 measured a worst inversion of 1,064ms and T046 a maximum
+# ingestion skew of 1,219ms over 27,413 live records. 10s is still safe, but
+# the margin is about 9x, not the ~40x the IRC number implied -- do not
+# shrink this value off the 226ms figure. Not shared with tools/replay.py: that
 # harness fires timers off a min-heap in strictly non-decreasing order and
 # has no split-idleness concept to model.
 WATERMARK_IDLENESS_SECONDS = 10
