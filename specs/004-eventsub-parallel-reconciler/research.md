@@ -175,6 +175,16 @@ No state to migrate, because checkpointing is off.
 term plus processing, with the idleness timeout not firing. This is the +1 s
 cost the decision accepted, visible directly.
 
+**Effect on the detection delay, measured.** 44 detections over 90 minutes:
+peak-to-detection **p50 8.2 s, p90 12.0 s, p95 12.0 s, max 17.2 s, 0% over
+30 s**; margin-before-peak p50 16.8 s, p10 13.0 s, min 7.8 s. The +1 s cost is
+real but invisible against the two reductions that landed before it — the
+5 → 1 move and the partition-count fix that stopped the idleness timeout from
+firing routinely. For reference the last measurement at the 5 s value, over 554
+detections, was p50 14.1 / p90 18.1 / p95 20.1 / max 28.9 s. **44 detections is
+a small sample and understates the tail**; the median is the trustworthy part.
+KNOWN_ISSUES.md Issue 4 carries the full comparison.
+
 **T037**: `KNOWN_ISSUES.md` Issue 4 "Post-deploy validation" now carries the
 bookkeeping for both the 5 → 1 and 1 → 2 moves. The delay figures there were
 measured at 5 s; the current value subtracts 3 s from each. That section had
