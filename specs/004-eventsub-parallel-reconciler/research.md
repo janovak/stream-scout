@@ -34,7 +34,7 @@ watermark → **PASS. Phase 2 unblocked.**
   distribution is the relevant output and it is clean. Re-confirm the tail at a
   full, stable 500 during Phase 5 (T044 / T038).
   **Outcome (2026-08-29)**: T044 confirmed the transport at a stable 500 for
-  31 minutes, and T038 measured the late rate at 23 channels as 0.0073%. The
+  31 minutes, and T038 measured the late rate at 21-23 channels as 0.0041%. The
   tail was **not** re-measured at 500, because that needs Flink in the path.
   See the honesty note at the end of Phase 5.
 - T002's lag tail includes scheduling jitter from a single-process measurement
@@ -241,41 +241,61 @@ out-of-orderness — per partition, in offset order, against a running maximum o
 operator watermark is the minimum across splits, always at or below any one
 partition's, so a record counted late here may still be in time for the job.
 
-**The test has to include the record's offset within its own second.** Bucket
-`b`'s timer is registered at `b*1000` and fires when the watermark reaches it,
-so with `sent_at = b*1000 + rem` and `behind = max_sent_at - sent_at`, the
-bucket has already fired when `behind + rem >= OOO_MS + 1`. A first version of
-this measurement tested `behind > OOO_MS` alone and so undercounted lateness by
-up to a full second. The numbers below are from the corrected test.
+**Getting the test right took two corrections**, both found in code review, and
+both in the direction of flattering the result. Bucket `b`'s timer is at
+`b*1000` and fires when the watermark (`max_sent_at - OOO - 1`) reaches it, so
+the bucket has already fired when `previous >= b*1000 + OOO + 1`, where
+`previous` is the running maximum over records seen *before* this one.
 
-**600 s sample, 27,413 records, 23 broadcasters, all four partitions, on the
+- The first version tested `behind > OOO_MS` and dropped the record's offset
+  within its own second, undercounting lateness by up to a full second.
+- The second included the offset but clamped `previous - sent_at` to 0 for a
+  record that is itself a new maximum, where the true value is negative. That
+  over-counts, and only at bounds below 1 s — at 1 s and 2 s a clamped record
+  would need `rem >= 1001`, which is impossible.
+
+The figures below use the final form, comparing `previous` against the bucket
+start directly.
+
+**600 s sample, 21,502 records, 21 broadcasters, all four partitions, on the
 deployed 2 s watermark:**
 
 | Bound | Records past it | Rate |
 |---|---|---|
-| 500 ms | 14,038 | 51.21% |
-| 1,000 ms | 170 | 0.620% |
-| **2,000 ms** | **2** | **0.0073%** |
+| 500 ms | 9,166 | 42.63% |
+| 1,000 ms | 128 | 0.595% |
+| **2,000 ms** | **0** | **0.000%** |
 | 5,000 ms | 0 | 0.000% |
 
-Worst inversion 1,064 ms; inversion p99 90 ms, p99.9 158 ms.
-**SC-005 budget is 0.1%. At the deployed 2 s the measured rate is 0.0073% —
-PASS, with about 14× of headroom.**
+Worst inversion 1,041 ms; inversion p99 116 ms, p99.9 758 ms (percentiles over
+the 4,540 inversions, not over all records).
 
-**The 1 s column is the finding.** At the previous value this window would have
-been late on 0.620% of records — **more than six times over the SC-005 budget**.
-The 1 → 2 move was not buying margin against an untested channel count, as D4
-supposed when it was written; on the deployed traffic 1 s does not meet SC-005
-at all. D4 reached the right decision for a weaker reason than the one that
-actually holds.
+**Do not read the 0 as "never".** An earlier 600 s window under the same
+watermark, 27,413 records, saw **2** records past 2 s. Across both windows that
+is **2 in 48,915 = 0.0041%**, against the 0.1% budget. **SC-005 PASSES with
+roughly 24× of headroom**, and the honest statement is "a few per hundred
+thousand", not zero.
 
-The 500 ms row looks alarming and is not a defect: at a sub-second tolerance
-the bucket's timer fires before the second it covers has finished arriving, so
-roughly half of all records land after it — `rem >= 501` with `behind` of 0 is
-already late. It is recorded because it shows the shape of the function, and
-because it is the reason the `rem` term cannot be dropped.
+**The 1 s column is the finding, and it reproduces.** 0.595% here and 0.620% in
+the earlier window — **about six times over the SC-005 budget** in both. At the
+previous value this pipeline does not meet SC-005 on live EventSub traffic at
+all. D4 argued the 1 → 2 move bought margin against an untested channel count;
+the real reason is that 1 s fails outright, which is a stronger reason than the
+one the decision was written on.
 
-**Channel count: this was measured at 23 broadcasters, not 500.** The
+The 500 ms row is not a defect and not an artefact: at a sub-second tolerance a
+bucket's timer fires before the second it covers has finished arriving, so a
+large fraction of records land after it. It is kept because it shows the shape
+of the function, and because it is why the offset term cannot be dropped.
+
+**The observable consequence agrees.** A late record only damages anything when
+it re-fires a second beneath an *open* hold, which is the `hold_regressed`
+path. Over the first 80 minutes of the deployed job (`179f85c0`) there were
+**zero** `hold_regressed` warnings and `hold_regressed_total` has no series at
+all — no increments. At 0.0041%, two late records in 48,915, the odds of one
+landing under an open hold are small, and none did.
+
+**Channel count: this was measured at 21-23 broadcasters, not 500.** The
 500-channel measurement is carried by T044 below, which exercised the
 reconciler and the sockets at 500 but not Flink — see the honesty note at the
 end of Phase 5.
@@ -367,7 +387,7 @@ at all: production's `REDIS_URL` points at a different instance entirely.
 | **SC-002** | T042 | **PASS**. Poll write at 500: change-nothing p50 9.975 ms, change-everything (500 of 500 members replaced) p50 10.391 ms — **1.042×**, and an identical **6 Redis commands** per write either way | **500 channels** |
 | **SC-003** | T043 | **PASS**. Zero `Bucket channel_join got rate limited`, and zero rate-limit lines of any kind | production, 21–24 channels |
 | **SC-004** | T044 | **PASS**. 31 minutes, 26 one-minute samples, subscriptions **499 constant** against a desired 500. Deviation **0.2%** against a ±1% budget, 0 lost-socket events, 181,180 messages received | **500 channels** |
-| **SC-005** | T038 | **PASS**. 0.0073% of records past the 2 s watermark over 27,413 records, budget 0.1%. The same sample puts 1 s at 0.620%, over budget | 23 broadcasters |
+| **SC-005** | T038 | **PASS**. 0.0041% past the 2 s watermark — 2 records in 48,915 over two windows, budget 0.1%. The same samples put 1 s at ~0.60%, six times over budget | 21–23 broadcasters |
 | **SC-006** | T045 | **PASS**. Killed mid-ramp at ~250–350 of 500 with `SIGKILL`; restart converged to **499/500 in 74 s**, **499 live broadcasters, 0 duplicates** | **500 channels** |
 | **SC-007** | T044a | **PASS**. All five FR-012 metrics present on `/metrics` with HELP/TYPE and live values | production |
 
@@ -390,10 +410,10 @@ no series while nothing has failed, which is this exporter's
 register-on-first-increment behaviour, not a placeholder. It was observed
 populating as `{reason="refused"} 1.0` during the driver runs.
 
-**T046**: `sent_at` is an epoch-millisecond int in every one of 27,413 live
-records — 0 null, 0 non-int. Skew against the ingestion `timestamp`: min 99,
-p50 168, p95 235, p99 270, max 1,219 ms. **0 records outside the 2 s
-tolerance.**
+**T046**: `sent_at` is an epoch-millisecond int in every one of 21,502 live
+records — 0 null, 0 non-int. Skew against the ingestion `timestamp`: min 100,
+p50 165, p95 232, p99 268, max 1,256 ms. **0 records outside the 2 s
+tolerance**, and 0 in the earlier 27,413-record window either.
 
 **T047**: `test_stream_monitoring.py` — 136 passed, 8 skipped (the pre-existing
 Postgres self-heal skips, which need a `twitch` role the host does not have).
@@ -426,7 +446,7 @@ and still proves what it was written to prove, but its comment described the
 ### What was NOT measured at 500, stated plainly
 
 **SC-005 is the one criterion still taken at the production operating point**
-(23 broadcasters).
+(21-23 broadcasters).
 The driver deliberately has no Kafka producer and no Flink, so it cannot
 produce a 500-channel late-drop number. Getting one would mean pushing roughly
 25× the current traffic through a parallelism-4 job and letting `ClipCreator`
@@ -437,7 +457,7 @@ What the 414 → 500 gap now looks like:
 
 - T002 measured the delivery-lag distribution at **414** channels and found one
   message in 59,405 past 2 s (0.0017%).
-- T038 measures the resulting late rate at **23** channels: 0.0073%.
+- T038 measures the resulting late rate at **21-23** channels: 0.0041%.
 - T044 confirms the transport itself is stable at **500** for 31 minutes, with
   the sockets carrying 181,180 real messages — so the 500-channel claim that is
   missing is narrowly about *Flink's* residual drop rate, not about whether the
@@ -445,7 +465,7 @@ What the 414 → 500 gap now looks like:
 
 The lag tail did not grow between the 394-channel spike (p50 154 / p95 220 ms)
 and 414 channels (p50 163 / p95 217 ms), and the 24-channel production figure
-(p50 168 / p95 235 ms) sits on the same line. Nothing in three measurements at
+(p50 165 / p95 232 ms) sits on the same line. Nothing in three measurements at
 three scales suggests the tail grows with channel count. **That is an argument,
 not a measurement, and it is recorded here as one.**
 
@@ -583,10 +603,10 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
   with per-second timers and no window operator, so nothing ever drops a late
   record. The equivalent quantity — records arriving after their own bucket's
   timer fired — was measured directly on the live topic instead:
-  **0.0073% past 2 s over 27,413 records**, against the 0.1% budget. The same
-  measurement puts the *previous* 1 s value at 0.620% — six times over budget —
-  so the move to 2 s was necessary for SC-005, not merely prudent. The channel
-  count is 23, not 500; the 500-channel part of the claim is carried by T044's
+  **0.0041% past 2 s — 2 records in 48,915 across two windows** — against the
+  0.1% budget. The same measurement puts the *previous* 1 s value at 0.60%,
+  six times over budget, in both windows, so the move to 2 s was necessary for
+  SC-005, not merely prudent. The channel count is 21–23, not 500; the 500-channel part of the claim is carried by T044's
   transport measurement and is argued, not measured. See Phase 4 T038 and the
   honesty note at the end of Phase 5.
 

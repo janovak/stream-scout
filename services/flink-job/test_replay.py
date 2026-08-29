@@ -89,11 +89,19 @@ def test_future_buckets_already_in_state_are_excluded_from_evaluate():
     """Regression: a message for second+1..+bound can already be counted by
     the time `second`'s own timer fires (its timer only needs the watermark
     to pass `second`, and the watermark itself needs those later messages to
-    have already arrived and been counted). evaluate() has no upper bound on
-    ts_bucket -- that invariant used to be guaranteed by the caller when
-    now_seconds was real wall-clock time -- so without filtering, those
-    future buckets leak into `second`'s baseline and window and can
-    manufacture a spike that was never really there."""
+    have already arrived and been counted). Those future buckets must not
+    leak into `second`'s baseline and window, or they manufacture a spike
+    that was never really there.
+
+    What this test does NOT do is pin the caller-side filter in
+    `replay._fire` / `AnomalyDetector.on_timer`. Deleting that filter leaves
+    this test green, because `evaluate()` bounds the window itself with
+    `elif ts_bucket <= second` and ignores a future bucket anyway. The bound
+    inside `evaluate()` is what actually protects this, and it has its own
+    guard in `test_spike_detector.py::TestFutureBuckets`, which does fail if
+    that branch is widened. This test pins the end-to-end behaviour through
+    the replay harness; it is not the filter's regression test, and removing
+    the filter on the strength of it passing would be a mistake."""
     replayer = EventTimeReplayer(CONFIG)  # window=5, baseline=10
 
     # Baseline deep enough to clear the warm-up gate (0.8 x 10 = 8 buckets),
