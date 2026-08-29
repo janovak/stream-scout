@@ -720,17 +720,22 @@ class AnomalyDetector(KeyedProcessFunction):
             # adds these counts and cannot accept one.
             all_counts = {ts: c for ts, c in self.message_counts.items() if c is not None}
 
-            # A message for second now_seconds+1..+5 can already be in
-            # MapState by the time now_seconds's timer fires -- its own timer
+            # A message for a second after now_seconds -- up to
+            # now_seconds + WATERMARK_OUT_OF_ORDERNESS_SECONDS -- can already be
+            # in MapState by the time now_seconds's timer fires. Its own timer
             # only requires the watermark to pass now_seconds, but the
             # watermark itself only advances that far once messages up to
             # ~now_seconds + WATERMARK_OUT_OF_ORDERNESS_SECONDS have already
-            # arrived and been counted in process_element. evaluate() has no
-            # upper bound on ts_bucket (that invariant used to be guaranteed
-            # by the caller, back when now_seconds was real wall-clock time
-            # and no bucket could exceed it) so without this filter, future
-            # buckets already sitting in state would leak into "now_seconds"'s
-            # baseline/window.
+            # arrived and been counted in process_element.
+            #
+            # This filter is defensive, not load-bearing: evaluate() bounds the
+            # window with `elif ts_bucket <= second`, so a future bucket falls
+            # through every branch and is ignored there too, and its docstring
+            # says so. Removing this line does not change any output today.
+            # It stays because evaluate()'s docstring also states the opposite
+            # direction of the contract -- "the caller must not supply buckets
+            # newer than `second`" -- and this is the caller holding up its
+            # end. Keep both, or change both together.
             counts_as_of_now = {ts: c for ts, c in all_counts.items() if ts <= now_seconds}
             hold = HoldState.from_json(self.hold.value())
             decision = evaluate(

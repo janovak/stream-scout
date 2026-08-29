@@ -57,17 +57,46 @@ from typing import List, Mapping, Optional, Tuple
 # simulated watermark share this value. The two must compute event-time
 # readiness in the same way.
 #
-# Was 5 from Phase 2 through 2026-08-27 -- a generic round-number default set
-# when event-time processing was introduced, not derived from a measurement.
-# KNOWN_ISSUES.md Issue 4 later measured real out-of-orderness on the live
-# `chat-messages` topic directly (per-partition, in offset order): worst
-# observed inversion 226ms, zero records more than 1s out of order across the
-# investigation's full sample. 1s keeps roughly 4x that margin. This trims the
-# deliberate floor of the peak-to-clip-request delay (KNOWN_ISSUES.md Issue 4,
-# "Post-deploy validation") by the same 4 seconds it removes here -- it does
-# not touch the separate, larger, still-open sparse-partition/idleness
-# component of that delay.
-WATERMARK_OUT_OF_ORDERNESS_SECONDS = 1
+# History. The value was 5 from Phase 2 through 2026-08-27. That was a round
+# number with no measurement behind it. It became 1 on 2026-08-27, while chat
+# arrived over IRC: KNOWN_ISSUES.md Issue 4 measured the live `chat-messages`
+# topic per partition, in offset order, and found a worst inversion of 226ms
+# and no record more than 1s out of order.
+#
+# The value is 2 from 2026-08-29. The transport changed. This is not a
+# correction of the IRC number. Chat now arrives over EventSub (spec 004), and
+# EventSub delivery lag is a different quantity from IRC inversion depth. It is
+# the time between Twitch writing `metadata.message_timestamp` and this
+# pipeline receiving the record. Spec 004 Phase 0 T002 measured that lag over
+# 59,405 messages at 414 channels: p50 163ms, p95 217ms, p99 257ms,
+# p99.9 415ms, p99.99 1,255ms. The tail did not grow against the 394-channel
+# spike (154 / 220). One message went past 2s. That is 0.0017%.
+#
+# T002 measures delivery lag, which is not quite the quantity that matters. A
+# record is late when its own second's timer has already fired, and that timer
+# fires when the watermark passes the START of the second. So a record is late
+# once `delivery_lag + (sent_at % 1000) > this constant`. The offset inside the
+# second counts, and T002 does not include it.
+#
+# T038 measured the thing itself, on the live topic under this value: 2
+# records in 66,154, across three 600s windows, arrived after their own
+# bucket's timer had fired. That is 0.0030% against an SC-005 budget of 0.1%,
+# so 2s holds with roughly 33x of headroom. Worst inversion 998-1,041ms.
+#
+# Do not go back to 1s. The same samples put a 1s bound at 0.20-0.62% -- two
+# to six times over the SC-005 budget, in every one of the three windows. 1s
+# survived on IRC because IRC inversions topped out at 226ms; it does not
+# survive EventSub's delivery lag plus the sub-second offset. This is the
+# measurement that justifies the value, and it is a stronger reason than the
+# margin argument D4 was written on.
+#
+# The cost is 1 second. It adds that second to the deliberate floor of the
+# peak-to-clip-request delay (KNOWN_ISSUES.md Issue 4, "Post-deploy
+# validation"). It does not change the separate, larger sparse-partition and
+# idleness component of that delay.
+#
+# See specs/004-eventsub-parallel-reconciler/research.md D4.
+WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2
 
 # KNOWN_ISSUES.md Issue 4: how long a source split can go silent before
 # with_idleness() lets the operator watermark advance past it. Through
@@ -80,9 +109,49 @@ WATERMARK_OUT_OF_ORDERNESS_SECONDS = 1
 # creates chat-messages at 4 partitions, matching parallelism), but this
 # timeout stays: a single broadcaster's own partition can still go quiet on
 # its own, independent of partition count, and this is what recovers the
-# watermark when it does. Measured real out-of-orderness on the live topic
-# tops out at 226ms, so this only needs to be comfortably above that, not
-# anywhere near the 60s it used to be. Not shared with tools/replay.py: that
+# watermark when it does.
+#
+# What bounds this value is NOT out-of-orderness, despite what this comment
+# used to say. This timeout decides how long a LIVE split may be silent before
+# Flink stops waiting for it. Too low and a still-active split is marked idle:
+# the operator watermark then runs ahead of it, and its next records arrive
+# late. Too high and one quiet split freezes the clock for everyone, which is
+# the 60s bug this issue was opened for.
+#
+# A SPLIT IS A PARTITION, NOT A BROADCASTER. with_idleness() acts per source
+# split. chat-messages has 4 partitions and the producer keys on
+# broadcaster_id, so each partition carries several broadcasters -- about 5 at
+# the current 20-channel operating point. A split therefore goes idle only
+# when EVERY broadcaster hashed to it has been silent for the full timeout at
+# once. That is a much shorter gap than any single broadcaster's, and it gets
+# shorter as the monitored set grows.
+#
+# Do not size this off one broadcaster's inter-message gaps. Those run to tens
+# of seconds in quiet chat, and reasoning from them argues for raising this
+# back toward 30-60s -- which is precisely the watermark freeze that cutting
+# it to 10 fixed. The quantity that bounds it is the silence gap of a whole
+# partition, over the union of the broadcasters on it.
+#
+# The 226ms IRC out-of-orderness figure this comment used to cite is the wrong
+# input as well, and it is also stale: spec 004 measured worst inversions
+# above 1s on EventSub (research.md, Phase 4 T038).
+#
+# UNMEASURED, and deliberately left so (spec 004, 2026-08-29). Removing the
+# wrong justification did not supply a right one: 10 is inherited from the
+# KNOWN_ISSUES Issue 4 fix, where the only requirement was "far below 60".
+# Nobody has measured the per-partition silence gap. It is left at 10 because
+# it is working -- 5+ hours on the deployed job with zero `hold_regressed`
+# events -- and because raising it is the direction that reopens Issue 4.
+#
+# This is a real hole in SC-005's guarantee, not a cosmetic one: a split
+# marked idle leaves the watermark minimum, so the operator watermark can run
+# AHEAD of that split, and records arriving after that are late in a way the
+# 0.0041% figure does not bound (research.md, Phase 4 T038, the idleness
+# exception). Whoever picks that up: measure per-partition gaps, not
+# per-broadcaster ones, and remember the answer depends on partition count and
+# on how many channels are monitored.
+#
+# Not shared with tools/replay.py: that
 # harness fires timers off a min-heap in strictly non-decreasing order and
 # has no split-idleness concept to model.
 WATERMARK_IDLENESS_SECONDS = 10
