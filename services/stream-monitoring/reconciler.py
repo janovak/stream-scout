@@ -558,6 +558,13 @@ class Reconciler:
         self._desired_ids: Set[int] = set()
         self._pass_generation = -1
         self._wake = asyncio.Event()
+        # A SEPARATE event from `_wake`, deliberately. They mean different
+        # things -- "the poller wrote a new set" and "a socket died" -- and
+        # sharing one made each fix for the other break something: clearing it
+        # in the mid-pass refresh swallowed a socket loss, and re-setting it
+        # there left it set for the rest of the pass, so every remaining
+        # channel re-read Redis. Two events, no interaction.
+        self._invalidated = asyncio.Event()
         self._refresh_lock = asyncio.Lock()
         # Channels whose refusal has gone stale and that this pass is giving
         # one more try. A create that succeeds for one of these clears the
@@ -585,7 +592,7 @@ class Reconciler:
         """
         self._adoption_complete = False
         self._invalidations += 1
-        self._wake.set()
+        self._invalidated.set()
 
     def notify_desired_changed(self):
         """Tell the loop that the poller wrote a new desired set.
@@ -609,7 +616,21 @@ class Reconciler:
         )
         try:
             while self.running:
-                await self.reconcile_once()
+                try:
+                    await self.reconcile_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # `reconcile_once` guards the paths it expects to fail, so
+                    # reaching here means something unforeseen. Ending the task
+                    # would be silent: `self._reconciler_task` holds a live
+                    # reference, so asyncio's "Task exception was never
+                    # retrieved" handler never runs and no traceback is ever
+                    # printed. The service would go on polling and writing
+                    # `chat:desired` while no subscription was created or
+                    # dropped again, with a frozen
+                    # `reconcile_last_success_timestamp` as the only symptom.
+                    logger.exception("Reconcile pass raised, continuing")
                 await self._wait_for_work()
         except asyncio.CancelledError:
             logger.info("Reconciler cancelled")
@@ -698,12 +719,21 @@ class Reconciler:
 
     async def _wait_for_work(self):
         """Wait for a generation bump, or for the idle timeout."""
+        waiters = [
+            asyncio.ensure_future(self._wake.wait()),
+            asyncio.ensure_future(self._invalidated.wait()),
+        ]
         try:
-            await asyncio.wait_for(self._wake.wait(), timeout=self.config.idle_timeout_seconds)
-        except asyncio.TimeoutError:
-            pass
+            await asyncio.wait(
+                waiters,
+                timeout=self.config.idle_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         finally:
+            for waiter in waiters:
+                waiter.cancel()
             self._wake.clear()
+            self._invalidated.clear()
 
     def _readopt_due(self) -> bool:
         """True when the in-memory actual set is due a check against Twitch."""
@@ -769,6 +799,12 @@ class Reconciler:
         # re-enumerates until some later, unrelated loss. Count invalidations
         # and re-check at the end.
         invalidations_before = self._invalidations
+        # Stamped for every attempt, not only a clean one. `_readopt_due()`
+        # compares against this, and leaving it alone on the failure path kept
+        # it true for ever: a periodic re-adopt that failed part way turned the
+        # 300 s re-check into a full multi-page Helix enumeration on every
+        # pass -- roughly 12 a minute, on the token the clip job shares.
+        self._last_adopt = time.monotonic()
         adopted: Dict[int, str] = {}
         skipped_status = 0
         complete = True
@@ -792,7 +828,6 @@ class Reconciler:
         if complete and not invalidated_during:
             self._actual = adopted
             self._adoption_complete = True
-            self._last_adopt = time.monotonic()
         elif complete:
             # A connection was lost while this enumeration ran. What it saw is
             # still the freshest view available, so keep it -- but leave the
@@ -809,6 +844,12 @@ class Reconciler:
             merged = dict(self._actual)
             merged.update(adopted)
             self._actual = merged
+            # And the view has holes again, so drops go back off until a clean
+            # walk succeeds (NFR-003). Before the periodic re-adopt existed
+            # this was implicit -- `_adopt` only ran while the flag was already
+            # False -- and the periodic path broke that implication by reaching
+            # here with it True.
+            self._adoption_complete = False
 
         logger.info(
             "Adopted existing subscriptions",
@@ -993,15 +1034,13 @@ class Reconciler:
                 # Keep the view we have. The next pass corrects it.
                 logger.warning("Mid-pass desired refresh failed", extra={"error": str(e)})
                 return
+            # Only the desired-set signal. A socket loss has its own event, so
+            # clearing this one cannot swallow it and there is nothing to put
+            # back -- which matters because this runs once per channel, and
+            # re-setting the event here left it set for the rest of the pass,
+            # turning "read Redis once per generation" into three synchronous
+            # round trips per channel.
             self._wake.clear()
-            if not self._adoption_complete:
-                # `_wake` carries two different signals. An
-                # `invalidate_actual_set()` that landed while this pass was
-                # running set it too, and clearing it here would swallow the
-                # wake-up, leaving recovery from a dead socket to wait out the
-                # whole idle timeout. The re-enumeration itself is safe -- it
-                # rides on `_adoption_complete` -- but the urgency is not.
-                self._wake.set()
             self._desired_ids = set(desired.broadcaster_ids())
             logger.info(
                 "Picked up a new desired set mid-pass",

@@ -83,7 +83,7 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_|reconcile_|subscrip
 | Metric | Read it as |
 |---|---|
 | `eventsub_subscription_count` | Live subscriptions held. Should equal the wanted set — compare against `ZCARD chat:desired`. A steady small gap is normally one channel refusing authorization; check the logs for `subscription missing proper authorization` |
-| `reconcile_last_success_timestamp` | Unix time of the last pass that **ran to completion**. **This is the stalled-reconciler alarm.** If it stops advancing while polls keep succeeding, the reconciler is stuck and the subscription set is frozen — the poller cannot tell you this, because it still works. Note it is not "a pass with no failures": at 500 channels one broadcaster refuses every pass, so gating on that would freeze the gauge and destroy the signal. Per-channel failures are `subscription_create_failures_total` |
+| `reconcile_last_success_timestamp` | Unix time of the last pass that **ran to completion**. **This is the stalled-reconciler alarm.** If it stops advancing while polls keep succeeding, the reconciler is stuck and the subscription set is frozen — the poller cannot tell you this, because it still works. Two things it does **not** mean: it is not "a pass with no failures" (at 500 channels one broadcaster refuses every pass, so gating on that would freeze the gauge and destroy the signal — per-channel failures are `subscription_create_failures_total`); and **a gap of a few minutes during a cold start is normal, not a stall**. A pass that hits 429s backs off and retries inside the pass, up to `RECONCILE_MAX_RETRY_ROUNDS` × `RECONCILE_RATE_LIMIT_BACKOFF_SECONDS` ≈ 200 s at the defaults, and the stamp only lands when the pass ends. Before restarting anything, check `reconcile_duration_seconds` and whether the subscription count is still climbing |
 | `reconcile_duration_seconds` | Histogram of pass duration. A converged pass is milliseconds. Buckets run to 120 s because a cold start to 500 channels takes ~51 s |
 | `subscription_create_failures_total` | Counter, labelled by `reason`. **No series at all is the healthy state**, not a broken exporter: this client registers a labelled series on its first increment |
 | `eventsub_connection_occupancy` | Subscriptions per connection, labelled by connection id. None should exceed 300 |
@@ -408,8 +408,11 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_subscription_count|r
    The service deliberately does **not** persist refusals while that scope is
    missing, so a token mistake cannot mark the whole monitored set as refused
    for seven days. Nothing needs undoing in the database afterwards.
-2. **`reconcile_last_success_timestamp` is not advancing.** The reconciler is
-   stalled while the poller keeps working. Restart the container.
+2. **`reconcile_last_success_timestamp` is not advancing.** Check whether this
+   is a cold start first: a pass that is backing off 429s can legitimately run
+   for about 200 s at the default settings, and the subscription count will be
+   climbing throughout. Restart the container only if the count is flat and
+   `reconcile_duration_seconds` shows no pass completing.
 3. **The count is right but Kafka is empty.** The subscriptions exist and are
    silent, so the problem is downstream — check the Kafka producer logs and
    `kafka_messages_produced`.

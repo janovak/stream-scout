@@ -1303,6 +1303,40 @@ class TestReconcilerAdoption:
             "the re-enumeration did not notice the subscription had gone"
         )
 
+    def test_a_failed_re_enumeration_does_not_become_a_hot_loop(self):
+        """`_readopt_due()` compares against `_last_adopt`, which used to be
+        stamped only on a clean walk. A periodic re-adopt that failed part way
+        therefore left it true for ever, turning the 300 s re-check into a full
+        multi-page Helix enumeration on every 5 s pass -- on the same user
+        token the clip job shares."""
+        fake_redis = FakeRedis()
+        # Wanted, so the first pass keeps them and there is something to
+        # enumerate when the re-check comes due.
+        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3), ("d", 4)])
+        transport = StubTransport()
+        for broadcaster_id in (1, 2, 3, 4):
+            asyncio.run(transport.create(broadcaster_id))
+        reconciler = make_reconciler(transport, fake_redis, readopt_interval_seconds=3600)
+        asyncio.run(reconciler.reconcile_once())
+        assert reconciler._adoption_complete is True
+
+        # The periodic re-check comes due and fails part way through.
+        reconciler._last_adopt = float("-inf")
+        transport.list_fails_after = 2
+        asyncio.run(reconciler.reconcile_once())
+
+        # The view has holes, so it retries next pass -- that is by design.
+        # What it must NOT do is stay due for ever once it recovers.
+        assert reconciler._adoption_complete is False, (
+            "a partial walk left drops enabled on an incomplete view"
+        )
+        transport.list_fails_after = None
+        asyncio.run(reconciler.reconcile_once())
+        assert reconciler._adoption_complete is True
+        assert reconciler._readopt_due() is False, (
+            "the re-adopt stayed due, so every pass will re-enumerate Twitch"
+        )
+
     def test_partial_enumeration_never_deletes(self):
         """The dangerous move is deleting on an incomplete picture: an unseen
         subscription is not an unwanted one."""
@@ -1527,10 +1561,11 @@ class TestReconcilerMetrics:
         assert reconciler_module.reconcile_last_success_timestamp._value.get() == stalled_at
 
     def test_a_mid_pass_refresh_does_not_swallow_an_invalidation(self):
-        """`_wake` carries two signals: "the poller wrote a new set" and "a
-        socket died". The mid-pass refresh cleared it for the first, which
-        threw away the second -- so recovery from a dead socket waited out the
-        whole idle timeout instead of running at once."""
+        """The two signals -- "the poller wrote a new set" and "a socket died"
+        -- have their own events. Sharing one meant each fix for the other
+        broke something: clearing it in the refresh swallowed the socket loss,
+        and re-setting it there left it set for the rest of the pass, so every
+        remaining channel re-read Redis three times over."""
         fake_redis = FakeRedis()
         seed_desired(fake_redis, [("a", 1)])
         reconciler = make_reconciler(StubTransport(), fake_redis)
@@ -1540,8 +1575,17 @@ class TestReconcilerMetrics:
             reconciler.notify_desired_changed()
             reconciler.invalidate_actual_set()
             await reconciler._maybe_refresh_desired()
-            assert reconciler._wake.is_set(), (
+
+            assert reconciler._invalidated.is_set(), (
                 "the desired-set refresh consumed the socket-loss wake-up"
+            )
+            # And the desired-set signal really is consumed, so the rest of the
+            # pass does not re-read Redis per channel.
+            assert not reconciler._wake.is_set()
+            calls = len(fake_redis.calls)
+            await reconciler._maybe_refresh_desired()
+            assert len(fake_redis.calls) == calls, (
+                "the refresh ran again for the next channel"
             )
 
         asyncio.run(run())
@@ -2604,8 +2648,14 @@ class TestPoolRaces:
             with pytest.raises(TransportError):
                 await pool.create(7)
 
-            # The lock is free, so the pool still works once connects recover.
+            # A failed connect blocks growth briefly, so the rest of the batch
+            # fails fast instead of each channel waiting out its own timeout.
             pool._connection_factory = FakeWebsocket
+            with pytest.raises(TransportError):
+                await pool.create(8)
+
+            # The lock is free, so the pool still works once that window ends.
+            pool._growth_blocked_until = 0.0
             assert await pool.create(7)
             assert pool.occupancy() == {"0": 1}
 
@@ -2775,6 +2825,34 @@ class TestDegradedWithoutUserAuth:
             assert service.reconciler is None
             # The poll job still runs and still writes the desired set.
             assert service.scheduler.get_job("poll_streams") is not None
+
+        asyncio.run(run())
+
+    def test_an_unexpected_error_does_not_kill_the_reconciler_in_silence(self):
+        """`run()` caught only CancelledError, so anything else ended the task.
+        Because `_reconciler_task` keeps a live reference, asyncio's
+        "Task exception was never retrieved" handler never fires either -- no
+        traceback anywhere. The service would go on polling while no
+        subscription was ever created or dropped again."""
+
+        async def run():
+            fake_redis = FakeRedis()
+            seed_desired(fake_redis, [("a", 1)])
+            reconciler = make_reconciler(StubTransport(), fake_redis)
+
+            passes = []
+
+            async def exploding_pass():
+                passes.append(1)
+                if len(passes) == 1:
+                    raise RuntimeError("something unforeseen")
+                if len(passes) >= 3:
+                    reconciler.stop()
+
+            reconciler.reconcile_once = exploding_pass
+            await asyncio.wait_for(reconciler.run(), timeout=2)
+
+            assert len(passes) >= 3, "the loop died on the first exception"
 
         asyncio.run(run())
 

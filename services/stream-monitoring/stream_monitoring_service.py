@@ -52,6 +52,10 @@ TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
 PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "9100"))
 HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", "8080"))
+# How long shutdown lets an in-flight reconcile pass finish before cancelling
+# it. Long enough for a create or delete already in flight to land; far short
+# of a full ramp, which shutdown has no reason to wait for.
+RECONCILER_STOP_TIMEOUT_SECONDS = float(os.getenv("RECONCILER_STOP_TIMEOUT_SECONDS", "5"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # Token-file scope strings -> pyTwitchAPI enums. One place, so adding a scope
@@ -494,11 +498,32 @@ class StreamMonitoringService:
             self.scheduler.shutdown(wait=True)
 
         # Stop the reconciler before Redis closes underneath it. Ask first,
-        # then cancel, so a pass that is already running can finish its
-        # current operation instead of leaving a half-made subscription.
+        # then cancel, so a pass that is already running can finish its current
+        # operation instead of leaving a half-made subscription.
+        #
+        # The wait is what makes "ask first" real. `stop()` only sets a flag
+        # and wakes the loop; cancelling in the next statement never let the
+        # task run, so the cancellation landed at whatever await the pass was
+        # sitting on -- including between `transport.create()` returning and
+        # `_actual[bid]` being assigned, which is exactly the half-made
+        # subscription this ordering claims to avoid.
         if self.reconciler is not None:
             self.reconciler.stop()
         if self._reconciler_task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._reconciler_task),
+                    timeout=RECONCILER_STOP_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Reconciler did not stop in time, cancelling",
+                    extra={"timeout_seconds": RECONCILER_STOP_TIMEOUT_SECONDS},
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning("Reconciler stopped with an error", extra={"error": str(e)})
             self._reconciler_task.cancel()
             try:
                 await self._reconciler_task

@@ -292,6 +292,9 @@ class EventSubPoolTransport(SubscriptionTransport):
         self.on_subscriptions_lost = on_subscriptions_lost
         self.supervise_interval_seconds = supervise_interval_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
+        # Monotonic deadline after a failed `_grow`, so the rest of a batch
+        # fails fast instead of each channel waiting out its own connect.
+        self._growth_blocked_until = 0.0
 
         self._connections: List[_Connection] = []
         self._next_connection_id = 0
@@ -582,7 +585,25 @@ class EventSubPoolTransport(SubscriptionTransport):
         async with self._lock:
             connection = self.route(broadcaster_id)
             if connection is None:
-                connection = await self._grow()
+                # Growth runs under the lock, and a connect can take up to
+                # `connect_timeout_seconds` to give up. Without the guard below
+                # every remaining channel in the batch queued behind its own
+                # 30 s attempt, one after another: 200 channels waiting on a
+                # hung Twitch handshake froze the reconciler for about an hour,
+                # with `reconcile_last_success_timestamp` stopped throughout.
+                # One failure now fails the rest of the batch fast, and the
+                # next pass tries again.
+                if time.monotonic() < self._growth_blocked_until:
+                    raise TransportError(
+                        "pool growth failed recently, not retrying this pass"
+                    )
+                try:
+                    connection = await self._grow()
+                except Exception:
+                    self._growth_blocked_until = (
+                        time.monotonic() + self.connect_timeout_seconds
+                    )
+                    raise
             connection.reserved += 1
             return connection
 
