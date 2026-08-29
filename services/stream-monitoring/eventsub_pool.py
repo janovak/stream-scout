@@ -591,8 +591,18 @@ class EventSubPoolTransport(SubscriptionTransport):
             # it: one failed connect would freeze the reconciler for good.
             # Setting the flag releases the busy-wait so the worker thread
             # ends instead of spinning.
+            #
+            # That alone is not enough. `_keep_loop_alive()` runs on the
+            # socket's OWN loop and spins on `while not self._closing`, and
+            # only `_stop()` ever sets `_closing`. Without the teardown below
+            # every timed-out connect left a thread spinning at 10 Hz for the
+            # life of the process, holding an open `ClientSession` and its file
+            # descriptors -- and invisibly, because the connection is never
+            # appended to `self._connections`, so `reap_dead_connections()`
+            # could not see it either.
             websocket._startup_complete = True
             websocket._running = False
+            self._tear_down_socket(websocket)
             raise TransportError(
                 f"EventSub connection did not come up within "
                 f"{self.connect_timeout_seconds}s"
@@ -657,11 +667,38 @@ class EventSubPoolTransport(SubscriptionTransport):
     def _forget_revoked(self, subscription_id: str, status: Optional[str]):
         slot = self._by_subscription.pop(subscription_id, None)
         if slot is None:
+            # An id this pool does not recognise is NOT an id that is not ours.
+            # A reconnect makes the library re-create every subscription on the
+            # socket with new ids (`_resubscribe`), and the pool keeps the ids
+            # it recorded at create time -- `delete()` resolves the live id
+            # lazily for exactly that reason. So a revocation that arrives
+            # after a reconnect names an id `_by_subscription` has never seen.
+            # Returning here dropped the loss on the floor: nothing discarded
+            # the channel, nothing invalidated the reconciler, and every count
+            # went on reporting it as covered while no socket delivered for it.
+            slot = self._slot_for_rotated_id(subscription_id)
+        if slot is None:
+            logger.error(
+                "Subscription revoked by Twitch, but the channel could not be "
+                "identified -- invalidating so the next pass re-enumerates",
+                extra={"subscription_id": subscription_id, "status": status},
+            )
+            # The channel is unknown, so the only safe move is to make the
+            # reconciler rebuild its view from Twitch.
+            if self.on_subscriptions_lost is not None:
+                self.on_subscriptions_lost(1)
             return
         self._slots.pop(slot.broadcaster_id, None)
+        # Both ids. When the slot came back from the rotated-id lookup, the one
+        # Twitch revoked is NOT the one occupancy was counted under, so
+        # discarding only the revoked id would leave the channel in the count
+        # for ever -- the same dark-but-counted state this method exists to
+        # prevent.
+        self._by_subscription.pop(slot.subscription_id, None)
         connection = self._connection_by_id(slot.connection_id)
         if connection is not None:
             connection.subscription_ids.discard(subscription_id)
+            connection.subscription_ids.discard(slot.subscription_id)
         logger.warning(
             "Subscription revoked by Twitch",
             extra={
@@ -790,6 +827,61 @@ class EventSubPoolTransport(SubscriptionTransport):
         except TwitchAPIException as e:
             raise TransportError(f"could not delete {subscription_id}: {e}") from e
 
+    @staticmethod
+    def _tear_down_socket(websocket) -> None:
+        """Close one library socket without blocking this service's loop.
+
+        `EventSubWebsocket.stop()` blocks on a future the socket's own loop has
+        to complete, so calling it on a session that has already failed -- or
+        never came up -- can hang the service. `_stop()` is the coroutine that
+        actually closes the aiohttp session and the websocket, so it is
+        scheduled on the socket's loop and not awaited.
+
+        `_closing` is set in a `finally`, because it is what `_keep_loop_alive`
+        spins on: a teardown that raised on the way would otherwise leave that
+        thread looping at 10 Hz for the life of the process. `_stop()` itself
+        raises when the connection is already None, which is exactly that case.
+        """
+        try:
+            socket_loop = getattr(websocket, "_socket_loop", None)
+            if socket_loop is not None and socket_loop.is_running():
+                async def teardown():
+                    try:
+                        await websocket._stop()
+                    except Exception:
+                        pass
+                    finally:
+                        websocket._closing = True
+
+                asyncio.run_coroutine_threadsafe(teardown(), socket_loop)
+            else:
+                websocket._closing = True
+        except Exception as e:  # pragma: no cover -- a test double without them
+            logger.debug("Could not tear down a socket", extra={"error": str(e)})
+
+    def _slot_for_rotated_id(self, subscription_id: str) -> Optional[_Slot]:
+        """Find the slot behind an id the pool has not recorded.
+
+        A reconnect rotates every id on a socket, and the library's own
+        registry -- keyed BY subscription id -- is the only place the new id
+        appears. Map it back to a broadcaster there, then return whatever slot
+        the pool still holds for that channel under its older id. Same lookup
+        `_forget_unrecognised` makes on the delete path.
+        """
+        for connection in list(self._connections):
+            active = getattr(connection.websocket, "_active_subscriptions", None)
+            if not isinstance(active, dict) or subscription_id not in active:
+                continue
+            condition = (active[subscription_id].get("condition") or {})
+            broadcaster = condition.get("broadcaster_user_id")
+            if broadcaster is None:
+                return None
+            try:
+                return self._slots.get(int(broadcaster))
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def _forget_slot(self, slot: _Slot):
         """Drop one slot from both indexes."""
         self._slots.pop(slot.broadcaster_id, None)
@@ -899,6 +991,12 @@ class EventSubPoolTransport(SubscriptionTransport):
         if not dead:
             return 0
 
+        # Computed once, before any retire: `_retire` removes from
+        # `self._connections`, so evaluating this inside the loop counted the
+        # survivors down by one on every iteration and printed a different
+        # number on each line of the same event.
+        remaining = len(self._connections) - len(dead)
+
         lost = 0
         for connection in dead:
             lost += connection.occupancy
@@ -907,7 +1005,7 @@ class EventSubPoolTransport(SubscriptionTransport):
                 extra={
                     "connection": connection.connection_id,
                     "subscriptions": connection.occupancy,
-                    "remaining_connections": len(self._connections) - len(dead),
+                    "remaining_connections": remaining,
                 },
             )
             self._retire(connection)
@@ -955,23 +1053,8 @@ class EventSubPoolTransport(SubscriptionTransport):
         forever on a thread that can no longer do anything.
         """
         websocket = connection.websocket
-        try:
-            websocket._running = False
-            socket_loop = getattr(websocket, "_socket_loop", None)
-            if socket_loop is not None and socket_loop.is_running():
-                async def teardown():
-                    try:
-                        await websocket._stop()
-                    except Exception:
-                        pass
-                    finally:
-                        websocket._closing = True
-
-                asyncio.run_coroutine_threadsafe(teardown(), socket_loop)
-            else:
-                websocket._closing = True
-        except Exception as e:  # pragma: no cover -- a test double without them
-            logger.debug("Could not tear down a retired connection", extra={"error": str(e)})
+        websocket._running = False
+        self._tear_down_socket(websocket)
 
         self._connections = [
             live for live in self._connections if live.connection_id != connection.connection_id

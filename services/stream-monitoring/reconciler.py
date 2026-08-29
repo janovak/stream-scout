@@ -127,7 +127,7 @@ eventsub_connection_occupancy = Gauge(
 )
 reconcile_last_success_timestamp = Gauge(
     "reconcile_last_success_timestamp",
-    "Unix time of the last reconcile pass that completed without error",
+    "Unix time of the last reconcile pass that ran to completion",
 )
 
 
@@ -147,6 +147,7 @@ def resolve_reconciler_config(env=None):
     idle_timeout = float(env.get("RECONCILE_IDLE_TIMEOUT_SECONDS", "5"))
     backoff = float(env.get("RECONCILE_RATE_LIMIT_BACKOFF_SECONDS", "10"))
     max_rounds = int(env.get("RECONCILE_MAX_RETRY_ROUNDS", "20"))
+    readopt_interval = float(env.get("RECONCILE_READOPT_INTERVAL_SECONDS", "300"))
 
     if concurrency < 1:
         raise ValueError(f"RECONCILE_CONCURRENCY must be >= 1, got {concurrency}")
@@ -156,12 +157,17 @@ def resolve_reconciler_config(env=None):
         raise ValueError(f"RECONCILE_RATE_LIMIT_BACKOFF_SECONDS must be >= 0, got {backoff}")
     if max_rounds < 1:
         raise ValueError(f"RECONCILE_MAX_RETRY_ROUNDS must be >= 1, got {max_rounds}")
+    if readopt_interval <= 0:
+        raise ValueError(
+            f"RECONCILE_READOPT_INTERVAL_SECONDS must be > 0, got {readopt_interval}"
+        )
 
     return ReconcilerConfig(
         concurrency=concurrency,
         idle_timeout_seconds=idle_timeout,
         rate_limit_backoff_seconds=backoff,
         max_retry_rounds=max_rounds,
+        readopt_interval_seconds=readopt_interval,
     )
 
 
@@ -180,6 +186,18 @@ class ReconcilerConfig:
     idle_timeout_seconds: float = 5.0
     rate_limit_backoff_seconds: float = 10.0
     max_retry_rounds: int = 20
+    # How long the in-memory actual set may go without being checked against
+    # Twitch. Adoption used to run once and then never again unless a socket
+    # died or a revocation arrived -- both of which the pool has to observe
+    # first. A subscription lost by any route the pool CANNOT observe was
+    # therefore permanent, and `eventsub_subscription_count` went on reporting
+    # it, so the FR-012 alert could not fire. The known such route is the
+    # library's `_resubscribe()` failing part way through a reconnect: it
+    # swallows the exception and only restores the old map if nothing at all
+    # was re-created, so the channels past the failure point simply do not
+    # exist on Twitch any more. One listing every few minutes is cheap
+    # insurance against that whole class.
+    readopt_interval_seconds: float = 300.0
 
 
 class TransportError(Exception):
@@ -532,6 +550,9 @@ class Reconciler:
         # and after its enumeration so a loss that lands mid-walk is not
         # thrown away by the completion that follows it.
         self._invalidations = 0
+        # When the actual set was last rebuilt from Twitch, for the periodic
+        # re-check. -inf so the first pass always adopts.
+        self._last_adopt = float("-inf")
         # The live desired view. Workers read it, so that a channel which
         # leaves the set part way through a pass is not created (T014).
         self._desired_ids: Set[int] = set()
@@ -604,7 +625,7 @@ class Reconciler:
         """Run one pass: read the intent, diff it, and act on the difference."""
         started = time.monotonic()
         try:
-            if not self._adoption_complete:
+            if not self._adoption_complete or self._readopt_due():
                 await self._adopt()
 
             desired = self._read_desired()
@@ -660,6 +681,13 @@ class Reconciler:
         eventsub_subscription_count.set(len(self._actual))
         self._publish_occupancy()
         reconcile_duration_seconds.observe(time.monotonic() - started)
+        # "Ran to completion", not "had no failures". A pass where individual
+        # creates refused or errored still reached here, and that is on
+        # purpose: at 500 channels one broadcaster refuses on every pass, so a
+        # no-failures gate would hold this gauge still for ever and destroy the
+        # signal it exists for. What it detects is a reconciler that has
+        # stopped completing passes at all, while the poller keeps working.
+        # Per-channel failures are `subscription_create_failures_total`.
         reconcile_last_success_timestamp.set(time.time())
         if self.on_pass_complete is not None:
             self.on_pass_complete(len(self._actual))
@@ -676,6 +704,13 @@ class Reconciler:
             pass
         finally:
             self._wake.clear()
+
+    def _readopt_due(self) -> bool:
+        """True when the in-memory actual set is due a check against Twitch."""
+        return (
+            time.monotonic() - self._last_adopt
+            >= self.config.readopt_interval_seconds
+        )
 
     def _wake_if_generation_moved(self):
         """Run again at once if the poller wrote a new set during this pass."""
@@ -757,6 +792,7 @@ class Reconciler:
         if complete and not invalidated_during:
             self._actual = adopted
             self._adoption_complete = True
+            self._last_adopt = time.monotonic()
         elif complete:
             # A connection was lost while this enumeration ran. What it saw is
             # still the freshest view available, so keep it -- but leave the
@@ -958,6 +994,14 @@ class Reconciler:
                 logger.warning("Mid-pass desired refresh failed", extra={"error": str(e)})
                 return
             self._wake.clear()
+            if not self._adoption_complete:
+                # `_wake` carries two different signals. An
+                # `invalidate_actual_set()` that landed while this pass was
+                # running set it too, and clearing it here would swallow the
+                # wake-up, leaving recovery from a dead socket to wait out the
+                # whole idle timeout. The re-enumeration itself is safe -- it
+                # rides on `_adoption_complete` -- but the urgency is not.
+                self._wake.set()
             self._desired_ids = set(desired.broadcaster_ids())
             logger.info(
                 "Picked up a new desired set mid-pass",

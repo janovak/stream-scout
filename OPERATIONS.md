@@ -61,6 +61,13 @@ container**:
 restarts it, and it converges from whatever state it finds — existing
 subscriptions are adopted, not duplicated.
 
+Every few minutes (`RECONCILE_READOPT_INTERVAL_SECONDS`, default 300) it also
+re-lists the subscriptions from Twitch rather than trusting the set it holds in
+memory. That is the backstop for a subscription lost by a route the pool cannot
+observe — the known one is the library's reconnect re-subscribing part way and
+giving up — where the count would otherwise keep reporting a channel that no
+longer exists.
+
 Subscriptions are spread over a pool of websocket connections, **300 per
 connection** (Twitch's cap). The pool starts empty and opens another connection
 when the ones it has are full, so ~500 channels run on two.
@@ -76,7 +83,7 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_|reconcile_|subscrip
 | Metric | Read it as |
 |---|---|
 | `eventsub_subscription_count` | Live subscriptions held. Should equal the wanted set — compare against `ZCARD chat:desired`. A steady small gap is normally one channel refusing authorization; check the logs for `subscription missing proper authorization` |
-| `reconcile_last_success_timestamp` | Unix time of the last clean pass. **This is the stalled-reconciler alarm.** If it stops advancing while polls keep succeeding, the reconciler is stuck and the subscription set is frozen — the poller cannot tell you this, because it still works |
+| `reconcile_last_success_timestamp` | Unix time of the last pass that **ran to completion**. **This is the stalled-reconciler alarm.** If it stops advancing while polls keep succeeding, the reconciler is stuck and the subscription set is frozen — the poller cannot tell you this, because it still works. Note it is not "a pass with no failures": at 500 channels one broadcaster refuses every pass, so gating on that would freeze the gauge and destroy the signal. Per-channel failures are `subscription_create_failures_total` |
 | `reconcile_duration_seconds` | Histogram of pass duration. A converged pass is milliseconds. Buckets run to 120 s because a cold start to 500 channels takes ~51 s |
 | `subscription_create_failures_total` | Counter, labelled by `reason`. **No series at all is the healthy state**, not a broken exporter: this client registers a labelled series on its first increment |
 | `eventsub_connection_occupancy` | Subscriptions per connection, labelled by connection id. None should exceed 300 |

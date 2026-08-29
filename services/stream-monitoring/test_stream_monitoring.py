@@ -1274,6 +1274,35 @@ class TestReconcilerAdoption:
             "re-enumerate and the lost channels stay recorded as covered"
         )
 
+    def test_the_actual_set_is_re_enumerated_periodically(self):
+        """Adoption used to run once and then never again unless the pool
+        observed a dead socket or a revocation. A subscription lost by any
+        route the pool cannot see -- the library's `_resubscribe()` failing
+        part way through a reconnect is the known one -- was therefore
+        permanent, and `eventsub_subscription_count` went on counting it, so
+        the FR-012 alert could not fire."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis, readopt_interval_seconds=3600)
+        asyncio.run(reconciler.reconcile_once())
+        assert reconciler._adoption_complete is True
+
+        # Twitch loses the subscription behind the pool's back.
+        transport.subscriptions.clear()
+        transport.statuses.clear()
+
+        # Not due yet: the stale view survives, which is the cheap steady state.
+        asyncio.run(reconciler.reconcile_once())
+
+        # Due now.
+        reconciler._last_adopt = float("-inf")
+        asyncio.run(reconciler.reconcile_once())
+        assert 1 in reconciler._actual, "the channel was not re-created"
+        assert transport.create_calls.count(1) == 2, (
+            "the re-enumeration did not notice the subscription had gone"
+        )
+
     def test_partial_enumeration_never_deletes(self):
         """The dangerous move is deleting on an incomplete picture: an unseen
         subscription is not an unwanted one."""
@@ -1496,6 +1525,26 @@ class TestReconcilerMetrics:
         asyncio.run(reconciler.reconcile_once())
 
         assert reconciler_module.reconcile_last_success_timestamp._value.get() == stalled_at
+
+    def test_a_mid_pass_refresh_does_not_swallow_an_invalidation(self):
+        """`_wake` carries two signals: "the poller wrote a new set" and "a
+        socket died". The mid-pass refresh cleared it for the first, which
+        threw away the second -- so recovery from a dead socket waited out the
+        whole idle timeout instead of running at once."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        reconciler = make_reconciler(StubTransport(), fake_redis)
+
+        async def run():
+            # Both signals land while a pass is in flight.
+            reconciler.notify_desired_changed()
+            reconciler.invalidate_actual_set()
+            await reconciler._maybe_refresh_desired()
+            assert reconciler._wake.is_set(), (
+                "the desired-set refresh consumed the socket-loss wake-up"
+            )
+
+        asyncio.run(run())
 
     def test_connection_occupancy_is_published(self):
         fake_redis = FakeRedis()
@@ -2293,7 +2342,44 @@ class TestPoolSocketDeath:
 
         asyncio.run(run())
 
-    def test_an_unknown_revocation_is_ignored(self):
+    def test_a_revocation_on_a_rotated_id_still_finds_the_channel(self):
+        """A reconnect re-creates every subscription on the socket with new
+        ids, and the pool keeps the ones it recorded at create time. So the
+        revocation Twitch sends afterwards names an id `_by_subscription` has
+        never seen. That used to return early and drop the loss on the floor:
+        nothing discarded the channel, nothing invalidated the reconciler, and
+        every count went on reporting a channel no socket delivered for."""
+
+        async def run():
+            lost = []
+            pool = make_pool(on_subscriptions_lost=lost.append)
+            await pool.start()
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+
+            # The reconnect: same channel, brand-new id, pool not told.
+            stale_id = next(iter(websocket._active_subscriptions))
+            entry = websocket._active_subscriptions.pop(stale_id)
+            rotated_id = "rotated-sub-1"
+            websocket._active_subscriptions[rotated_id] = entry
+
+            await pool._on_revocation({
+                "subscription": {"id": rotated_id, "status": "authorization_revoked"}
+            })
+            await asyncio.sleep(0)
+
+            assert lost == [1], "the revocation was dropped, leaving the channel dark"
+            assert 7 not in pool._slots
+            assert pool.occupancy() == {"0": 0}
+
+        asyncio.run(run())
+
+    def test_an_unresolvable_revocation_still_reports_the_loss(self):
+        """Twitch only delivers revocations for subscriptions on this pool's
+        own sessions, so an id nothing can resolve is still a channel this
+        pool has lost track of. Re-enumerating costs one listing; staying
+        quiet costs a permanently dark channel."""
+
         async def run():
             lost = []
             pool = make_pool(on_subscriptions_lost=lost.append)
@@ -2301,8 +2387,7 @@ class TestPoolSocketDeath:
             await pool.create(7)
             await pool._on_revocation({"subscription": {"id": "not-ours"}})
             await asyncio.sleep(0)
-            assert lost == []
-            assert pool.occupancy() == {"0": 1}
+            assert lost == [1]
 
         asyncio.run(run())
 
@@ -2416,6 +2501,43 @@ class TestPoolRaces:
             assert websocket._callbacks == {}
             assert pool._slots == {}
             assert pool.occupancy() == {"0": 0}
+
+        asyncio.run(run())
+
+    def test_a_timed_out_connect_tears_its_socket_down(self):
+        """`_keep_loop_alive()` spins on `while not self._closing`, and only
+        `_stop()` sets that flag. A timed-out connect that only released the
+        startup busy-wait left the socket thread spinning at 10 Hz for the life
+        of the process, holding an open ClientSession -- and invisibly, since
+        the connection is never appended to `_connections` and so
+        `reap_dead_connections()` could never see it."""
+
+        class NeverConnects(FakeWebsocket):
+            def start(self):
+                self._startup_complete = False
+                while not self._startup_complete:
+                    time.sleep(0.01)
+
+        async def run():
+            pool = make_pool(connect_timeout_seconds=0.3)
+            pool._connection_factory = NeverConnects
+            opened = []
+            original = pool._connection_factory
+
+            def factory():
+                websocket = original()
+                opened.append(websocket)
+                return websocket
+
+            pool._connection_factory = factory
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+
+            assert opened, "no socket was built"
+            assert opened[0]._closing is True, (
+                "the abandoned socket's keep-alive loop was left spinning"
+            )
 
         asyncio.run(run())
 
