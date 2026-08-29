@@ -116,8 +116,12 @@ def write_desired(client, channels):
     ids = {login: bid for login, bid in channels}
     pipe = client.pipeline()
     pipe.delete(DESIRED_KEY, DESIRED_IDS_KEY)
-    pipe.zadd(DESIRED_KEY, desired)
-    pipe.hset(DESIRED_IDS_KEY, mapping={login: ids[login] for login in desired})
+    # The `if desired` guard is the real method's, and it matters: ZADD with an
+    # empty mapping raises DataError, so an empty channel list would die
+    # pointing at Redis instead of at channel resolution.
+    if desired:
+        pipe.zadd(DESIRED_KEY, desired)
+        pipe.hset(DESIRED_IDS_KEY, mapping={login: ids[login] for login in desired})
     pipe.incr(DESIRED_GENERATION_KEY)
     pipe.execute()
     return desired
@@ -214,7 +218,7 @@ async def sample_until(harness, target, deadline, marks):
     """Poll the actual set until it stops growing. Returns time-to-mark seconds."""
     t0 = time.monotonic()
     hit = {}
-    last_count, stable_since = -1, None
+    last_count, stable_since, last_growth = -1, None, 0.0
     while time.monotonic() - t0 < deadline:
         failure = harness.reconciler_failure()
         if failure is not None:
@@ -239,8 +243,17 @@ async def sample_until(harness, target, deadline, marks):
                 break
         else:
             last_count, stable_since = count, None
+            last_growth = elapsed
         await asyncio.sleep(0.5)
-    return hit, harness.reconciler.subscription_count, round(time.monotonic() - t0, 2)
+    # Convergence is the moment the count STOPPED growing, not that moment plus
+    # the settle window. Returning the latter inflates SC-001 by
+    # STABLE_SECONDS, and when refusals hold the ramp below `target` the 1.0
+    # mark never lands, so the inflated figure would be the only number
+    # recorded.
+    return (hit,
+            harness.reconciler.subscription_count,
+            round(last_growth, 2),
+            round(time.monotonic() - t0, 2))
 
 
 async def mode_ramp(harness, channels):
@@ -258,10 +271,13 @@ async def mode_ramp(harness, channels):
     await harness.start(config)
     startup = round(time.monotonic() - ramp_start, 2)
     marks = [0.5, 0.9, 0.95, 0.99, 1.0]
-    hit, final, elapsed = await sample_until(harness, len(desired), RAMP_TIMEOUT_SECONDS, marks)
+    hit, final, converged, watched = await sample_until(
+        harness, len(desired), RAMP_TIMEOUT_SECONDS, marks)
     record("T041_cold_start", target=len(desired), reached=final,
-           seconds_to_plateau=round(elapsed + startup, 2),
+           seconds_to_converge=round(converged + startup, 2),
            marks={m: round(s + startup, 2) for m, s in hit.items()},
+           settle_window_seconds=STABLE_SECONDS,
+           seconds_watched=round(watched + startup, 2),
            transport_start_seconds=startup)
 
     # T044: hold it and watch the count against the desired set.
@@ -295,7 +311,8 @@ async def mode_ramp(harness, channels):
         return
     deviations = [abs(c - w) / w * 100 for c, w in samples if w]
     record("T044_sustain", samples=len(samples), minutes=SUSTAIN_MINUTES,
-           subscriptions_min=min(c for c, _ in samples), subscriptions_max=max(c for c, _ in samples),
+           subscriptions_min=min(c for c, _ in samples),
+           subscriptions_max=max(c for c, _ in samples),
            desired=samples[0][1],
            deviation_max_pct=round(max(deviations), 3) if deviations else None,
            deviation_mean_pct=round(statistics.mean(deviations), 3) if deviations else None,
@@ -318,8 +335,8 @@ async def mode_restart(harness, channels):
     write_desired(harness.client, channels)
     config = resolve_reconciler_config()
     await harness.start(config)
-    hit, final, elapsed = await sample_until(harness, len(channels), RAMP_TIMEOUT_SECONDS,
-                                             [0.9, 0.99, 1.0])
+    hit, final, elapsed, _watched = await sample_until(
+        harness, len(channels), RAMP_TIMEOUT_SECONDS, [0.9, 0.99, 1.0])
     # Count through Twitch directly, NOT through transport.list().
     #
     # list() yields only subscriptions on a session this pool holds, by
@@ -408,6 +425,11 @@ def mode_flatness(client, channels):
     write(stub, full, ids)
 
     def commands_processed():
+        # Server-wide, not per-database. Sound here because this is the local
+        # Redis container, which nothing else uses -- production is a separate
+        # instance (REDIS_URL points at the Tailscale host). Any other client
+        # on this server would be attributed to the harness, so check
+        # `INFO clients` before trusting this number elsewhere.
         return client.info("stats")["total_commands_processed"]
 
     def timed(desired, label, repeats=15):
@@ -494,11 +516,19 @@ async def main():
     except asyncio.CancelledError:
         record("cancelled", note="tearing down before exit")
     finally:
-        # Shielded: teardown itself must survive the cancellation that got us
-        # here, or the signal path leaks exactly what it exists to clean up.
-        await asyncio.shield(
-            asyncio.ensure_future(harness.stop(delete_subscriptions=True))
-        )
+        # Teardown must survive the cancellation that got us here, AND a second
+        # one. `await shield(t)` protects the inner task but re-raises in the
+        # awaiter as soon as another cancel arrives -- which would skip
+        # twitch.close() and let asyncio.run() kill the half-finished delete
+        # loop, leaking exactly what this exists to clean up. So absorb the
+        # cancellations and keep waiting on the inner task.
+        teardown = asyncio.ensure_future(harness.stop(delete_subscriptions=True))
+        while True:
+            try:
+                await asyncio.shield(teardown)
+                break
+            except asyncio.CancelledError:
+                record("cancel_during_teardown", note="ignored, teardown continues")
         await twitch.close()
 
 

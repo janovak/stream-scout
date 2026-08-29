@@ -79,16 +79,16 @@ from typing import List, Mapping, Optional, Tuple
 # second counts, and T002 does not include it.
 #
 # T038 measured the thing itself, on the live topic under this value: 2
-# records in 48,915, across two 600s windows, arrived after their own bucket's
-# timer had fired. That is 0.0041% against an SC-005 budget of 0.1%, so 2s
-# holds with roughly 24x of headroom. Worst inversion in the fully-corrected
-# window was 1,041ms over 21,502 records.
+# records in 66,154, across three 600s windows, arrived after their own
+# bucket's timer had fired. That is 0.0030% against an SC-005 budget of 0.1%,
+# so 2s holds with roughly 33x of headroom. Worst inversion 998-1,041ms.
 #
-# Do not go back to 1s. The same samples put a 1s bound at about 0.60% -- more
-# than six times over the SC-005 budget, in both windows. 1s survived on IRC
-# because IRC inversions topped out at 226ms; it does not survive EventSub's
-# delivery lag plus the sub-second offset. This is the measurement that justifies the value, and it
-# is a stronger reason than the margin argument D4 was written on.
+# Do not go back to 1s. The same samples put a 1s bound at 0.20-0.62% -- two
+# to six times over the SC-005 budget, in every one of the three windows. 1s
+# survived on IRC because IRC inversions topped out at 226ms; it does not
+# survive EventSub's delivery lag plus the sub-second offset. This is the
+# measurement that justifies the value, and it is a stronger reason than the
+# margin argument D4 was written on.
 #
 # The cost is 1 second. It adds that second to the deliberate floor of the
 # peak-to-clip-request delay (KNOWN_ISSUES.md Issue 4, "Post-deploy

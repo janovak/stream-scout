@@ -149,7 +149,12 @@ def main():
                 if previous >= bucket_start + bound + 1:
                     late_over[bound] += 1
 
-        if previous is None or sent_at > previous:
+        # `>=`, not `>`. A record whose sent_at EQUALS the running max is not
+        # out of order -- two messages can share a millisecond, which is
+        # routine at this rate. Treating it as an inversion of depth 0 both
+        # inflates `out_of_order_records` and pads the percentiles below with
+        # zeros, which is the dilution the comment there says it avoids.
+        if previous is None or sent_at >= previous:
             running_max[p] = sent_at
         else:
             behind = previous - sent_at
