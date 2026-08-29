@@ -98,6 +98,10 @@ DEFAULT_SUPERVISE_INTERVAL_SECONDS = 15.0
 # takes well under a second. The library's own retry ladder runs to 255 s and
 # it does not fail cleanly at the end of it, so the wait is bounded here.
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 30.0
+# How long `aclose()` lets in-flight socket callbacks land before returning,
+# so the caller's Kafka flush can carry the chat they produced. The library's
+# own `_stop()` sleeps 0.25 s for the same reason.
+SOCKET_DRAIN_SECONDS = 0.25
 
 # `_subscribe` throws away the HTTP status and keeps only Twitch's message, so
 # the kind of failure has to be read back out of the text. Phase 0's throwaway
@@ -268,6 +272,12 @@ class _Slot:
     broadcaster_id: int
     connection_id: int
     subscription_id: str
+    # The websocket session this subscription was made on. A reconnect gives
+    # the connection a NEW session, and everything Twitch held on the old one
+    # is gone -- so a slot whose session no longer matches its connection's is
+    # stale whatever any local registry says. This is the only check that does
+    # not depend on the library telling the truth about what it holds.
+    session_id: Optional[str] = None
 
 
 class EventSubPoolTransport(SubscriptionTransport):
@@ -368,6 +378,14 @@ class EventSubPoolTransport(SubscriptionTransport):
         self._connections = []
         self._slots = {}
         self._by_subscription = {}
+        # `_retire` schedules each socket's teardown on its own loop and does
+        # not await it, so delivery has not actually stopped when this returns.
+        # An event already dispatched runs the message handler -- and its
+        # `producer.produce()` -- after the caller's `flush()` has returned,
+        # and that record dies with the process. Give those callbacks a moment
+        # to land in the producer's queue, so the flush that follows carries
+        # them. Bounded, because shutdown must not hang on a wedged socket.
+        await asyncio.sleep(SOCKET_DRAIN_SECONDS)
 
     # -- SubscriptionTransport --------------------------------------------
 
@@ -387,7 +405,7 @@ class EventSubPoolTransport(SubscriptionTransport):
             # `_actual`, ask for it again, be handed the ghost straight back,
             # and count it as covered for ever. Check the library's registry,
             # which is the only local record of what the socket really holds.
-            if self._connection_holds(existing_connection, broadcaster_id):
+            if self._slot_is_current(existing, existing_connection, broadcaster_id):
                 return existing.subscription_id
             logger.warning(
                 "Recorded subscription is not on its connection any more, recreating",
@@ -457,7 +475,12 @@ class EventSubPoolTransport(SubscriptionTransport):
                     f"connection {connection.connection_id} was lost while subscribing "
                     f"broadcaster {broadcaster_id}"
                 )
-            slot = _Slot(broadcaster_id, connection.connection_id, subscription_id)
+            slot = _Slot(
+                broadcaster_id,
+                connection.connection_id,
+                subscription_id,
+                self._session_id(connection),
+            )
             connection.subscription_ids.add(subscription_id)
             self._slots[broadcaster_id] = slot
             self._by_subscription[subscription_id] = slot
@@ -865,7 +888,12 @@ class EventSubPoolTransport(SubscriptionTransport):
             connection = self._connection_by_session(session_id)
             if connection is None:
                 continue
-            slot = _Slot(broadcaster_id, connection.connection_id, subscription.id)
+            slot = _Slot(
+                broadcaster_id,
+                connection.connection_id,
+                subscription.id,
+                self._session_id(connection),
+            )
             connection.subscription_ids.add(subscription.id)
             self._slots[broadcaster_id] = slot
             self._by_subscription[subscription.id] = slot
@@ -952,12 +980,47 @@ class EventSubPoolTransport(SubscriptionTransport):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _session_id(connection: _Connection) -> Optional[str]:
+        session = getattr(connection.websocket, "active_session", None)
+        return getattr(session, "id", None) if session is not None else None
+
+    def _slot_is_current(
+        self, slot: _Slot, connection: _Connection, broadcaster_id: int
+    ) -> bool:
+        """Is this recorded subscription still real on this connection?
+
+        Two checks, because the registry alone is not trustworthy. The
+        library's `_resubscribe()` empties `_active_subscriptions`, re-creates
+        everything, and on failure restores the OLD map wholesale -- but only
+        `if not self._active_subscriptions`, so a failure on the FIRST
+        re-subscribe puts every pre-reconnect id back while Twitch holds none
+        of them on the new session. The registry then says yes for channels
+        that do not exist, `create()` hands back the ghost id with no Twitch
+        call, and the periodic re-adopt cannot repair it: `list()` yields
+        nothing for them, they land in `to_create`, and `create()` short-
+        circuits to the ghost again. Every FR-012 signal reads healthy while
+        that socket's channels are dark.
+
+        The session check catches it. A reconnect always means a new session,
+        so a slot stamped with the old one is stale no matter what the map
+        says -- and that holds for a partial failure too.
+        """
+        current_session = self._session_id(connection)
+        if (
+            slot.session_id is not None
+            and current_session is not None
+            and slot.session_id != current_session
+        ):
+            return False
+        return self._connection_holds(connection, broadcaster_id)
+
     def _connection_holds(self, connection: _Connection, broadcaster_id: int) -> bool:
         """Does the library still have a subscription for this channel here?
 
-        The registry is private, but it is the only local record of what a
-        socket really holds after a reconnect. A test double without one is
-        taken at its word rather than treated as empty.
+        The registry is private, and after a reconnect it can lie (see
+        `_slot_is_current`), so this is the second of two checks rather than
+        the only one. A test double without one is taken at its word.
         """
         active = getattr(connection.websocket, "_active_subscriptions", None)
         if not isinstance(active, dict):
@@ -994,7 +1057,15 @@ class EventSubPoolTransport(SubscriptionTransport):
             connection.subscription_ids.discard(subscription_id)
             if broadcaster is None:
                 return
-            slot = self._slots.get(int(broadcaster))
+            try:
+                broadcaster_id = int(broadcaster)
+            except (TypeError, ValueError):
+                # The sibling helper already guards this. Raising here would be
+                # worse than useless: the Twitch DELETE above has already
+                # succeeded, so `_drop_one` would never pop `_actual` and the
+                # reconciler would re-issue the same delete every pass for ever.
+                return
+            slot = self._slots.get(broadcaster_id)
             if slot is not None:
                 self._forget_slot(slot)
                 self._forget_library_subscription(connection, slot.subscription_id)

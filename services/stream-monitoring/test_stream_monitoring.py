@@ -759,7 +759,7 @@ def seed_desired(fake_redis, logins_with_ids):
     fake_redis.strings[DESIRED_GENERATION_KEY] = str(previous + 1)
 
 
-def make_reconciler(transport, fake_redis, **config_overrides):
+def make_reconciler(transport, fake_redis, refusal_store=None, **config_overrides):
     """A reconciler with test-speed timings: no real backoff, no idle wait."""
     settings = {
         "concurrency": 10,
@@ -772,6 +772,7 @@ def make_reconciler(transport, fake_redis, **config_overrides):
         transport=transport,
         redis_client=fake_redis,
         config=ReconcilerConfig(**settings),
+        refusal_store=refusal_store,
     )
 
 
@@ -1522,6 +1523,48 @@ class TestReconcilerConcurrencyBound:
         asyncio.run(reconciler.reconcile_once())
 
         assert transport.peak <= 4
+
+
+class TestRefusalStoreFaults:
+    """A failed refusal READ must not read as "nothing is refused"."""
+
+    def test_a_database_fault_reaches_the_caller(self):
+        """Returning {} for a failed read is a wrong answer, not a degraded
+        one, and it silently disabled `_drop_refused`'s own handling -- both
+        its except branch and its "Refusal cache unavailable" log were
+        unreachable for the real store. The symptom was every refused channel
+        being retried every pass, one POST each, with nothing in the log."""
+        pool = MagicMock()
+        pool.getconn.side_effect = RuntimeError("postgres is away")
+        store = reconciler_module.PostgresRefusalStore(pool)
+
+        with pytest.raises(RuntimeError):
+            store.refusals([1, 2, 3])
+
+    def test_a_write_fault_is_still_swallowed(self):
+        """The writes keep their old behaviour: a refusal that fails to record
+        is re-learned next pass, which is harmless."""
+        pool = MagicMock()
+        pool.getconn.side_effect = RuntimeError("postgres is away")
+        store = reconciler_module.PostgresRefusalStore(pool)
+
+        store.mark_refused(1)
+        store.clear_refusal(1)
+
+    def test_the_reconciler_attempts_every_channel_when_the_store_faults(self):
+        """And the caller's handler, now reachable, does the safe thing."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2)])
+        store = MagicMock()
+        store.refusals.side_effect = RuntimeError("postgres is away")
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis, refusal_store=store)
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert sorted(transport.create_calls) == [1, 2], (
+            "a store fault stopped the reconciler subscribing"
+        )
 
 
 class TestReconcilerMetrics:
@@ -2471,6 +2514,36 @@ class TestPoolSocketDeath:
             await pool._on_revocation({"subscription": {"id": "not-ours"}})
             await asyncio.sleep(0)
             assert lost == [1]
+
+        asyncio.run(run())
+
+    def test_a_slot_from_a_previous_session_is_not_trusted(self):
+        """The library's `_resubscribe()` restores the PRE-reconnect map
+        wholesale when the FIRST re-subscribe fails (`if not
+        self._active_subscriptions`). The registry then reports every old id as
+        live while Twitch holds none of them on the new session -- so a
+        registry check alone says yes for channels that do not exist, and the
+        periodic re-adopt cannot repair it because `create()` keeps handing the
+        ghost back. The session the slot was made on is the check that holds."""
+
+        async def run():
+            pool = make_pool()
+            await pool.start()
+            first_id = await pool.create(7)
+            connection = pool._connections[0]
+
+            # The reconnect: new session, and _resubscribe restored the old map
+            # verbatim, so the registry still claims the old id.
+            connection.websocket.active_session = type(
+                "Session", (), {"id": "session-after-reconnect"}
+            )()
+
+            second_id = await pool.create(7)
+
+            assert second_id != first_id, (
+                "create() trusted a registry that survived a reconnect, so the "
+                "channel is dark while every count says it is covered"
+            )
 
         asyncio.run(run())
 

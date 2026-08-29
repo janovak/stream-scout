@@ -429,10 +429,15 @@ class PostgresRefusalStore(RefusalStore):
     read; the two writes happen only on a refusal or on a channel healing,
     which is rare by construction.
 
-    Every method swallows its own errors. A database that is briefly away must
-    not stop the reconciler from subscribing: the worst case of a failed read
-    is that a refused channel is tried once more, and of a failed write that a
-    refusal is re-learned next pass.
+    The WRITES swallow their own errors: a refusal that fails to record is
+    re-learned next pass, which is harmless. The READ does not, and must not.
+    Returning `{}` for a failed read is not a degraded answer, it is a wrong
+    one -- indistinguishable from "no channel is refused" -- and it silently
+    disabled the caller's own handling: `_drop_refused` has an `except` branch
+    and an explicit "Refusal cache unavailable" log for exactly this, and both
+    were unreachable for the real store. The visible cost was every refused
+    channel being retried every pass, one POST each, with nothing in the log
+    to say why.
     """
 
     def __init__(self, db_pool, recheck_days: int = REFUSAL_RECHECK_DAYS):
@@ -444,7 +449,8 @@ class PostgresRefusalStore(RefusalStore):
             return {}
         rows = self._run(
             "read",
-            lambda cur: cur.execute(
+            reraise=True,
+            work=lambda cur: cur.execute(
                 "SELECT streamer_id, "
                 "       eventsub_refused_at < NOW() - make_interval(days => %s) AS stale "
                 "FROM streamers "
@@ -454,6 +460,7 @@ class PostgresRefusalStore(RefusalStore):
             fetch=True,
         )
         return {} if rows is None else {row[0]: bool(row[1]) for row in rows}
+
 
     def mark_refused(self, broadcaster_id: int) -> None:
         self._run(
@@ -473,7 +480,7 @@ class PostgresRefusalStore(RefusalStore):
             ),
         )
 
-    def _run(self, operation: str, work, fetch: bool = False):
+    def _run(self, operation: str, work, fetch: bool = False, reraise: bool = False):
         conn = None
         try:
             conn = self.db_pool.getconn()
@@ -492,6 +499,8 @@ class PostgresRefusalStore(RefusalStore):
                     conn.rollback()
                 except Exception:
                     pass
+            if reraise:
+                raise
             return None
         finally:
             if conn is not None:
