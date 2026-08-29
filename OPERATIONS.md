@@ -10,7 +10,11 @@ This guide covers the full restart procedure, per-service restart steps, and tro
    TWITCH_CLIENT_ID=your_client_id_here
    TWITCH_CLIENT_SECRET=your_client_secret_here
    ```
-3. **Twitch tokens** in `./secrets/twitch_user_tokens.json`. Run `python seed_twitch_tokens.py` if this file is missing.
+3. **Twitch tokens** in `./secrets/twitch_user_tokens.json`. Run `python seed_twitch_tokens.py` if this file is missing. The token must carry **two scopes**, and `seed_twitch_tokens.py` asks for exactly these:
+   - **`user:read:chat`** — the EventSub `channel.chat.message` subscription, which is how chat arrives. Without it every subscription refuses, and the service logs that at ERROR on start-up rather than going quiet.
+   - **`clips:edit`** — clip creation, shared with the Flink job.
+
+   `chat:read` is **no longer required and no longer requested**. It was the IRC scope, and IRC was removed in spec 004 Phase 3. A token seeded before that still works, because a superset is fine, but re-seeding drops it.
 
 ---
 
@@ -30,6 +34,52 @@ docker compose restart flink-jobmanager
 If you are restarting to pick up a **code change**, use `--force-recreate` instead — a plain restart does not re-resolve a single-file bind mount. See "Note on image rebuilds" below.
 
 `-pyFiles` (here, `-pyfs`) comes from the `FLINK_PYFILES` environment variable in `docker-compose.yml`, not hardcoded in the entrypoint script. Changing which files it lists needs no image rebuild — see "Adding a new Python module" below.
+
+---
+
+## How chat ingestion runs
+
+Chat arrives over **EventSub websockets**. There is no IRC client, no chat rooms
+to join, and no JOIN rate limit — all of that was removed in spec 004 Phase 3.
+
+Two pieces do the work, and **both live inside the one `stream-monitoring`
+container**:
+
+- **The poller** runs on the APScheduler tick. It ranks the top live streams,
+  applies the `JOIN_THRESHOLD` / `LEAVE_THRESHOLD` hysteresis band, and writes
+  the wanted channel set to Redis (`chat:desired`, plus the login-to-id map in
+  `chat:desired:ids`). It does no network work for subscriptions and its
+  duration does not grow with the size of the change.
+- **The reconciler** is an **asyncio task in the same process**, started next to
+  the poll job. It reads that wanted set and drives the live subscriptions
+  toward it — creating and deleting concurrently, up to `RECONCILE_CONCURRENCY`
+  (default 10) at a time. It wakes when the poller bumps the generation counter,
+  or every 5 s, whichever comes first.
+
+**There is no separate container or service to start, stop, or check.** If
+`stream-monitoring` is up, the reconciler is up. Restarting the container
+restarts it, and it converges from whatever state it finds — existing
+subscriptions are adopted, not duplicated.
+
+Subscriptions are spread over a pool of websocket connections, **300 per
+connection** (Twitch's cap). The pool starts empty and opens another connection
+when the ones it has are full, so ~500 channels run on two.
+
+### Reading the reconciler metrics
+
+All of these are on the stream-monitoring metrics endpoint, port **9100**:
+
+```bash
+curl -s http://localhost:9100/metrics | grep -E '^(eventsub_|reconcile_|subscription_create)'
+```
+
+| Metric | Read it as |
+|---|---|
+| `eventsub_subscription_count` | Live subscriptions held. Should equal the wanted set — compare against `ZCARD chat:desired`. A steady small gap is normally one channel refusing authorization; check the logs for `subscription missing proper authorization` |
+| `reconcile_last_success_timestamp` | Unix time of the last clean pass. **This is the stalled-reconciler alarm.** If it stops advancing while polls keep succeeding, the reconciler is stuck and the subscription set is frozen — the poller cannot tell you this, because it still works |
+| `reconcile_duration_seconds` | Histogram of pass duration. A converged pass is milliseconds. Buckets run to 120 s because a cold start to 500 channels takes ~51 s |
+| `subscription_create_failures_total` | Counter, labelled by `reason`. **No series at all is the healthy state**, not a broken exporter: this client registers a labelled series on its first increment |
+| `eventsub_connection_occupancy` | Subscriptions per connection, labelled by connection id. None should exceed 300 |
 
 ---
 
@@ -78,7 +128,8 @@ neither the old nor the new code understands.
 
 ### Spec 004 Phase 2 — the two self-heal timestamps
 
-Applied 2026-08-28. Adds `eventsub_refused_at` (the reconciler writes it when a
+Applied 2026-08-28 to the deployed database: 1,404 rows, 134 backfilled. This is
+the **only** migration spec 004 needs; it is complete as written below. Adds `eventsub_refused_at` (the reconciler writes it when a
 channel refuses the chat subscription) and `clipping_disabled_at` (the Flink job
 writes it beside every `allows_clipping = FALSE`). Both carry the same 7-day
 re-check, so a channel that fixes its settings stops being skipped forever.
@@ -202,13 +253,15 @@ Restarting flink-jobmanager runs the job fresh — see "How the Flink job runs" 
 
 ### Stream monitoring service
 
-**When:** not joining chat rooms, Twitch API errors, or websocket failures.
+**When:** chat messages stop reaching Kafka, Twitch API errors, or websocket failures.
 ```bash
 docker logs streamscout-stream-monitoring --tail 20
 docker compose restart stream-monitoring
 docker logs -f streamscout-stream-monitoring
 ```
-Expect to see: `Stream Monitoring Service started`, `Polling for top streams`, `Joined chat room`. Press `Ctrl+C` to stop following.
+Expect to see: `Stream Monitoring Service started`, `Reconciler started`, `Adopted existing subscriptions`, `Polling for top streams`, `Poll complete`. Press `Ctrl+C` to stop following.
+
+To pick up a **code change**, use `docker compose up -d --force-recreate stream-monitoring` instead of `restart` — see "Note on image rebuilds".
 
 ### Flink job (Clip Detector)
 
@@ -328,15 +381,36 @@ Two steps, not one:
 
 Then `docker compose up -d` — no image rebuild needed for either step.
 
-### Stream monitoring is not joining any chat rooms
+### No chat messages are reaching Kafka
+
+Chat is EventSub now, so there are no chat rooms to join. Work down the chain:
+
 ```bash
 docker logs streamscout-stream-monitoring --tail 30
+curl -s http://localhost:9100/metrics | grep -E '^(eventsub_subscription_count|reconcile_last_success_timestamp|subscription_create_failures_total)'
 ```
-Authentication errors mean the Twitch tokens expired. Regenerate them:
-```bash
-python seed_twitch_tokens.py
-docker compose restart stream-monitoring
-```
+
+1. **`eventsub_subscription_count` is 0 and every create fails.** Look for
+   `subscription missing proper authorization` on every channel. That is the
+   token, not the broadcasters: it has no **`user:read:chat`** scope. The
+   service also logs this at ERROR on start-up. Re-seed and force-recreate:
+   ```bash
+   python seed_twitch_tokens.py
+   docker compose up -d --force-recreate stream-monitoring
+   ```
+   The service deliberately does **not** persist refusals while that scope is
+   missing, so a token mistake cannot mark the whole monitored set as refused
+   for seven days. Nothing needs undoing in the database afterwards.
+2. **`reconcile_last_success_timestamp` is not advancing.** The reconciler is
+   stalled while the poller keeps working. Restart the container.
+3. **The count is right but Kafka is empty.** The subscriptions exist and are
+   silent, so the problem is downstream — check the Kafka producer logs and
+   `kafka_messages_produced`.
+4. **Authentication errors of any other kind** mean the tokens expired. Re-seed
+   as above.
+
+A single channel refusing on every pass is normal — roughly 1 in 500 does — and
+it is recorded in `streamers.eventsub_refused_at` and retried after 7 days.
 
 ### No clips after 5+ minutes
 Check each of these in order:

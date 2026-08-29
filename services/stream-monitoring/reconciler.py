@@ -110,9 +110,9 @@ reconcile_duration_seconds = Histogram(
     "reconcile_duration_seconds",
     "Wall-clock duration of one reconcile pass",
     # The default buckets stop at 10 s. A cold start to 500 channels takes
-    # about 40 s (research D2), so the interesting range would all land in
-    # +Inf. These buckets cover a converged pass (milliseconds) through the
-    # 120 s SC-001 ceiling.
+    # about 51 s at the default concurrency (measured, research T041), so the
+    # interesting range would all land in +Inf. These buckets cover a converged
+    # pass (milliseconds) through the 120 s SC-001 ceiling.
     buckets=(0.005, 0.05, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, float("inf")),
 )
 subscription_create_failures_total = Counter(

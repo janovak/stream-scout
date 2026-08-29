@@ -28,7 +28,7 @@ not need a working system at each intermediate step.
 
 **Language/Version**: Python 3.11 (`services/stream-monitoring`); Python 3.10 (PyFlink job, unchanged)
 **Primary Dependencies**: `twitchAPI` 4.5.0 (`twitchAPI.eventsub.websocket.EventSubWebsocket`), `redis`, `confluent-kafka`, `apscheduler`, `psycopg2`
-**Storage**: Redis (desired set, per-connection routing hints); Postgres (`streamers` table — adds refusal and re-check columns); Flink keyed state (unchanged)
+**Storage**: Redis (desired set and its login-to-id map); Postgres (`streamers` table — adds refusal and re-check columns); Flink keyed state (unchanged). Connection routing is computed in memory, not stored
 **Testing**: pytest — `services/stream-monitoring/test_stream_monitoring.py`; Flink side `test_replay.py`, `test_spike_detector.py`
 **Target Platform**: Docker Compose stack; one `stream-monitoring` container; Flink standalone cluster
 **Project Type**: single (backend service plus stream-processing job)
@@ -48,7 +48,7 @@ not need a working system at each intermediate step.
 | Postgres exclusively for persistence | Unchanged — refusal state is two new columns on `streamers`, not a new store |
 | PyFlink for stream processing | Unchanged — the job keeps its code; only `WATERMARK_OUT_OF_ORDERNESS_SECONDS` changes |
 | Twitch API integration | Unchanged in principle — transport moves from IRC to EventSub, still one Twitch account |
-| Prometheus metrics | Extended — subscription count, reconcile duration, creation failures, per-connection occupancy (FR-012) |
+| Prometheus metrics | Extended — subscription count, reconcile duration, creation failures, per-connection occupancy, and the time of the last successful reconcile (FR-012) |
 | Grafana / Loki observability | Unchanged — same structured-log path |
 | **No data loss in the pipeline** | **At risk** — see research R1 (ramp-window drops) and R2 (event-time shift). Both are measured in Phase 0 before cutover |
 | Health check endpoints | Unchanged — `/health` on 8080 stays |
@@ -79,7 +79,7 @@ specs/004-eventsub-parallel-reconciler/
 services/stream-monitoring/
 ├── stream_monitoring_service.py   # poller — loses all chat/join logic; keeps Helix, Redis, Postgres, lifecycle
 ├── reconciler.py                  # NEW — diff desired vs actual, bounded concurrency, highest rank first
-├── eventsub_pool.py               # NEW — EventSubWebsocket pool, consistent-hash routing, 300-cap occupancy
+├── eventsub_pool.py               # NEW — EventSubWebsocket pool, rendezvous-hash routing, 300-cap occupancy
 ├── token_manager.py               # +user:read:chat scope
 ├── test_stream_monitoring.py      # extended — poll-does-not-block, hysteresis-survives, reconciler convergence
 ├── Dockerfile                     # +COPY reconciler.py eventsub_pool.py; drop the patches/ step
@@ -120,7 +120,7 @@ list in earlier specs. `reconciler.py` and `eventsub_pool.py` each need a
 | 2 — EventSub transport | Token scope, connection pool, message mapping, wire the reconciler to the pool | EventSub carries live traffic |
 | 3 — Remove IRC | Delete the `Chat` client, dead-chat detection, and the `patches/` workaround. No dual-transport period | Service is simpler, not just changed |
 | 4 — Watermark and detection | Set `WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2`. Confirm the detector behaves unchanged. Add a warm-up gate only if T004 requires it | Late-drop rate < 0.1% |
-| 5 — Verify | The six success criteria | All SC pass |
+| 5 — Verify | The seven success criteria | All SC pass |
 | 6 — Review | `/speckit.analyze`, `/code-review high`, address findings | Clean |
 
 ## Complexity Tracking

@@ -48,5 +48,11 @@ FR-008 is about the schema, not just the three hot fields.
    string.
 3. Key = `str(broadcaster_id).encode("utf-8")`, unchanged, so partition
    assignment does not move.
-4. A test asserts a mapped EventSub message and a mapped IRC message produce the
-   same JSON keys (FR-008, task in Phase 2).
+4. A test asserts the mapped payload matches the field tables above.
+   **Corrected in Phase 3**: this invariant first named a test comparing a
+   mapped EventSub message against a mapped IRC message. That test existed and
+   passed through Phase 2 (T021), and it was removed with IRC in Phase 3 (T034)
+   because its reference — the live IRC handler — no longer exists. The field
+   tables in this contract are now the reference, and
+   `TestEventSubMessageMapping` in `test_stream_monitoring.py` asserts against
+   them, invariant 2 included.

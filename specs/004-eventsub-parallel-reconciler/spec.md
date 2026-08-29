@@ -79,8 +79,9 @@ channels and measure time to full coverage.
 **Acceptance Scenarios**:
 
 1. **Given** a cold start targeting 500 channels, **When** the reconciler runs,
-   **Then** full coverage is reached in under 60 s (target) and never more than
-   120 s (hard ceiling), against the IRC equivalent of ~250 s.
+   **Then** full coverage — every channel that does not refuse authorization —
+   is reached in under 60 s (target) and never more than 120 s (hard ceiling),
+   against the IRC equivalent of ~250 s.
 2. **Given** subscription creation is in progress, **When** a poll tick occurs,
    **Then** the poll completes normally and is not blocked or skipped.
 
@@ -120,9 +121,9 @@ distribution before and after.
    the JSON has the same keys and the same value types as an IRC-sourced
    message today — in particular `sent_at` is an integer or `null`, never a
    string (`contracts/chat-messages.schema.md`).
-2. **Given** the watermark tolerance is set to 2 s, **When** delivery lag is
-   measured at the target channel count, **Then** late-event drops stay below
-   0.1%.
+2. **Given** the watermark tolerance is set to 2 s, **When** the late rate is
+   measured on live traffic, **Then** it stays below 0.1%. See SC-005 for what
+   "late" means for this job and for the channel count it was taken at.
 
 ### User Story 4 - Subscriptions survive restarts and drift (Priority: P2)
 
@@ -137,14 +138,19 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
    starts, **Then** it adopts them rather than duplicating them.
 2. **Given** a revoked subscription, **When** the next reconcile runs,
    **Then** it is recreated.
-3. **Given** a channel marked as authorization-refused (or clipping-disabled)
-   more than 7 days ago, **When** the next cycle runs, **Then** it is retried
-   once, and a success clears the mark.
+3. **Given** a channel marked as authorization-refused more than 7 days ago,
+   **When** the next cycle runs, **Then** the subscription is attempted once
+   more, and a success clears the mark.
+4. **Given** a streamer marked as clipping-disabled more than 7 days ago,
+   **When** the next poll runs, **Then** the streamer is back in the ranking,
+   and the next real clip attempt either clears the mark or sets it again
+   (FR-013).
 
 ### Edge Cases
 
 - A channel refuses subscription with `subscription missing proper
-  authorization`. Measured at ~1.5% of channels (6 of 400). Record the refusal
+  authorization`. The 003 spike measured ~1.5% of channels (6 of 400); the
+  Phase 5 run at a real 500 saw 1 (0.2%). Record the refusal
   with its time and skip the channel, like clipping-disabled streamers already
   are. Retry the refusal only once it is more than 7 days old.
 - A websocket connection dies holding up to 300 subscriptions.
@@ -181,10 +187,18 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   one reconcile cycle; full coverage from a cold start MUST land inside the
   SC-001 bound.
 - **FR-006**: The system MUST distribute subscriptions across websocket
-  connections, respecting the measured **300 per connection** cap.
+  connections, respecting the measured **300 per connection** cap. The pool
+  MUST start with no connections and grow on demand when the desired set needs
+  more than the open connections can hold. Routing MUST be stable across
+  reconciles and across restarts, and growing the pool MUST NOT move a channel
+  that is already placed.
 - **FR-007**: Channels that refuse authorization MUST be recorded with the time
   of the refusal and skipped on later cycles. A refusal MUST be retried once it
-  is more than 7 days old.
+  is more than 7 days old. The refusal record MUST NOT be written when the
+  token has no `user:read:chat` scope. Without that scope every channel refuses
+  for one reason that is not the broadcaster's, so persisting the refusals
+  would turn a token mistake into a 7-day skip of the whole monitored set
+  (added during implementation, task T025).
 - **FR-008**: Published Kafka messages MUST keep the schema the Flink job
   consumes today, including a `sent_at` field.
 - **FR-009**: The event-time source for `sent_at` MUST be the envelope field
@@ -192,8 +206,10 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   carries no timestamp. Cutover MUST proceed only if Phase 0 task T001 shows the
   median dispatch-versus-receive offset is within the 2 s watermark tolerance.
 - **FR-010**: `WATERMARK_OUT_OF_ORDERNESS_SECONDS` MUST be set to 2, replacing
-  the IRC-era value of 1. The residual late-event drop rate MUST be measured at
-  the target channel count and MUST stay below 0.1%.
+  the IRC-era value of 1. The residual late rate MUST be measured on live
+  traffic and MUST stay below 0.1%. **Corrected during implementation**: the
+  measurement is taken at the production operating point, not at 500, and the
+  quantity is not a Flink drop counter. See SC-005.
 - **FR-011**: Hysteresis (join at `JOIN_THRESHOLD`, leave at `LEAVE_THRESHOLD`)
   MUST be preserved.
 - **FR-012**: Prometheus metrics MUST cover subscription count, reconcile
@@ -201,8 +217,13 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   last successful reconcile (so a stalled reconciler is visible while polls
   keep succeeding).
 - **FR-013**: The existing `allows_clipping` skip MUST also self-heal on the
-  same 7-day re-check, so a streamer that re-enables clipping is retried rather
-  than skipped forever.
+  same 7-day re-check, so a streamer that re-enables clipping is returned to
+  ranking rather than skipped forever. **Clarified during implementation**: for
+  `allows_clipping` this is an un-skip, not a bounded single retry. The
+  reconciler does not call Twitch to test the flag. The streamer re-enters the
+  ranking, and the next real clip attempt in the Flink job either clears the
+  mark or sets it again, exactly as `data-model.md` specifies. A streamer who
+  never spikes therefore holds a slot until they do.
 - **FR-014**: A per-channel warm-up gate that withholds a channel's baseline
   until its subscription is settled MUST be added only if Phase 0 task T004
   shows the ramp-window event loss exceeds ~1% of a channel's first-window
@@ -225,7 +246,11 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
 
 ### Key Entities
 
-- **Desired set**: the channels the poller says should be monitored, with rank.
+- **Desired set**: the channels the poller says should be monitored, with rank,
+  plus the login-to-broadcaster-id map that goes with them. The poller ranks by
+  login and EventSub subscribes by id, so the map has to cross the seam. Both
+  are written in one transaction, so they can never disagree
+  (`chat:desired` and `chat:desired:ids` in `data-model.md`).
 - **Actual set**: the subscriptions that currently exist.
 - **Reconciler**: the component driving actual toward desired.
 - **Connection pool**: websocket connections, each holding up to 300 subs.
@@ -239,6 +264,8 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
 
 - **SC-001**: Cold start to 500 channels completes in under 60 s (target) and
   in no more than 120 s (hard ceiling), against an IRC baseline of ~250 s.
+  "Complete" means every channel that does not refuse authorization, on the
+  same allowance SC-004 makes.
 - **SC-002**: Poll duration does not scale with desired-set change size.
 - **SC-003**: No `Bucket channel_join got rate limited` — the IRC bucket is
   gone entirely.
@@ -246,9 +273,21 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   subscription count within ±1% of the desired-set size. Any gap is
   attributable to a logged refusal, a socket reconnect in progress, or a
   desired-set change — nothing unexplained.
-- **SC-005**: With `WATERMARK_OUT_OF_ORDERNESS_SECONDS` at 2, the Flink
-  late-records-dropped rate on the `chat-messages` source at 500 channels stays
-  below 0.1% of records.
+- **SC-005**: With `WATERMARK_OUT_OF_ORDERNESS_SECONDS` at 2, fewer than 0.1%
+  of `chat-messages` records arrive after the timer for their own bucket has
+  fired.
+  **Corrected during implementation.** This criterion first named Flink's
+  `numLateRecordsDropped` on the source. That metric does not exist for this
+  job. Flink emits it from window operators, and `clip_detector_job.py` is a
+  `KeyedProcessFunction` with per-second timers. A late record is therefore not
+  dropped. It re-fires a second that the job has already evaluated, and it can
+  regress an open hold. The rate above is the equivalent quantity, measured
+  directly on the live topic (`research.md` T038).
+  **This is also the one criterion measured at the production operating point
+  of 21-23 broadcasters, not at 500.** A 500-channel figure needs Flink and
+  `ClipCreator` in the path. That is the change this spec defers to 005. See
+  `research.md` "What was NOT measured at 500" for the gap and for the argument
+  that closes it.
 - **SC-006**: A restart mid-ramp converges without duplicate subscriptions.
 - **SC-007**: Every metric FR-012 lists is present on the `/metrics` endpoint
   and populated with a non-placeholder value while the reconciler runs.
@@ -261,10 +300,17 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   lacks. A superset token already exists from the spike. Re-seeding the token
   does **not** invalidate the running production token — verified during the
   spike with production running throughout (`research.md`).
-- **Measured to 394, assumed to 500+**: the 300-per-connection cap, the 0 cost
-  against `max_total_cost`, and no per-user subscription ceiling were all
-  measured at 394 channels. Phase 0 T002 re-checks the delivery-lag tail at
-  500. SC-004 assumes count stability holds at 500.
+- **Measured to 394, then measured at 500 — except SC-005.** The
+  300-per-connection cap, the 0 cost against `max_total_cost`, and the absence
+  of a per-user subscription ceiling were first measured at 394 channels. Phase
+  5 then measured SC-001, SC-002, SC-004 and SC-006 at a real 500 through a
+  synthetic driver running the shipped `Reconciler` and `EventSubPoolTransport`
+  against Twitch, so those assumptions are now results. **What stays an
+  assumption is SC-005 alone**: the late rate is measured at 21-23
+  broadcasters, and the claim that it holds at 500 rests on three delivery-lag
+  measurements at three scales that do not grow with channel count. That is an
+  argument, not a measurement. See `research.md` "What was NOT measured at
+  500".
 - **Cutover coverage gap**: the operator accepts a bounded loss of chat
   coverage during the IRC→EventSub switch. There is no dual-transport period
   (`research.md` R5). `git revert` of the branch is the fallback.
@@ -273,11 +319,43 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
 
 ## Out of Scope
 
-- **`ClipCreator`'s unbounded thread spawn and the absence of a clip budget.**
-  This is real and will bite at scale — clip creation is capped per account
-  much as JOIN was, so a larger monitored set will detect far more anomalies
-  than can be acted on. It needs anomaly *ranking* against a scarce budget,
-  which is a design change. Candidate for 005.
+- **`ClipCreator`'s unbounded thread spawn and the absence of a clip budget —
+  this is now the next ceiling, and it is spec 005.** Not a candidate: this
+  feature removed the ingestion ceiling and put the next one directly in front
+  of the operator.
+
+  The numbers say where it lands. Measured anomaly density is roughly **2
+  anomalies per broadcaster-hour** — 2.09 in the T039 pre-cutover replay, and
+  2.4 to 2.7 across the 17 broadcasters of the Phase 2 live gate
+  (`research.md` T039 and "Detection is unchanged on EventSub data"). At the
+  15/30 thresholds production runs today, ~20 channels give ~45 anomalies an
+  hour, which the current design absorbs. **At the 500 channels this feature
+  now reaches in 51 s, the same density gives roughly 1,100 anomalies an
+  hour**, about 18 a minute.
+
+  Two properties of `ClipCreator` turn that into a failure
+  (`specs/003-detector-scale-fanout/research.md` §3):
+
+  - **Unbounded threads.** `ClipCreator.process_element` starts a raw
+    `threading.Thread` per anomaly, with no global limiter. Each one can live
+    "the better part of half an hour" by its own comment, because it waits out
+    `ClipPolicy`'s initial delay plus the clip and metadata retries. At 18
+    anomalies a minute the live thread count runs into the hundreds. This is
+    exactly the discipline NFR-001 imposed on the reconciler and that
+    `ClipCreator` does not have.
+  - **A per-account clip cap.** Clip creation is capped per Twitch account,
+    much as JOIN was. A 500-channel monitored set detects far more anomalies
+    than one account may act on, so the excess cannot be absorbed by retrying:
+    429 is currently marked retryable, which converts the cap into permanent
+    backoff held open by those same threads.
+
+  So the fix is not a thread-pool size. It is **ranking anomalies against a
+  scarce clip budget** — deciding which of the 1,100 are worth the few hundred
+  clips available — and that is a design change with its own spec. **Spec 005
+  starts here.** Until it lands, raising `JOIN_THRESHOLD` / `LEAVE_THRESHOLD`
+  toward 500 is what makes the failure appear, and a rising clip-creation
+  failure rate under that ramp is the expected signal, not a regression in this
+  feature.
 - The detector state work in 003, which measurement deflated.
 - Kafka partition and Flink parallelism re-provisioning.
 - Webhook transport, unless websocket proves insufficient (see `research.md`

@@ -95,8 +95,25 @@ count, not `total`) and maintained in memory after that.
 | Entity | Fields | Notes |
 |---|---|---|
 | `Connection` | `websocket`, `subscription_ids: set`, `occupancy` | `occupancy <= 300` (measured cap) |
-| `Pool` | `connections: list[Connection]` | Grows when `desired_count > len(connections) * 300` |
-| Routing | `connection_index = consistent_hash(broadcaster_id) % len(connections)` | A channel keeps its connection across reconciles (D6) |
+| `Pool` | `connections: list[Connection]` | Starts empty. Grows on demand when every open connection is at the cap |
+| Routing | Rendezvous hash: the connection whose `blake2b(connection_id, broadcaster_id)` digest scores highest wins | A channel keeps its connection across reconciles and across restarts (D6) |
+
+### Routing is rendezvous hashing, not modulo (corrected in Phase 2)
+
+This document first wrote the routing rule as
+`consistent_hash(id) % len(connections)`. **Modulo is the thing D6 exists to
+prevent.** Adding a connection changes the divisor, so nearly every channel
+moves to a different socket. That is a full reshuffle of the pool on growth.
+
+The implementation uses **rendezvous hashing**: score every connection against
+the broadcaster id and take the highest. Adding a connection moves only the
+channels that score higher on the new one. Two further details are
+load-bearing:
+
+- Connection ids come from a monotonic counter, so retiring one does not
+  renumber the survivors.
+- The digest is `blake2b`, not the built-in `hash()`. Python salts `hash()` of
+  a string per process, so `hash()` would reshuffle every channel on restart.
 
 ## State transitions — a channel through the reconciler
 
