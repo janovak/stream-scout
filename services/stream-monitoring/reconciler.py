@@ -631,6 +631,15 @@ class Reconciler:
                     # dropped again, with a frozen
                     # `reconcile_last_success_timestamp` as the only symptom.
                     logger.exception("Reconcile pass raised, continuing")
+                if not self.running:
+                    # `stop()` signals through `_wake`, and
+                    # `_maybe_refresh_desired` clears that event for its own
+                    # purpose -- so the signal can be gone by the time the pass
+                    # ends. Re-check the flag directly rather than waiting on
+                    # an event that may already have been consumed, or shutdown
+                    # sits here for the whole idle timeout and the service's
+                    # bounded "ask first" wait always times out instead.
+                    break
                 await self._wait_for_work()
         except asyncio.CancelledError:
             logger.info("Reconciler cancelled")

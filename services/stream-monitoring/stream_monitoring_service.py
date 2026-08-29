@@ -891,10 +891,20 @@ async def main():
 
     # Set up signal handlers
     loop = asyncio.get_event_loop()
+    stop_task = None
 
     def signal_handler():
+        # Held and awaited below. `stop()` sets `running = False` before its
+        # first await, so `start()`'s keep-alive loop returns within a second
+        # and `main()` would return with the shutdown only part done --
+        # `asyncio.run` then cancels it where it stands. Everything after the
+        # reconciler wait (transport close, Kafka flush, Postgres, Redis) was
+        # being skipped: buffered chat dropped, subscriptions left for Twitch
+        # to reap, and "Stream Monitoring Service stopped" never logged.
+        nonlocal stop_task
         logger.info("Received shutdown signal")
-        asyncio.create_task(service.stop())
+        if stop_task is None:
+            stop_task = asyncio.create_task(service.stop())
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, signal_handler)
@@ -909,6 +919,10 @@ async def main():
         logger.error("Service error", extra={"error": str(e)})
         await service.stop()
         sys.exit(1)
+
+    # Let a shutdown that a signal started actually finish.
+    if stop_task is not None:
+        await stop_task
 
 
 if __name__ == "__main__":

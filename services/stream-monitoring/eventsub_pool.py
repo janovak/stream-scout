@@ -118,12 +118,18 @@ _RATE_LIMIT_MARKERS = ("too many", "rate limit", "429", "exceeded")
 # level, while a false negative classifies the error as a 429 and burns the
 # reconciler's whole retry budget -- 20 rounds of 10 s backoff -- on a create
 # that can never succeed.
+#
+# `"websocket session"` was in this list and had to come out. It matches
+# `EventSubSubscriptionError: websocket session has already disconnected`,
+# which `research.md` records the library raising twice from its own
+# `_resubscribe` during a 500-channel ramp -- a transient reconnect race, not
+# a full session. Marking that connection full was wrong, and at occupancy 0
+# it stranded the socket. Every marker here must name a LIMIT.
 _SESSION_FULL_MARKERS = (
     "subscription limit",
     "too many subscriptions",
     "maximum number of subscriptions",
     "subscriptions per websocket",
-    "websocket session",
     "session limit",
 )
 
@@ -788,10 +794,22 @@ class EventSubPoolTransport(SubscriptionTransport):
             # believes in. Retrying the same channel would route it straight
             # back here, so take the connection out of routing and let the
             # next pass place the channel elsewhere.
+            if connection.occupancy == 0:
+                # Full while holding nothing: this session can never carry a
+                # channel. Skipping it in `route()` was not enough -- nothing
+                # else would ever look at it again, `_is_dead()` cannot flag it
+                # because the library still thinks the socket is healthy, and
+                # so its thread, event loop and ClientSession leaked for the
+                # life of the process while `_grow()` opened a replacement.
+                # Retire it properly instead.
+                logger.error(
+                    "EventSub connection reported full while empty, retiring it",
+                    extra={"connection": connection.connection_id, "error": message},
+                )
+                self._retire(connection)
+                return TransportError(f"connection unusable: {message}")
             # Remember the level it refused at, not a permanent flag, so
-            # deletes can bring the connection back into routing. A session
-            # that reports full while holding nothing can hold nothing, so
-            # `full_at = 0` excluding it for good is the right answer there.
+            # deletes can bring the connection back into routing.
             connection.full_at = connection.occupancy
             logger.error(
                 "EventSub connection reported full below the configured cap",

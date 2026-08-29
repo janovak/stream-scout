@@ -2197,7 +2197,8 @@ class TestPoolErrorClassification:
         async def run():
             pool = make_pool()
             await pool._grow()
-            pool._connections[0].websocket.raise_on_subscribe = (
+            retired = pool._connections[0].websocket
+            retired.raise_on_subscribe = (
                 eventsub_pool.EventSubSubscriptionError(
                     "websocket session has too many subscriptions"
                 )
@@ -2205,11 +2206,17 @@ class TestPoolErrorClassification:
             with pytest.raises(TransportError) as caught:
                 await pool.create(5)
             assert not isinstance(caught.value, RateLimitedError)
-            assert pool._connections[0].full_at == 0
-            # And it is out of routing, so the next create opens a connection.
-            pool._connections[0].websocket.raise_on_subscribe = None
+            # Full while holding nothing means the session can carry nothing.
+            # Merely skipping it in routing left its thread, event loop and
+            # ClientSession leaked for the life of the process, because
+            # `_is_dead()` cannot flag a socket the library still likes.
+            assert pool._connections == [], "the unusable connection was kept"
+            assert retired._closing is True, "its socket was never torn down"
+
+            # And the next create opens a fresh one.
+            retired.raise_on_subscribe = None
             await pool.create(5)
-            assert len(pool._connections) == 2
+            assert len(pool._connections) == 1
 
         asyncio.run(run())
 
@@ -2240,6 +2247,29 @@ class TestPoolErrorClassification:
             await pool.delete(subscription_id)
             assert connection.occupancy == 2
             assert pool.route(99) is connection
+
+        asyncio.run(run())
+
+    def test_a_reconnect_race_is_not_mistaken_for_a_full_session(self):
+        """`research.md` records the library raising
+        `websocket session has already disconnected` twice from its own
+        `_resubscribe` during a 500-channel ramp. A marker list wide enough to
+        match that text classified a transient reconnect race as a full
+        session -- and at occupancy 0 that retired a perfectly good socket."""
+
+        async def run():
+            pool = make_pool()
+            await pool._grow()
+            pool._connections[0].websocket.raise_on_subscribe = (
+                eventsub_pool.EventSubSubscriptionError(
+                    "websocket session has already disconnected"
+                )
+            )
+            with pytest.raises(TransportError):
+                await pool.create(5)
+
+            assert len(pool._connections) == 1, "a live connection was retired"
+            assert pool._connections[0].full_at is None
 
         asyncio.run(run())
 
@@ -2853,6 +2883,77 @@ class TestDegradedWithoutUserAuth:
             await asyncio.wait_for(reconciler.run(), timeout=2)
 
             assert len(passes) >= 3, "the loop died on the first exception"
+
+        asyncio.run(run())
+
+    def test_a_signalled_shutdown_runs_to_the_end(self):
+        """`stop()` sets `running = False` before its first await, so
+        `start()`'s keep-alive loop returns within a second. If `main()` does
+        not await the stop task, `asyncio.run` cancels it where it stands and
+        everything after the reconciler wait -- transport close, Kafka flush,
+        Postgres, Redis -- is skipped: buffered chat dropped and ~500
+        subscriptions left for Twitch to reap."""
+
+        async def run():
+            service = StreamMonitoringService()
+            service.scheduler = MagicMock()
+            service.reconciler = None
+            service._reconciler_task = None
+            service.transport = None
+            service.twitch = None
+            finished = []
+
+            real_stop = service.stop
+
+            async def slow_stop():
+                # Something after `running = False` that yields, the way the
+                # bounded reconciler wait does.
+                service.running = False
+                await asyncio.sleep(0.2)
+                await real_stop()
+                finished.append(True)
+
+            service.stop = slow_stop
+
+            with patch.object(StreamMonitoringService, "initialize", AsyncMock()):
+                stop_task = None
+
+                async def drive():
+                    nonlocal stop_task
+                    starter = asyncio.create_task(service.start())
+                    await asyncio.sleep(0.05)
+                    stop_task = asyncio.create_task(service.stop())
+                    await starter
+                    # This is the line main() was missing.
+                    await stop_task
+
+                await asyncio.wait_for(drive(), timeout=5)
+
+            assert finished == [True], "shutdown was cut off part way through"
+
+        asyncio.run(run())
+
+    def test_stop_is_signalled_even_when_the_refresh_consumed_the_event(self):
+        """`stop()` signals through `_wake`, and `_maybe_refresh_desired`
+        clears that event for its own purpose. The loop has to re-check the
+        flag, or shutdown waits out the whole idle timeout -- which is the same
+        length as the service's bounded "ask first" wait, so that wait would
+        always time out and cancel the task it was meant to let finish."""
+
+        async def run():
+            fake_redis = FakeRedis()
+            seed_desired(fake_redis, [("a", 1)])
+            reconciler = make_reconciler(
+                StubTransport(), fake_redis, idle_timeout_seconds=30
+            )
+
+            async def pass_that_stops_and_eats_the_signal():
+                reconciler.stop()          # sets running=False and _wake
+                reconciler._wake.clear()   # what the mid-pass refresh does
+
+            reconciler.reconcile_once = pass_that_stops_and_eats_the_signal
+            # Without the flag re-check this waits the full 30 s idle timeout.
+            await asyncio.wait_for(reconciler.run(), timeout=2)
 
         asyncio.run(run())
 
