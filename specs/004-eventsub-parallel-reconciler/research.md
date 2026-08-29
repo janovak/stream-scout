@@ -453,11 +453,25 @@ driver now enumerates through Twitch directly instead.
 
 The check now walks Twitch's own pages with a **USER** token — the library
 defaults to an app token, which cannot see websocket subscriptions at all and
-would have returned an empty list, putting `duplicates == 0` back to
-true-by-construction for a new reason — and scopes by session, because
-production shares this token and its channels are a subset of the top 500, so
-counting its subscriptions alongside ours would have reported ~21 false
-duplicates.
+would have returned an empty list — and scopes by session, because production
+shares this token and its channels are a subset of the top 500, so counting its
+subscriptions alongside ours would have reported ~21 false duplicates.
+
+**Be precise about what that proves.** "No duplicate subscriptions" has two
+readings. Taken as *no broadcaster holds two subscriptions of any kind*, it is
+false by definition straight after a `SIGKILL`: the dead process's
+subscriptions linger until Twitch reaps them. Taken as *no broadcaster holds
+two subscriptions that can actually deliver*, it is the property worth having
+— two live sockets feeding one broadcaster into the pipeline would double-count
+and corrupt detection. This checks the second, which means it **cannot fail on
+a cross-restart pair**, because the stranded half is by definition not
+deliverable. What it can catch is the pool creating two live subscriptions for
+one broadcaster within a run, which is the routing bug that would actually
+hurt. The excluded population is now reported rather than assumed:
+`not_enabled` counts the stranded orphans, and
+`broadcasters_multi_enabled_anywhere` counts broadcasters with two or more
+enabled rows across every session — a number production alone makes non-zero,
+and which is expected rather than a failure.
 
 **Re-run with the corrected check, 2026-08-29**: `SIGKILL` mid-ramp at ~265 of
 500, restart converged to **499/500** with 99% at 94 s. The walk saw **888

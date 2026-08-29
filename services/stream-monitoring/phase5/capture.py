@@ -61,6 +61,7 @@ def main():
 
     targets = {}
     assignment = []
+    done_at_start = set()
     # Equal records per partition, NOT equal time. A busy partition's slice
     # therefore reaches less far back in wall-clock time than a quiet one, so
     # the resulting file's nominal span is not a span every broadcaster is
@@ -74,20 +75,28 @@ def main():
         targets[p] = high
         assignment.append(TopicPartition(TOPIC, p, start))
         print(f"partition {p}: {start} -> {high} ({high - start} records)", flush=True)
+        if start >= high:
+            # Empty or already caught up: it will never deliver a message, so
+            # it would never enter `done` and the loop's own exit condition
+            # would be unreachable -- leaving only the idle/wall-clock guards.
+            done_at_start.add(p)
     consumer.assign(assignment)
 
     rows = []
-    done = set()
+    done = set(done_at_start)
     last_progress = time.time()
     started = time.time()
+    truncated = None
     while len(done) < len(partitions):
         if time.time() - started > WALL_CLOCK_LIMIT:
+            truncated = f"wall-clock limit ({WALL_CLOCK_LIMIT}s)"
             print(f"wall-clock limit reached with {len(done)}/{len(partitions)} "
                   f"partitions drained, stopping", flush=True)
             break
         msg = consumer.poll(1.0)
         if msg is None:
             if time.time() - last_progress > IDLE_LIMIT:
+                truncated = f"idle for {IDLE_LIMIT}s"
                 print("idle, stopping early", flush=True)
                 break
             continue
@@ -114,6 +123,8 @@ def main():
     sent = [r["sent_at"] for r in rows if isinstance(r.get("sent_at"), int)]
     print(json.dumps({
         "out": OUT,
+        "truncated": truncated,  # None means every partition reached its target
+        "partitions_drained": f"{len(done)}/{len(partitions)}",
         "records": len(rows),
         "broadcasters": len({r.get("broadcaster_id") for r in rows}),
         "span_minutes": round((max(sent) - min(sent)) / 60000, 1) if sent else None,

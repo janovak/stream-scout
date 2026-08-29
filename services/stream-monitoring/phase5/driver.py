@@ -51,6 +51,7 @@ import os
 import signal
 import statistics
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,7 +73,10 @@ from reconciler import (  # noqa: E402
     ReconcilerConfig,
     resolve_reconciler_config,
 )
-from eventsub_pool import EventSubPoolTransport  # noqa: E402
+from eventsub_pool import (  # noqa: E402
+    CHAT_MESSAGE_SUBSCRIPTION_TYPE,
+    EventSubPoolTransport,
+)
 from twitchAPI.type import AuthType  # noqa: E402
 
 TARGET_CHANNELS = int(os.environ.get("PHASE5_CHANNELS", "500"))
@@ -132,7 +136,8 @@ class Harness:
         self.twitch = twitch
         self.user_id = user_id
         self.client = client
-        self.messages = 0
+        self._messages = 0
+        self._message_lock = threading.Lock()
         self.lost_events = 0
         self.pass_sizes = []
         self.transport = None
@@ -141,7 +146,20 @@ class Harness:
 
     async def _on_message(self, event):
         # Counted and dropped. Nothing reaches Kafka from this process.
-        self.messages += 1
+        #
+        # Locked, not a bare `+= 1`: callbacks run on each socket's own loop,
+        # on its own thread (eventsub_pool's docstring says the handler must be
+        # safe to call from several at once), and a load-add-store across two
+        # connections drops increments. The count is a reported figure, so it
+        # should not quietly undercount. A lock per message is nothing against
+        # the socket work already done to deliver it.
+        with self._message_lock:
+            self._messages += 1
+
+    @property
+    def messages(self) -> int:
+        with self._message_lock:
+            return self._messages
 
     def _on_lost(self, lost):
         self.lost_events += 1
@@ -337,50 +355,76 @@ async def mode_restart(harness, channels):
     await harness.start(config)
     hit, final, elapsed, _watched = await sample_until(
         harness, len(channels), RAMP_TIMEOUT_SECONDS, [0.9, 0.99, 1.0])
-    # Count through Twitch directly, NOT through transport.list().
+    # Walk Twitch's own pages, not transport.list().
     #
-    # list() yields only subscriptions on a session this pool holds, by
-    # design. The subscriptions the SIGKILLed first process left behind sit on
-    # a session that died with it, so list() can never see them -- which makes
-    # `duplicates == 0` true by construction for precisely the cross-restart
-    # case SC-006 is about. Walking Twitch's own pages is the only way this
-    # check can fail, so it is the only way it means anything.
+    # Be precise about what this proves, because an earlier version of this
+    # comment overclaimed. SC-006 asks for "no duplicate subscriptions" after
+    # a restart, and there are two readings:
+    #
+    #   (a) no broadcaster has two subscriptions of any kind. Right after a
+    #       SIGKILL this is false by definition -- the dead process's
+    #       subscriptions linger until Twitch reaps them -- and it is not the
+    #       interesting property, because a subscription on a dead session
+    #       delivers nothing to anyone.
+    #   (b) no broadcaster has two subscriptions that can actually DELIVER.
+    #       That is the leak worth forbidding: two live sockets both feeding
+    #       one broadcaster's messages into the pipeline would double-count
+    #       and corrupt detection.
+    #
+    # This checks (b), and (b) is the criterion worth checking -- but note
+    # that it therefore CANNOT fail on a cross-restart pair, because the
+    # stranded half is by definition not deliverable. What it does catch is
+    # the pool creating two live subscriptions for one broadcaster in a single
+    # run, which is the routing bug that would actually hurt.
+    #
+    # `enabled_anywhere` below is reported alongside so the excluded
+    # population is visible rather than assumed: it counts broadcasters with
+    # two or more ENABLED rows across every session on the token. At the
+    # operating point that number is dominated by production, which shares
+    # this token and whose ~21 channels are a subset of the top 500 -- so a
+    # non-zero value there is expected and is not a failure.
     #
     # target_token=USER is mandatory. The library defaults to APP, and an app
     # token cannot see websocket subscriptions at all -- the call succeeds and
-    # returns an empty webhook list, which would put `duplicates == 0` back to
-    # true-by-construction for a new reason.
+    # returns an empty webhook list, which would make every count below zero.
     #
-    # Production shares this token and its channels are a subset of the top
-    # 500, so a broadcaster legitimately holds one subscription on production's
-    # session AND one on ours. Counting those together would report ~21 false
-    # duplicates. Only sessions this pool owns are ours.
+    # One blind spot worth naming: a pool socket mid-reconnect is absent from
+    # _live_session_ids(), so its enabled subscriptions read as foreign for
+    # that instant.
     ours = harness.transport._live_session_ids()
     enabled_ours = {}
+    enabled_anywhere = {}
     enabled_foreign = 0
+    not_enabled = 0
     seen = 0
     result = await harness.twitch.get_eventsub_subscriptions(
-        sub_type="channel.chat.message", target_token=AuthType.USER
+        sub_type=CHAT_MESSAGE_SUBSCRIPTION_TYPE, target_token=AuthType.USER
     )
     async for sub in result:
         seen += 1
         broadcaster = (getattr(sub, "condition", None) or {}).get("broadcaster_user_id")
-        if broadcaster is None or sub.status != "enabled":
-            # A stale `websocket_disconnected` row is not a duplicate: Twitch
-            # reaps those and they can deliver nothing.
+        if broadcaster is None:
             continue
+        if sub.status != "enabled":
+            # Stranded on a dead session; Twitch reaps these.
+            not_enabled += 1
+            continue
+        enabled_anywhere.setdefault(broadcaster, []).append(sub.id)
         session = (getattr(sub, "transport", None) or {}).get("session_id")
         if session in ours:
             enabled_ours.setdefault(broadcaster, []).append(sub.id)
         else:
             enabled_foreign += 1
 
-    # Two ENABLED subscriptions for one broadcaster on our own sessions is the
-    # leak SC-006 forbids.
+    # Two deliverable subscriptions for one broadcaster on our own sessions is
+    # the leak SC-006 forbids.
     duplicates = {b: ids for b, ids in enabled_ours.items() if len(ids) > 1}
+    multi_anywhere = sum(1 for ids in enabled_anywhere.values() if len(ids) > 1)
     record("T045_convergence", reached=final, seconds=elapsed, marks=hit,
            enabled_on_our_sessions=len(enabled_ours),
            enabled_on_other_sessions=enabled_foreign,  # production's, expected
+           not_enabled=not_enabled,  # orphans on the killed session
+           broadcasters_multi_enabled_anywhere=multi_anywhere,  # incl. production
            subscriptions_seen=seen,
            duplicates=len(duplicates),
            duplicate_detail=dict(list(duplicates.items())[:5]))
@@ -529,6 +573,12 @@ async def main():
                 break
             except asyncio.CancelledError:
                 record("cancel_during_teardown", note="ignored, teardown continues")
+            except Exception as exc:
+                # A network blip mid-teardown must not skip twitch.close(), and
+                # must not replace whatever the run itself raised -- that is
+                # the message saying why the run failed.
+                record("teardown_failed", error=repr(exc))
+                break
         await twitch.close()
 
 
