@@ -35,6 +35,12 @@ BROKER = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC = os.environ.get("PHASE5_TOPIC", "chat-messages")
 OUT = sys.argv[1] if len(sys.argv) > 1 else "phase5/post-cutover.jsonl"
 IDLE_LIMIT = float(os.environ.get("PHASE5_IDLE_LIMIT", "15"))
+# Hard ceiling on the drain. The done-set needs EVERY partition to reach its
+# target, but the idle guard only trips when NO partition is delivering -- so
+# one quiet partition alongside three busy ones would loop forever, growing
+# `rows` without bound. That is the blow-up the record bound exists to
+# prevent, arrived at from the other direction.
+WALL_CLOCK_LIMIT = float(os.environ.get("PHASE5_WALL_CLOCK_LIMIT", "300"))
 # Comparable to corpus/dev-slice.jsonl (264,867 records).
 TARGET_RECORDS = int(os.environ.get("PHASE5_TARGET_RECORDS", "260000"))
 
@@ -72,7 +78,12 @@ def main():
     rows = []
     done = set()
     last_progress = time.time()
+    started = time.time()
     while len(done) < len(partitions):
+        if time.time() - started > WALL_CLOCK_LIMIT:
+            print(f"wall-clock limit reached with {len(done)}/{len(partitions)} "
+                  f"partitions drained, stopping", flush=True)
+            break
         msg = consumer.poll(1.0)
         if msg is None:
             if time.time() - last_progress > IDLE_LIMIT:
@@ -86,8 +97,12 @@ def main():
             rows.append(json.loads(msg.value()))
         except Exception:
             pass
-        if msg.offset() >= targets[msg.partition()] - 1:
+        if msg.offset() >= targets[msg.partition()] - 1 and msg.partition() not in done:
             done.add(msg.partition())
+            # Stop fetching from a partition that has reached its target, so a
+            # busy one cannot keep the loop alive (and keep resetting the idle
+            # guard) while a quiet one is still short of its own.
+            consumer.pause([TopicPartition(TOPIC, msg.partition())])
     consumer.close()
 
     rows.sort(key=lambda r: r.get("timestamp") or 0)

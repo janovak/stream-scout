@@ -58,12 +58,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
-# `make_twitch` / `top_logins` are Phase 0's, reused rather than rewritten so
-# both phases authenticate and rank identically.
-sys.path.insert(0, str(HERE.parent / "phase0"))
 
 import redis  # noqa: E402
-from common import make_twitch, top_logins  # noqa: E402
+# phase5/common.py, not phase0's: `phase0/` is excluded per-clone through
+# .git/info/exclude and is in no clone but this machine's.
+from common import load_env, make_twitch, top_logins  # noqa: E402
 
 from reconciler import (  # noqa: E402
     DESIRED_GENERATION_KEY,
@@ -133,6 +132,7 @@ class Harness:
         self.pass_sizes = []
         self.transport = None
         self.reconciler = None
+        self.task = None
 
     async def _on_message(self, event):
         # Counted and dropped. Nothing reaches Kafka from this process.
@@ -159,14 +159,36 @@ class Harness:
         )
         self.task = asyncio.create_task(self.reconciler.run())
 
+    def reconciler_failure(self):
+        """The exception that killed the reconciler task, or None.
+
+        `Reconciler.run()` re-raises CancelledError but lets anything else
+        propagate into the task, where nothing would ever retrieve it. A dead
+        reconciler leaves `subscription_count` frozen, and a frozen count is
+        exactly what `sample_until` reads as convergence -- so without this a
+        crashed ramp records a smaller number as a clean plateau. This script
+        produced the SC-001/002/004/006 evidence; that failure mode is the one
+        worth refusing to have.
+        """
+        if self.task is None or not self.task.done():
+            return None
+        if self.task.cancelled():
+            return None
+        return self.task.exception()
+
     async def stop(self, delete_subscriptions=True):
         if self.reconciler is not None:
+            failure = self.reconciler_failure()
+            if failure is not None:
+                record("reconciler_died", error=repr(failure))
             self.reconciler.stop()
             self.task.cancel()
             try:
                 await self.task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception as exc:
+                record("reconciler_died", error=repr(exc))
         if self.transport is not None and delete_subscriptions:
             await self._delete_everything()
         if self.transport is not None:
@@ -193,6 +215,11 @@ async def sample_until(harness, target, deadline, marks):
     hit = {}
     last_count, stable_since = -1, None
     while time.monotonic() - t0 < deadline:
+        failure = harness.reconciler_failure()
+        if failure is not None:
+            record("reconciler_died", error=repr(failure),
+                   at_count=harness.reconciler.subscription_count)
+            raise RuntimeError(f"reconciler died mid-ramp: {failure!r}") from failure
         count = harness.reconciler.subscription_count
         elapsed = time.monotonic() - t0
         for mark in marks:
@@ -249,10 +276,16 @@ async def mode_ramp(harness, channels):
                occupancy=harness.transport.occupancy(), messages=harness.messages,
                lost_events=harness.lost_events)
 
+    if not samples:
+        # Under ~1 minute of sustain the loop never takes a sample. Say so
+        # rather than dying in min() with the T041 result already recorded.
+        record("T044_sustain", samples=0, minutes=SUSTAIN_MINUTES,
+               note="no samples taken -- sustain shorter than the 60 s sample interval")
+        return
     deviations = [abs(c - w) / w * 100 for c, w in samples if w]
     record("T044_sustain", samples=len(samples), minutes=SUSTAIN_MINUTES,
            subscriptions_min=min(c for c, _ in samples), subscriptions_max=max(c for c, _ in samples),
-           desired=samples[0][1] if samples else None,
+           desired=samples[0][1],
            deviation_max_pct=round(max(deviations), 3) if deviations else None,
            deviation_mean_pct=round(statistics.mean(deviations), 3) if deviations else None,
            messages_received=harness.messages, lost_events=harness.lost_events)
@@ -269,12 +302,37 @@ async def mode_restart(harness, channels):
     await harness.start(config)
     hit, final, elapsed = await sample_until(harness, len(channels), RAMP_TIMEOUT_SECONDS,
                                              [0.9, 0.99, 1.0])
+    # Count through Twitch directly, NOT through transport.list().
+    #
+    # list() yields only subscriptions on a session this pool holds, by
+    # design. The subscriptions the SIGKILLed first process left behind sit on
+    # a session that died with it, so list() can never see them -- which makes
+    # `duplicates == 0` true by construction for precisely the cross-restart
+    # case SC-006 is about. Walking Twitch's own pages is the only way this
+    # check can fail, so it is the only way it means anything.
     per_broadcaster = {}
-    async for sub in harness.transport.list():
-        per_broadcaster.setdefault(sub.broadcaster_id, []).append(sub.status)
-    duplicates = {b: s for b, s in per_broadcaster.items() if len(s) > 1}
+    enabled_per_broadcaster = {}
+    pages = 0
+    result = await harness.twitch.get_eventsub_subscriptions(
+        sub_type="channel.chat.message"
+    )
+    async for sub in result:
+        pages += 1
+        broadcaster = (getattr(sub, "condition", None) or {}).get("broadcaster_user_id")
+        if broadcaster is None:
+            continue
+        per_broadcaster.setdefault(broadcaster, []).append(sub.status)
+        if sub.status == "enabled":
+            enabled_per_broadcaster.setdefault(broadcaster, []).append(sub.id)
+
+    # A stale `websocket_disconnected` row is not a duplicate: Twitch reaps
+    # those on its own and they can deliver nothing. Two ENABLED subscriptions
+    # for one broadcaster is the leak SC-006 forbids.
+    duplicates = {b: ids for b, ids in enabled_per_broadcaster.items() if len(ids) > 1}
     record("T045_convergence", reached=final, seconds=elapsed, marks=hit,
-           live_broadcasters=len(per_broadcaster), duplicates=len(duplicates),
+           enabled_broadcasters=len(enabled_per_broadcaster),
+           subscriptions_seen=pages,
+           duplicates=len(duplicates),
            duplicate_detail=dict(list(duplicates.items())[:5]))
 
 
@@ -302,6 +360,14 @@ def mode_flatness(client, channels):
     set_a = channels[:TARGET_CHANNELS]
     set_b = channels[TARGET_CHANNELS : TARGET_CHANNELS * 2]
     assert not ({l for l, _ in set_a} & {l for l, _ in set_b}), "sets must be disjoint"
+    # Same size, or the "change everything" writes are smaller than the
+    # "change nothing" ones and the ratio is biased toward the PASS this
+    # criterion is testing for. Helix pagination runs short somewhere past
+    # 1000, so this is a real possibility, not a theoretical one.
+    assert len(set_b) == len(set_a), (
+        f"need {TARGET_CHANNELS * 2} live channels for a fair comparison, "
+        f"got {len(channels)}"
+    )
     full = {login: r for r, (login, _) in enumerate(set_a, 1)}
     ids = {login: int(bid) for login, bid in channels}
 
@@ -355,9 +421,7 @@ def mode_flatness(client, channels):
 
 async def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "ramp"
-    env = dict(l.strip().split("=", 1) for l in open(HERE.parents[2] / ".env") if "=" in l)
-    os.environ.setdefault("TWITCH_CLIENT_ID", env["TWITCH_CLIENT_ID"])
-    os.environ.setdefault("TWITCH_CLIENT_SECRET", env["TWITCH_CLIENT_SECRET"])
+    load_env()
 
     client = redis_client()
     twitch, user_id = await make_twitch()
@@ -372,12 +436,21 @@ async def main():
         return
 
     harness = Harness(twitch, user_id, client)
-    stopping = asyncio.Event()
 
-    def _sigterm(*_):
-        stopping.set()
+    # SIGTERM must reach the `finally` below, because that is what hands ~500
+    # subscriptions back. Cancelling the work task does; a handler that only
+    # sets a flag does NOT -- it replaces the default terminate behaviour, so
+    # the process ignores SIGTERM outright and a `kill` or `docker stop`
+    # mid-sustain leaks every subscription until Twitch reaps the session.
+    # SIGKILL still bypasses all of this, which is what T045 relies on.
+    work = asyncio.current_task()
 
-    signal.signal(signal.SIGTERM, _sigterm)
+    def _request_stop(*_):
+        record("signal_received", action="cancelling and tearing down")
+        work.cancel()
+
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
     try:
         if mode == "ramp":
             await mode_ramp(harness, channels)
@@ -385,8 +458,14 @@ async def main():
             await mode_restart(harness, channels)
         else:
             raise SystemExit(f"unknown mode {mode}")
+    except asyncio.CancelledError:
+        record("cancelled", note="tearing down before exit")
     finally:
-        await harness.stop(delete_subscriptions=True)
+        # Shielded: teardown itself must survive the cancellation that got us
+        # here, or the signal path leaks exactly what it exists to clean up.
+        await asyncio.shield(
+            asyncio.ensure_future(harness.stop(delete_subscriptions=True))
+        )
         await twitch.close()
 
 
