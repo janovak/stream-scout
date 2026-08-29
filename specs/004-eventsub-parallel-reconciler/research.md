@@ -252,6 +252,17 @@ this sample lands in that window as far as the `hold_regressed` evidence below
 can tell, but the bound is not unconditional and should not be quoted as if it
 were.
 
+**And the constant that gap depends on is itself unmeasured.**
+`WATERMARK_IDLENESS_SECONDS` is 10 because the KNOWN_ISSUES Issue 4 fix needed
+something far below 60, not because anyone measured how long a live
+broadcaster's chat can fall silent — the quantity that actually bounds it.
+Spec 004 did not change the value; it is outside this feature's scope, it is
+working (5+ hours on the deployed job with zero `hold_regressed` events), and
+lowering it is the risky direction. But the old justification in its comment
+was wrong and removing it did not supply a right one, so the constant now
+carries an explicit "unmeasured, and here is what would measure it" note.
+Recorded here so SC-005's headroom is not read as covering a case it does not.
+
 **Getting the test right took two corrections**, both found in code review, and
 both in the direction of flattering the result. Bucket `b`'s timer is at
 `b*1000` and fires when the watermark (`max_sent_at - OOO - 1`) reaches it, so

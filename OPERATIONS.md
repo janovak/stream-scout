@@ -27,6 +27,8 @@ There is nothing to submit by hand and no `-pyFiles` command to run. To restart 
 docker compose restart flink-jobmanager
 ```
 
+If you are restarting to pick up a **code change**, use `--force-recreate` instead — a plain restart does not re-resolve a single-file bind mount. See "Note on image rebuilds" below.
+
 `-pyFiles` (here, `-pyfs`) comes from the `FLINK_PYFILES` environment variable in `docker-compose.yml`, not hardcoded in the entrypoint script. Changing which files it lists needs no image rebuild — see "Adding a new Python module" below.
 
 ---
@@ -134,7 +136,27 @@ Open http://localhost:8081 for the Flink dashboard, and http://localhost:3000 (`
 ```bash
 docker compose build flink-jobmanager flink-taskmanager
 ```
-The four `.py` job files and `secrets/` are bind-mounted instead. See the `volumes:` section for `flink-jobmanager` in `docker-compose.yml`. Editing those needs only a restart, not a rebuild.
+The four `.py` job files and `secrets/` are bind-mounted instead. See the `volumes:` section for `flink-jobmanager` in `docker-compose.yml`. Editing those needs no rebuild.
+
+**But a restart is not always enough — use `--force-recreate` after anything that replaces the file.** Those `.py` files are bind-mounted **individually**, and a single-file bind mount follows the **inode**, not the path. Docker resolves it when the container is *created*. So any edit that writes a new file in place of the old one — `git checkout`, `git switch`, `sed -i`, an editor that saves by write-and-rename — leaves the container holding the old inode. The host file reads the new content and the container keeps running the old, with no error anywhere:
+
+```bash
+docker compose up -d --force-recreate flink-jobmanager flink-taskmanager
+```
+
+Editing a file *in place* (appending, or an editor that truncates and rewrites the same inode) does survive a plain `docker compose restart`. Do not rely on knowing which kind of edit you just made.
+
+**This has already bitten once.** After spec 004 Phase 3 merged, `stream-monitoring` went on running the Phase-2-era service — IRC client still in it — for hours, because the branch checkout replaced `stream_monitoring_service.py` and the container kept the old inode. It was found only by comparing checksums. See `specs/004-eventsub-parallel-reconciler/research.md`, "Deployment trap found while verifying".
+
+**Verify the deploy rather than assuming it.** Read the value back out of the running container:
+```bash
+docker exec streamscout-stream-monitoring md5sum /app/stream_monitoring_service.py
+md5sum services/stream-monitoring/stream_monitoring_service.py    # must match
+
+docker exec streamscout-flink-jobmanager python3 -c \
+  "import sys; sys.path.insert(0,'/opt/flink/usrlib'); import spike_detector as s; \
+   print(s.WATERMARK_OUT_OF_ORDERNESS_SECONDS, s.WATERMARK_IDLENESS_SECONDS)"
+```
 
 ---
 

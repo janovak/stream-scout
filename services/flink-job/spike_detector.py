@@ -125,7 +125,25 @@ WATERMARK_OUT_OF_ORDERNESS_SECONDS = 2
 # The 226ms IRC out-of-orderness figure this comment used to cite is the wrong
 # input for that choice, and it is also stale: spec 004 measured worst
 # inversions above 1s on EventSub (research.md, Phase 4 T038). Do not size
-# this constant off either number. Not shared with tools/replay.py: that
+# this constant off either number.
+#
+# UNMEASURED, and deliberately left so (spec 004, 2026-08-29). Removing the
+# wrong justification did not supply a right one: 10 is inherited from the
+# KNOWN_ISSUES Issue 4 fix, where the only requirement was "far below 60".
+# Nothing has measured the distribution of inter-message gaps for a live
+# broadcaster, which is the quantity that actually bounds this. It is left at
+# 10 because it is working -- 5+ hours on the deployed job with zero
+# `hold_regressed` events -- and because lowering it is the risky direction.
+#
+# This is a real hole in SC-005's guarantee, not a cosmetic one: a split
+# marked idle leaves the watermark minimum, so the operator watermark can run
+# AHEAD of that split, and records arriving after that are late in a way the
+# 0.0041% figure does not bound (research.md, Phase 4 T038, the idleness
+# exception). Measuring it needs per-broadcaster silence-gap data. Whoever
+# picks that up: measure the gaps first, then set this, and do not reuse an
+# out-of-orderness number for it.
+#
+# Not shared with tools/replay.py: that
 # harness fires timers off a min-heap in strictly non-decreasing order and
 # has no split-idleness concept to model.
 WATERMARK_IDLENESS_SECONDS = 10

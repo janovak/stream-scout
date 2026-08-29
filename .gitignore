@@ -83,5 +83,11 @@ services/flink-job/corpus/
 services/stream-monitoring/phase0/
 services/stream-monitoring/phase5/
 
+# Local working notes, never meant to be tracked. The file has said so since
+# 2026-08-24 and also recorded that nothing enforced it -- it sat one
+# `git add -A` from being committed, and it carries token-file permission
+# internals and host paths. This is the rule it asked for.
+KNOWN_ISSUES.md
+
 # Agent-created git worktrees (full duplicate checkouts)
 .claude/worktrees/
