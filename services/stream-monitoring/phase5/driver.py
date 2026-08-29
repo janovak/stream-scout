@@ -73,6 +73,7 @@ from reconciler import (  # noqa: E402
     resolve_reconciler_config,
 )
 from eventsub_pool import EventSubPoolTransport  # noqa: E402
+from twitchAPI.type import AuthType  # noqa: E402
 
 TARGET_CHANNELS = int(os.environ.get("PHASE5_CHANNELS", "500"))
 SUSTAIN_MINUTES = float(os.environ.get("PHASE5_SUSTAIN_MINUTES", "31"))
@@ -268,6 +269,16 @@ async def mode_ramp(harness, channels):
     samples = []
     while time.monotonic() < deadline:
         await asyncio.sleep(60)
+        # Same hazard sample_until guards, and worse here: a reconciler that
+        # dies mid-sustain freezes subscription_count against a static desired
+        # set, so every remaining sample records deviation 0.0% -- the
+        # strongest possible SC-004 result, produced by a dead process.
+        failure = harness.reconciler_failure()
+        if failure is not None:
+            record("reconciler_died", error=repr(failure),
+                   at_count=harness.reconciler.subscription_count,
+                   samples_so_far=len(samples))
+            raise RuntimeError(f"reconciler died mid-sustain: {failure!r}") from failure
         count = harness.reconciler.subscription_count
         want = harness.client.zcard(DESIRED_KEY)
         samples.append((count, want))
@@ -294,8 +305,15 @@ async def mode_ramp(harness, channels):
 async def mode_restart(harness, channels):
     """T045: converge, then confirm no broadcaster holds two live subscriptions.
 
-    The kill itself is external (see run_restart below). This mode is what runs
-    on the SECOND start, against subscriptions the first process left behind.
+    The kill itself is external -- this mode is only the SECOND start. The
+    sequence is:
+
+        python phase5/driver.py ramp &          # let it climb
+        kill -9 <pid>                           # mid-ramp, no teardown
+        python phase5/driver.py restart         # this mode
+
+    It runs against the subscriptions the killed process left behind, which
+    sit on a session that died with it.
     """
     write_desired(harness.client, channels)
     config = resolve_reconciler_config()
@@ -310,28 +328,43 @@ async def mode_restart(harness, channels):
     # `duplicates == 0` true by construction for precisely the cross-restart
     # case SC-006 is about. Walking Twitch's own pages is the only way this
     # check can fail, so it is the only way it means anything.
-    per_broadcaster = {}
-    enabled_per_broadcaster = {}
-    pages = 0
+    #
+    # target_token=USER is mandatory. The library defaults to APP, and an app
+    # token cannot see websocket subscriptions at all -- the call succeeds and
+    # returns an empty webhook list, which would put `duplicates == 0` back to
+    # true-by-construction for a new reason.
+    #
+    # Production shares this token and its channels are a subset of the top
+    # 500, so a broadcaster legitimately holds one subscription on production's
+    # session AND one on ours. Counting those together would report ~21 false
+    # duplicates. Only sessions this pool owns are ours.
+    ours = harness.transport._live_session_ids()
+    enabled_ours = {}
+    enabled_foreign = 0
+    seen = 0
     result = await harness.twitch.get_eventsub_subscriptions(
-        sub_type="channel.chat.message"
+        sub_type="channel.chat.message", target_token=AuthType.USER
     )
     async for sub in result:
-        pages += 1
+        seen += 1
         broadcaster = (getattr(sub, "condition", None) or {}).get("broadcaster_user_id")
-        if broadcaster is None:
+        if broadcaster is None or sub.status != "enabled":
+            # A stale `websocket_disconnected` row is not a duplicate: Twitch
+            # reaps those and they can deliver nothing.
             continue
-        per_broadcaster.setdefault(broadcaster, []).append(sub.status)
-        if sub.status == "enabled":
-            enabled_per_broadcaster.setdefault(broadcaster, []).append(sub.id)
+        session = (getattr(sub, "transport", None) or {}).get("session_id")
+        if session in ours:
+            enabled_ours.setdefault(broadcaster, []).append(sub.id)
+        else:
+            enabled_foreign += 1
 
-    # A stale `websocket_disconnected` row is not a duplicate: Twitch reaps
-    # those on its own and they can deliver nothing. Two ENABLED subscriptions
-    # for one broadcaster is the leak SC-006 forbids.
-    duplicates = {b: ids for b, ids in enabled_per_broadcaster.items() if len(ids) > 1}
+    # Two ENABLED subscriptions for one broadcaster on our own sessions is the
+    # leak SC-006 forbids.
+    duplicates = {b: ids for b, ids in enabled_ours.items() if len(ids) > 1}
     record("T045_convergence", reached=final, seconds=elapsed, marks=hit,
-           enabled_broadcasters=len(enabled_per_broadcaster),
-           subscriptions_seen=pages,
+           enabled_on_our_sessions=len(enabled_ours),
+           enabled_on_other_sessions=enabled_foreign,  # production's, expected
+           subscriptions_seen=seen,
            duplicates=len(duplicates),
            duplicate_detail=dict(list(duplicates.items())[:5]))
 

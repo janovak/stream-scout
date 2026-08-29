@@ -425,7 +425,7 @@ at all: production's `REDIS_URL` points at a different instance entirely.
 | **SC-003** | T043 | **PASS**. Zero `Bucket channel_join got rate limited`, and zero rate-limit lines of any kind | production, 21–24 channels |
 | **SC-004** | T044 | **PASS**. 31 minutes, 26 one-minute samples, subscriptions **499 constant** against a desired 500. Deviation **0.2%** against a ±1% budget, 0 lost-socket events, 181,180 messages received | **500 channels** |
 | **SC-005** | T038 | **PASS**. 0.0041% past the 2 s watermark — 2 records in 48,915 over two windows, budget 0.1%. The same samples put 1 s at ~0.60%, six times over budget | 21–23 broadcasters |
-| **SC-006** | T045 | **PASS**. Killed mid-ramp at ~250–350 of 500 with `SIGKILL`; restart converged to **499/500 in 74 s**. No duplicates — see the note below on which check carries that | **500 channels** |
+| **SC-006** | T045 | **PASS**. Killed mid-ramp at ~265 of 500 with `SIGKILL`; restart converged to **499/500**, 99% at 94 s. Page walk over all **888** subscriptions on the token: **0 broadcasters holding two enabled subscriptions** on this pool's sessions | **500 channels** |
 | **SC-007** | T044a | **PASS**. All five FR-012 metrics present on `/metrics` with HELP/TYPE and live values | production |
 
 **SC-004's single delta is attributed.** The 499-vs-500 gap held constant for
@@ -443,17 +443,29 @@ could never have seen them: `duplicates == 0` was true by construction for
 exactly the cross-restart case SC-006 names. That was found in review, and the
 driver now enumerates through Twitch directly instead.
 
-What carries SC-006 is the direct page walk done after the runs: every
-subscription on the auth user, paged through Twitch's own API. It showed **21
-enabled on one session, across 21 distinct broadcasters, zero broadcasters
-holding two enabled subscriptions**, with the rest `websocket_disconnected`
-leftovers from the killed sessions that Twitch reaps on its own. The production
-half was checked the same way: container `SIGKILL`ed and restarted, converged
-to 21 of 21, no duplicate.
+The check now walks Twitch's own pages with a **USER** token — the library
+defaults to an app token, which cannot see websocket subscriptions at all and
+would have returned an empty list, putting `duplicates == 0` back to
+true-by-construction for a new reason — and scopes by session, because
+production shares this token and its channels are a subset of the top 500, so
+counting its subscriptions alongside ours would have reported ~21 false
+duplicates.
 
-The 500-channel restart took 74 s against the 51 s cold start because the
-killed ramp had already spent part of the create budget — the behaviour T003b
-measured, not a regression.
+**Re-run with the corrected check, 2026-08-29**: `SIGKILL` mid-ramp at ~265 of
+500, restart converged to **499/500** with 99% at 94 s. The walk saw **888
+subscriptions** on the token — 499 on this pool's sessions, 22 on production's,
+and the remainder orphans stranded on the session that died with the killed
+process — and found **zero broadcasters holding two enabled subscriptions on
+this pool's sessions**. A result that could have failed, over a population that
+includes the orphans the earlier check could not see.
+
+The production half was checked the same way: container `SIGKILL`ed and
+restarted, converged to 21 of 21, 21 enabled on one session across 21 distinct
+broadcasters, no duplicate.
+
+The 500-channel restart is slower than the 51 s cold start (74 s on the first
+run, 94 s on this one) because the killed ramp had already spent part of the
+create budget — the behaviour T003b measured, not a regression.
 
 **T044a detail.** `subscription_create_failures_total` carries HELP and TYPE but
 no series while nothing has failed, which is this exporter's

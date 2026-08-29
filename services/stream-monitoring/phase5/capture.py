@@ -3,8 +3,9 @@
 
 `chat-messages` keeps one hour (`retention.ms=3600000`), so the whole retained
 log is post-cutover already -- EventSub replaced IRC at 2026-08-28 16:43:40Z.
-This drains every partition from its log start to the high watermark it had at
-start-up, then writes the records in ingestion (`timestamp`) order.
+This reads the newest `PHASE5_TARGET_RECORDS` from each partition (see the
+bound described below, which is not optional) and writes them in ingestion
+(`timestamp`) order.
 
 The sort matters. `tools/replay.py` models one global watermark as the running
 maximum of `sent_at` over the file in file order, so the interleaving of
