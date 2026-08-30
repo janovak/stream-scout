@@ -573,6 +573,13 @@ class Reconciler:
         # and after its enumeration so a loss that lands mid-walk is not
         # thrown away by the completion that follows it.
         self._invalidations = 0
+        # Subscriptions the transport has reported lost that no enumeration has
+        # accounted for yet. `_actual` cannot be pruned on a loss -- the
+        # transport reports a count, not which channels -- so this is what
+        # keeps `eventsub_subscription_count` from going on reporting them. It
+        # accumulates, because several revocations can land between two passes,
+        # and it is cleared only by a clean walk.
+        self._unreconciled_losses = 0
         # When the actual set was last rebuilt from Twitch, for the periodic
         # re-check. -inf so the first pass always adopts.
         self._last_adopt = float("-inf")
@@ -615,15 +622,15 @@ class Reconciler:
 
         `lost_subscriptions` is how many went with the loss, and it is what
         makes that drop real. `_actual` cannot be pruned here -- the transport
-        reports a count, not which channels -- but the gauge must not go on
-        reporting subscriptions Twitch no longer has. Without this the dip did
-        not exist to be alerted on: the gauge was written once, at the END of a
-        pass, so a loss followed by a successful re-create moved it from a
-        value back to the same value and no scrape could see it. Worse, if the
-        re-enumeration then failed -- and a blip that kills a socket is exactly
-        what fails a walk -- `_adopt` deliberately merges the stale entries
-        back in, so the healthy-looking count survived pass after pass.
-        The next successful enumeration sets the exact figure.
+        reports a count, not which channels -- so the count is carried in
+        `_unreconciled_losses` and subtracted until a clean walk settles it.
+        Without this the dip did not exist to be alerted on: the gauge was
+        written once, at the END of a pass, so a loss followed by a successful
+        re-create moved it from a value back to the same value and no scrape
+        could see it. Worse, if the re-enumeration then failed -- and a blip
+        that kills a socket is exactly what fails a walk -- `_adopt`
+        deliberately merges the stale entries back in, so the healthy-looking
+        count survived pass after pass.
 
         Drops stay switched off until an enumeration succeeds, so a failure to
         re-enumerate cannot turn into a mass delete.
@@ -631,9 +638,8 @@ class Reconciler:
         self._adoption_complete = False
         self._invalidations += 1
         if lost_subscriptions > 0:
-            eventsub_subscription_count.set(
-                max(0, len(self._actual) - lost_subscriptions)
-            )
+            self._unreconciled_losses += lost_subscriptions
+            self._publish_subscription_count()
         # Clear any failed-enumeration backoff. Round 7 added that backoff and
         # claimed in a comment that a socket loss "does not come through here"
         # -- it does: the gate in `reconcile_once` covers every adoption path.
@@ -762,7 +768,7 @@ class Reconciler:
         await self._drop_all(to_drop)
         await self._create_all(to_create)
 
-        eventsub_subscription_count.set(len(self._actual))
+        self._publish_subscription_count()
         self._publish_occupancy()
         reconcile_duration_seconds.observe(time.monotonic() - started)
         # "Ran to completion", not "had no failures". A pass where individual
@@ -913,6 +919,9 @@ class Reconciler:
         if complete and not invalidated_during:
             self._actual = adopted
             self._adoption_complete = True
+            # A clean walk IS the reconciliation: `adopted` is what Twitch says
+            # exists on a session this pool holds, so nothing is outstanding.
+            self._unreconciled_losses = 0
         elif complete:
             # A connection was lost while this enumeration ran. What it saw is
             # still the freshest view available, so keep it -- but leave the
@@ -939,7 +948,7 @@ class Reconciler:
         # The freshest count there is, and available before the creates below
         # start: a loss is now visible as soon as the walk that confirms it
         # finishes, rather than at the end of the whole pass.
-        eventsub_subscription_count.set(len(self._actual))
+        self._publish_subscription_count()
 
         logger.info(
             "Adopted existing subscriptions",
@@ -1014,7 +1023,7 @@ class Reconciler:
             return
         subscription_id = await self.transport.create(broadcaster_id)
         self._actual[broadcaster_id] = subscription_id
-        eventsub_subscription_count.set(len(self._actual))
+        self._publish_subscription_count()
         if broadcaster_id in self._rechecking_refusals:
             # The channel refused more than REFUSAL_RECHECK_DAYS ago and has
             # just accepted. Clear the mark so it is a normal channel again.
@@ -1031,7 +1040,7 @@ class Reconciler:
             return
         await self.transport.delete(subscription_id)
         self._actual.pop(broadcaster_id, None)
-        eventsub_subscription_count.set(len(self._actual))
+        self._publish_subscription_count()
 
     async def _run_batch(self, broadcaster_ids: Iterable[int], handler, operation: str):
         """Run `handler` over the ids on a fixed pool of workers.
@@ -1195,6 +1204,21 @@ class Reconciler:
         if self.refusal_store is None:
             return
         self.refusal_store.clear_refusal(broadcaster_id)
+
+    def _publish_subscription_count(self):
+        """The FR-012 gauge, from every place the live count can change.
+
+        `len(self._actual)` alone is not the live count between a reported loss
+        and the walk that confirms it: those subscriptions are gone from Twitch
+        but still in `_actual`, because the transport reports how many went,
+        not which. Subtracting the unreconciled losses is what makes the dip
+        the runbook alerts on real -- and it survives a failed enumeration,
+        where `_adopt` deliberately merges the stale entries back and would
+        otherwise re-inflate the gauge to the value the loss just corrected.
+        """
+        eventsub_subscription_count.set(
+            max(0, len(self._actual) - self._unreconciled_losses)
+        )
 
     def _publish_occupancy(self):
         try:

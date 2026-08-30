@@ -526,43 +526,65 @@ class EventSubPoolTransport(SubscriptionTransport):
                     f"broadcaster {broadcaster_id}"
                 )
             session_now = self._session_id(connection)
-            if (
+            reconnected = (
                 session_before is not None
                 and session_now is not None
                 and session_before != session_now
-            ):
-                # The socket reconnected while this create was in flight. The
-                # subscription that came back belongs to a session Twitch has
-                # already closed, and `_resubscribe()` only re-creates what was
-                # in the registry when it took its snapshot -- so a create that
-                # landed after that moment is gone and nothing will restore it.
-                # Drop the library's entry (or the next reconnect resurrects a
-                # dead id) and let the channel be retried on the live session.
-                self._forget_library_subscription(connection, subscription_id)
-                logger.warning(
-                    "Connection reconnected mid-create, discarding the subscription",
-                    extra={
-                        "broadcaster_id": broadcaster_id,
-                        "connection": connection.connection_id,
-                        "subscription_id": subscription_id,
-                        "session_at_create": session_before,
-                        "session_now": session_now,
-                    },
-                )
-                raise TransportError(
-                    f"connection {connection.connection_id} reconnected while "
-                    f"subscribing broadcaster {broadcaster_id}"
-                )
-            slot = _Slot(
-                broadcaster_id,
-                connection.connection_id,
-                subscription_id,
-                session_before,
             )
-            connection.subscription_ids.add(subscription_id)
-            self._slots[broadcaster_id] = slot
-            self._by_subscription[subscription_id] = slot
-        return subscription_id
+            if not reconnected:
+                slot = _Slot(
+                    broadcaster_id,
+                    connection.connection_id,
+                    subscription_id,
+                    session_before,
+                )
+                connection.subscription_ids.add(subscription_id)
+                self._slots[broadcaster_id] = slot
+                self._by_subscription[subscription_id] = slot
+
+        if not reconnected:
+            return subscription_id
+
+        # The socket reconnected while this create was in flight, and which
+        # session the subscription landed on cannot be known from out here.
+        # `_subscribe` reads the session when it builds the POST body, so a
+        # reconnect that finished before that moment put it on the NEW session
+        # -- live, with a callback -- and one that finished after put it on the
+        # old one, where `_resubscribe()` will not restore it because it only
+        # re-creates what the registry held when it took its snapshot.
+        #
+        # Deleting covers both. A subscription on the dead session answers
+        # "not found", which `_delete_one` already treats as success; a live
+        # one is removed and re-created cleanly on the next pass. Guessing
+        # instead was worse in one direction than the other: dropping the
+        # library's callback for a subscription that turned out to be LIVE
+        # left it delivering into nothing, and the next pass would take
+        # Twitch's 409 and adopt it -- `_adopt_conflict` restores the pool's
+        # indexes but not the library's callback -- so the channel was counted
+        # as covered and dark for good. That is the exact failure this whole
+        # check exists to prevent.
+        #
+        # The delete runs OUTSIDE the lock (it is a Twitch round trip) and
+        # BEFORE the registry is cleared. If it fails, the registry entry
+        # stays, which is the safe side of that error: on the live-session
+        # branch the subscription and its callback are both still intact and
+        # the next enumeration simply adopts a working subscription.
+        logger.warning(
+            "Connection reconnected mid-create, discarding the subscription",
+            extra={
+                "broadcaster_id": broadcaster_id,
+                "connection": connection.connection_id,
+                "subscription_id": subscription_id,
+                "session_at_create": session_before,
+                "session_now": session_now,
+            },
+        )
+        await self._delete_one(subscription_id)
+        self._forget_library_subscription(connection, subscription_id)
+        raise TransportError(
+            f"connection {connection.connection_id} reconnected while "
+            f"subscribing broadcaster {broadcaster_id}"
+        )
 
     async def delete(self, subscription_id: str) -> None:
         """Remove a subscription. Already gone is success, not an error (T024).
@@ -814,9 +836,27 @@ class EventSubPoolTransport(SubscriptionTransport):
         `ClientSession` and its file descriptors -- and invisibly, because the
         connection is never appended to `self._connections`, so neither
         `reap_dead_connections()` nor `aclose()` could see it.
+
+        Nor is THAT enough on its own. Before `_keep_loop_alive` runs at all,
+        `_run_socket` sits in `run_until_complete(self._connect(is_startup=
+        True))`, and `_connect` never looks at `_closing`: it retries the
+        connect through `reconnect_delay_steps`, catching every failure --
+        including the AttributeError from the session this teardown has just
+        set to None -- and sleeping between them. That ladder is
+        `[0, 1, 2, 4, 8, 16, 32, 64, 128]`, so a socket abandoned during a
+        FAILING connect kept a non-daemon thread alive for up to 255 s, and
+        `threading._shutdown` joins it at interpreter exit: SIGTERM would sit
+        there rather than exiting. Emptying the ladder ends that loop at its
+        next condition check -- `retry >= len(...)` is then true, so `_connect`
+        raises and `_run_socket` unwinds -- which bounds the thread by whatever
+        sleep is already in progress instead of by the whole ladder.
         """
         websocket._startup_complete = True
         websocket._running = False
+        try:
+            websocket.reconnect_delay_steps = []
+        except Exception:  # pragma: no cover -- a double without the attribute
+            pass
         self._tear_down_socket(websocket)
 
     # -- events -----------------------------------------------------------

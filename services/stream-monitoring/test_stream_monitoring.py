@@ -1671,6 +1671,47 @@ class TestReconcilerMetrics:
             f"the gauge did not move during the ramp (samples {seen})"
         )
 
+    def test_repeated_losses_between_passes_accumulate(self):
+        """Several revocations can land before the next enumeration. Deriving
+        the dip from `len(_actual)` each time reported the SAME value for all
+        of them -- the set does not shrink on a loss, because the transport
+        says how many went, not which -- so three losses looked like one."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [(f"c{i}", i) for i in range(1, 6)])
+        reconciler = make_reconciler(StubTransport(), fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+        for _ in range(3):
+            reconciler.invalidate_actual_set(1)
+
+        assert reconciler_module.eventsub_subscription_count._value.get() == 2
+
+    def test_a_failed_walk_does_not_re_inflate_the_count(self):
+        """`_adopt` merges what it saw into what it had when a walk fails, so
+        the lost subscriptions are still in `_actual`. Publishing
+        `len(_actual)` there would undo the dip on the very next pass and
+        restore the healthy-looking count for as long as the walks keep
+        failing -- which is the state this alert exists to catch."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [(f"c{i}", i) for i in range(1, 6)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
+
+        asyncio.run(reconciler.reconcile_once())
+        reconciler.invalidate_actual_set(3)
+        transport.list_fails_after = 0
+        asyncio.run(reconciler.reconcile_once())
+
+        assert reconciler_module.eventsub_subscription_count._value.get() == 2, (
+            "a failed enumeration restored the count the loss had corrected"
+        )
+        # And a clean walk settles it exactly, once the failed walk's backoff
+        # has expired.
+        transport.list_fails_after = None
+        reconciler._adopt_retry_after = float("-inf")
+        asyncio.run(reconciler.reconcile_once())
+        assert reconciler_module.eventsub_subscription_count._value.get() == 5
+
     def test_last_success_timestamp_advances_on_a_good_pass(self):
         fake_redis = FakeRedis()
         seed_desired(fake_redis, [("a", 1)])
@@ -1931,6 +1972,29 @@ class TestReconcilerLifecycle:
 
         asyncio.run(run())
 
+    def test_a_cancellation_aimed_at_start_is_not_swallowed(self):
+        """`start()` treats a `CancelledError` from awaiting the start-up task
+        as "shutdown cancelled me". Only `stop()` does that, and it sets
+        `_stopping` first -- any other cancellation is aimed at `start()`
+        itself and passing through, so swallowing it would break cancellation
+        for whoever asked for it."""
+
+        async def run():
+            service = StreamMonitoringService()
+
+            async def slow_initialize():
+                await asyncio.sleep(60)
+
+            service.initialize = slow_initialize
+            starter = asyncio.create_task(service.start())
+            await asyncio.sleep(0.02)
+            starter.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await starter
+
+        asyncio.run(run())
+
     def test_stop_cancels_the_reconciler_before_closing_redis(self):
         service = StreamMonitoringService()
         fake_redis = FakeRedis()
@@ -2019,6 +2083,9 @@ class FakeWebsocket:
         self._running = True
         self._closing = False
         self._socket_thread = None
+        # The real ladder `_connect` walks, mirrored so a test can see it
+        # emptied rather than merely set.
+        self.reconnect_delay_steps = [0, 1, 2, 4, 8, 16, 32, 64, 128]
         self._next_id = 0
         self.started = False
         self.stopped = False
@@ -2964,6 +3031,11 @@ class TestPoolRaces:
             assert opened[0]._closing is True, (
                 "the abandoned socket's keep-alive loop was left spinning"
             )
+            assert opened[0].reconnect_delay_steps == [], (
+                "`_connect` ignores `_closing`, so a socket abandoned during a "
+                "failing connect keeps a non-daemon thread through the whole "
+                "255 s retry ladder and SIGTERM hangs joining it"
+            )
             assert pool._connections == [], "a half-open socket joined the pool"
 
         asyncio.run(run())
@@ -3016,6 +3088,100 @@ class TestPoolRaces:
             websocket.listen_channel_chat_message = original_listen
             assert await pool.create(7)
             assert pool._slots[7].session_id == "session-after-reconnect"
+
+        asyncio.run(run())
+
+    def test_a_reconnect_mid_create_deletes_rather_than_guessing(self):
+        """Which session the subscription landed on cannot be known out here.
+
+        `_subscribe` reads the session when it builds the POST body, so a
+        reconnect that finished BEFORE that moment puts the subscription on the
+        NEW session -- live, with a callback -- and one that finished after
+        puts it on the old one. Both look identical from the pool: the session
+        changed across the await.
+
+        Guessing "it is dead" and only dropping the library's callback was
+        wrong for the live case: the subscription went on existing while the
+        library had no callback for it, so it delivered into nothing, and the
+        next pass took Twitch's 409 and adopted it -- `_adopt_conflict`
+        restores the pool's indexes but not the callback -- leaving the channel
+        counted and dark. Deleting is correct either way: the dead one answers
+        "not found", the live one is removed and re-created cleanly.
+        """
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_pool(twitch=twitch)
+            await pool.start()
+            await pool._grow()
+            connection = pool._connections[0]
+            websocket = connection.websocket
+            original_listen = websocket.listen_channel_chat_message
+
+            async def reconnect_during_create(broadcaster_user_id, user_id, callback):
+                subscription_id = await original_listen(
+                    broadcaster_user_id, user_id, callback
+                )
+                websocket.active_session = type(
+                    "Session", (), {"id": "session-after-reconnect"}
+                )()
+                return subscription_id
+
+            websocket.listen_channel_chat_message = reconnect_during_create
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+
+            assert twitch.deleted, (
+                "the subscription was abandoned without being deleted, so a live "
+                "one would linger with no callback and be adopted as covered"
+            )
+            assert pool._slots == {}
+            assert websocket._active_subscriptions == {}
+            assert connection.reserved == 0, "the reservation outlived the create"
+
+        asyncio.run(run())
+
+    def test_a_failed_delete_leaves_the_library_registry_alone(self):
+        """The safe side of that error. If the DELETE fails we cannot know the
+        subscription is gone, so the callback must stay: on the live-session
+        branch it and the subscription are both still intact, and the next
+        enumeration simply adopts something that works. Clearing it first
+        would have thrown that away on a transient API error."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_pool(twitch=twitch)
+            await pool.start()
+            await pool._grow()
+            connection = pool._connections[0]
+            websocket = connection.websocket
+            original_listen = websocket.listen_channel_chat_message
+
+            async def reconnect_during_create(broadcaster_user_id, user_id, callback):
+                subscription_id = await original_listen(
+                    broadcaster_user_id, user_id, callback
+                )
+                websocket.active_session = type(
+                    "Session", (), {"id": "session-after-reconnect"}
+                )()
+                return subscription_id
+
+            websocket.listen_channel_chat_message = reconnect_during_create
+
+            async def failing_delete(subscription_id, target_token=None):
+                raise eventsub_pool.TwitchAPIException("twitch 503")
+
+            twitch.delete_eventsub_subscription = failing_delete
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+
+            assert websocket._active_subscriptions, (
+                "the callback was dropped for a subscription that may still be live"
+            )
+            assert pool._slots == {}
+            assert connection.reserved == 0
 
         asyncio.run(run())
 

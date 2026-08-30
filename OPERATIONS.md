@@ -57,9 +57,15 @@ container**:
   or every 5 s, whichever comes first.
 
 **There is no separate container or service to start, stop, or check.** If
-`stream-monitoring` is up, the reconciler is up. Restarting the container
-restarts it, and it converges from whatever state it finds — existing
-subscriptions are adopted, not duplicated.
+`stream-monitoring` is up **and it had a usable user token at start-up**, the
+reconciler is up. That qualifier matters: with no token file, or one that is
+expired, scope-reduced or hand-edited, the service deliberately keeps running
+with the poller alone and **no reconciler at all** — it logs `No user
+authentication, so no chat transport and no reconciler` at ERROR and `/health`
+still returns OK. A green container is therefore not by itself proof that chat
+is being ingested; `eventsub_subscription_count` is. Restarting the container
+restarts the reconciler, and it converges from whatever state it finds —
+existing subscriptions are adopted, not duplicated.
 
 Every few minutes (`RECONCILE_READOPT_INTERVAL_SECONDS`, default 300) it also
 re-lists the subscriptions from Twitch rather than trusting the set it holds in
@@ -433,8 +439,15 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_subscription_count|r
    ~900. Either lower `LEAVE_THRESHOLD` back under 900, or move to EventSub
    webhook — see `specs/004-eventsub-parallel-reconciler/research.md` D1.
    Re-seeding the token and restarting both achieve nothing here.
-5. **Authentication errors of any other kind** mean the tokens expired. Re-seed
-   as above.
+5. **Authentication errors** — check which kind before touching the token. A
+   token that is missing, expired, scope-reduced or hand-edited is logged as
+   `No usable user token, running without user auth (chat will not work)` and
+   the service keeps polling with no reconciler; that one needs a re-seed. A
+   transient Twitch or network failure during token validation is **not**
+   treated as expiry — it is deliberately allowed to crash the container so
+   Docker restarts it, and it recovers on its own. If the container is
+   restart-looping with 5xx or connection errors in the log, wait for Twitch
+   rather than rotating a valid token.
 
 A single channel refusing on every pass is normal — roughly 1 in 500 does — and
 it is recorded in `streamers.eventsub_refused_at` and retried after 7 days.

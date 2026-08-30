@@ -530,10 +530,16 @@ class StreamMonitoringService:
         try:
             await self._init_task
         except asyncio.CancelledError:
-            # `stop()` cancelled start-up because it ran out of patience. It
-            # owns the teardown of whatever got built, and it is awaiting this
-            # task, so return normally rather than propagating a cancellation
-            # this coroutine was never the target of.
+            if not self._stopping:
+                # Not our cancellation. Only `stop()` cancels `_init_task`, and
+                # it sets `_stopping` before it does -- anything else means the
+                # cancellation is aimed at THIS coroutine and passing through,
+                # so swallowing it here would break cancellation for the caller.
+                raise
+            # `stop()` ran out of patience with start-up. It owns the teardown
+            # of whatever got built, and it is awaiting this task, so return
+            # normally rather than propagating a cancellation that was never
+            # aimed at us.
             logger.info("Start-up cancelled by shutdown")
             return
         if not self.running:
