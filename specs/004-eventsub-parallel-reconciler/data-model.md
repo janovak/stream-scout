@@ -96,7 +96,7 @@ count, not `total`) and maintained in memory after that.
 |---|---|---|
 | `Connection` | `websocket`, `subscription_ids: set`, `occupancy` | `occupancy <= 300` (measured cap) |
 | `Pool` | `connections: list[Connection]` | Starts empty. Grows on demand when every open connection is at the cap |
-| Routing | Rendezvous hash: the connection whose `blake2b(connection_id, broadcaster_id)` digest scores highest wins | A channel keeps its connection across reconciles and across restarts (D6) |
+| Routing | Rendezvous hash: the connection whose `blake2b("{broadcaster_id}:{connection_id}")` digest scores highest, among those with room | A placed channel keeps its connection across reconciles and is never moved by growth (D6) |
 
 ### Routing is rendezvous hashing, not modulo (corrected in Phase 2)
 
@@ -114,6 +114,16 @@ load-bearing:
   renumber the survivors.
 - The digest is `blake2b`, not the built-in `hash()`. Python salts `hash()` of
   a string per process, so `hash()` would reshuffle every channel on restart.
+
+**What this does not give you (narrowed in Phase 6).** The score is stable, but
+the *placement* is not stable across restarts, because `route()` only considers
+connections that are already open and the pool grows only once they are full. A
+cold start therefore fills connection 0 to the cap before connection 1 exists,
+so which socket a channel lands on depends on arrival order as well as its
+score. That is deliberate and it costs nothing: a websocket session dies with
+the process, so a restart has no subscriptions to preserve. The value D6 is
+after is entirely within one process lifetime — growth must not move a channel
+that is working, and a socket death must cost only that socket's channels.
 
 ## State transitions — a channel through the reconciler
 

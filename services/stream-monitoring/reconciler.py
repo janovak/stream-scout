@@ -603,7 +603,7 @@ class Reconciler:
     def subscription_count(self) -> int:
         return len(self._actual)
 
-    def invalidate_actual_set(self):
+    def invalidate_actual_set(self, lost_subscriptions: int = 0):
         """Rebuild the actual set from the transport on the next pass.
 
         The transport calls this when it loses a connection (T023). Everything
@@ -613,11 +613,27 @@ class Reconciler:
         which is the alert path (FR-012) -- and the ordinary diff re-creates
         those channels on a surviving or new connection.
 
+        `lost_subscriptions` is how many went with the loss, and it is what
+        makes that drop real. `_actual` cannot be pruned here -- the transport
+        reports a count, not which channels -- but the gauge must not go on
+        reporting subscriptions Twitch no longer has. Without this the dip did
+        not exist to be alerted on: the gauge was written once, at the END of a
+        pass, so a loss followed by a successful re-create moved it from a
+        value back to the same value and no scrape could see it. Worse, if the
+        re-enumeration then failed -- and a blip that kills a socket is exactly
+        what fails a walk -- `_adopt` deliberately merges the stale entries
+        back in, so the healthy-looking count survived pass after pass.
+        The next successful enumeration sets the exact figure.
+
         Drops stay switched off until an enumeration succeeds, so a failure to
         re-enumerate cannot turn into a mass delete.
         """
         self._adoption_complete = False
         self._invalidations += 1
+        if lost_subscriptions > 0:
+            eventsub_subscription_count.set(
+                max(0, len(self._actual) - lost_subscriptions)
+            )
         # Clear any failed-enumeration backoff. Round 7 added that backoff and
         # claimed in a comment that a socket loss "does not come through here"
         # -- it does: the gate in `reconcile_once` covers every adoption path.
@@ -920,6 +936,11 @@ class Reconciler:
             # here with it True.
             self._adoption_complete = False
 
+        # The freshest count there is, and available before the creates below
+        # start: a loss is now visible as soon as the walk that confirms it
+        # finishes, rather than at the end of the whole pass.
+        eventsub_subscription_count.set(len(self._actual))
+
         logger.info(
             "Adopted existing subscriptions",
             extra={
@@ -993,6 +1014,7 @@ class Reconciler:
             return
         subscription_id = await self.transport.create(broadcaster_id)
         self._actual[broadcaster_id] = subscription_id
+        eventsub_subscription_count.set(len(self._actual))
         if broadcaster_id in self._rechecking_refusals:
             # The channel refused more than REFUSAL_RECHECK_DAYS ago and has
             # just accepted. Clear the mark so it is a normal channel again.
@@ -1009,6 +1031,7 @@ class Reconciler:
             return
         await self.transport.delete(subscription_id)
         self._actual.pop(broadcaster_id, None)
+        eventsub_subscription_count.set(len(self._actual))
 
     async def _run_batch(self, broadcaster_ids: Iterable[int], handler, operation: str):
         """Run `handler` over the ids on a fixed pool of workers.

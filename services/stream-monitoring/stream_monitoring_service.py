@@ -245,11 +245,18 @@ class StreamMonitoringService:
         self.redis_client: Optional[redis.Redis] = None
         self.credentials: Optional[TwitchCredentials] = None
         self.running = True
-        # Set once `initialize()` has finished building everything, so a
-        # shutdown signalled DURING start-up tears down a whole service rather
-        # than a half-built one. `_stopping` makes `stop()` idempotent: a
-        # signal and a failing `start()` can both reach it.
-        self._initialized: Optional[asyncio.Event] = None
+        # The task running `initialize()`, so shutdown can do more than wait on
+        # it. A wait alone was not enough: on timeout `stop()` went ahead and
+        # tore down, while `initialize()` carried on and built a Kafka
+        # producer, a Postgres pool, a Redis client and live websockets
+        # afterwards -- and `_stopping` was already True, so nothing would ever
+        # close them. Owning the task means it can be cancelled instead. Its
+        # completion also replaces the separate "initialized" event: a
+        # start-up that RAISES finishes the task just the same, so a shutdown
+        # racing a crash-loop does not wait out INITIALIZE_WAIT_SECONDS.
+        # `_stopping` makes `stop()` idempotent: a signal and a failing
+        # `start()` can both reach it.
+        self._init_task: Optional[asyncio.Task] = None
         self._stopping = False
         # `stop()` must not call `shutdown()` on a scheduler that was built but
         # never started -- APScheduler raises there, and that exception used to
@@ -274,14 +281,7 @@ class StreamMonitoringService:
     async def initialize(self):
         """Initialize all connections and services."""
         logger.info("Initializing Stream Monitoring Service")
-        self._initialized = asyncio.Event()
-        try:
-            await self._initialize()
-        finally:
-            # However this ends, including a raise. Leaving it unset made every
-            # crash-loop restart stall shutdown for the full
-            # INITIALIZE_WAIT_SECONDS before tearing anything down.
-            self._initialized.set()
+        await self._initialize()
 
     async def _initialize(self):
 
@@ -487,7 +487,10 @@ class StreamMonitoringService:
             "lost_subscriptions": lost_subscriptions
         })
         if self.reconciler is not None:
-            self.reconciler.invalidate_actual_set()
+            # The count goes with it, so the FR-012 gauge can drop now instead
+            # of at the end of the next pass -- by which time a successful
+            # re-create would have hidden the dip entirely.
+            self.reconciler.invalidate_actual_set(lost_subscriptions)
 
     async def _on_eventsub_message(self, event):
         """Publish one EventSub chat message to Kafka.
@@ -514,7 +517,25 @@ class StreamMonitoringService:
 
     async def start(self):
         """Start the service."""
-        await self.initialize()
+        if not self.running:
+            # A signal beat us here -- `main()` awaits the health server before
+            # this, and `stop()` is a no-op while there is nothing built and no
+            # start-up task to wait on. Initializing now would allocate a Kafka
+            # producer, a Postgres pool, a Redis client and live websockets
+            # that the already-finished `stop()` can never come back to close.
+            logger.info("Shutdown signalled before start-up, not initializing")
+            return
+        # As a task, so `stop()` can cancel it rather than only wait on it.
+        self._init_task = asyncio.create_task(self.initialize())
+        try:
+            await self._init_task
+        except asyncio.CancelledError:
+            # `stop()` cancelled start-up because it ran out of patience. It
+            # owns the teardown of whatever got built, and it is awaiting this
+            # task, so return normally rather than propagating a cancellation
+            # this coroutine was never the target of.
+            logger.info("Start-up cancelled by shutdown")
+            return
         if not self.running:
             # A signal arrived while `initialize()` was still building things.
             # Starting the scheduler and the reconciler now would hand
@@ -553,16 +574,40 @@ class StreamMonitoringService:
         # transport that did not exist yet. `initialize()` then built all of
         # them and nothing ever closed them: an unflushed producer, an open
         # Postgres pool and live websockets, after "stopped" had been logged.
-        if self._initialized is not None and not self._initialized.is_set():
+        #
+        # Bounded, because a Twitch auth that never returns must not block
+        # SIGTERM for ever -- and CANCELLED when that bound is hit, which is
+        # the part a plain wait was missing. Timing out and tearing down anyway
+        # left start-up running, so it went on to build exactly the resources
+        # this teardown had already decided did not exist, with `_stopping`
+        # set so no later `stop()` could reach them either.
+        if self._init_task is not None and not self._init_task.done():
             try:
                 await asyncio.wait_for(
-                    self._initialized.wait(), timeout=INITIALIZE_WAIT_SECONDS
+                    asyncio.shield(self._init_task), timeout=INITIALIZE_WAIT_SECONDS
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Start-up did not finish before shutdown, tearing down what exists",
+                    "Start-up did not finish before shutdown, cancelling it and "
+                    "tearing down what exists",
                     extra={"timeout_seconds": INITIALIZE_WAIT_SECONDS},
                 )
+                self._init_task.cancel()
+                try:
+                    await self._init_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Start-up failed while being cancelled",
+                        extra={"error": str(e)},
+                    )
+            except Exception as e:
+                # `initialize()` raised. Its own handlers have already logged
+                # the detail; what matters here is that start-up is over, so
+                # the teardown below can run against whatever it managed to
+                # build.
+                logger.warning("Start-up failed before shutdown", extra={"error": str(e)})
 
         # Only if it was actually started. `start()` can now return before
         # `scheduler.start()` when shutdown is signalled during start-up, and

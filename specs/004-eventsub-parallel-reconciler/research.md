@@ -768,6 +768,18 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
   counter, so retiring one does not renumber the survivors. The digest is
   `blake2b` rather than the built-in `hash()`, because Python salts `hash()` of
   a string per process and would otherwise reshuffle every channel on restart.
+- **Narrowed in the Phase 6 code review (2026-08-29)**: the placement is stable
+  within a process, not across restarts. `route()` scores only the connections
+  that are already OPEN, and the pool grows only when those are full, so a cold
+  start fills connection 0 to the cap before connection 1 exists and arrival
+  order therefore contributes to where a channel lands. Making placement
+  restart-stable would mean routing against sockets that do not exist yet —
+  opening three for ten channels, against FR-006's "start with no connections"
+  and Twitch's habit of closing a session that has no subscription within ten
+  seconds. It would also buy nothing: a websocket session dies with the
+  process, so a restart re-creates every subscription wherever it lands. The
+  two properties D6 is actually for — growth never moves a working channel, and
+  a socket death costs only that socket's channels — hold as written.
 
 ## Risks
 
@@ -775,7 +787,7 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
 |---|---|---|---|
 | R1 | Events dropped during the subscribe ramp — `received event for unknown subscription` | **CLOSED (T004, 2026-08-28)**: 0 dropped events across a 500-channel cold ramp (12,555 events in the window), opening baseline not depressed (first-60 s / steady ratio 1.08). twitchAPI 4.5.0 registers the callback synchronously with the create POST. No warm-up gate — T040 skipped. Re-check only if the library is upgraded | T004 ✓ |
 | R2 | D3 shifts event time silently and corrupts detection | **CLOSED (T001, 2026-08-28)**: the two timestamps are identical (median offset +1 ms, 0 negative, over 24,473 messages). No event-time shift. T006 gate passed | T001 ✓ |
-| R3 | Concurrency triggers 429s not seen sequentially | **Measured (T003/T003b)**: 429s are budget-driven, not concurrency-driven — none at concurrency ≤20 for 250 creates; first 429 after ~364 creates in a larger burst. Mitigation is the D2 backoff-and-retry loop, which converged a 500-channel cold start in 40.6 s and recovered even from a drained budget. Concurrency 10 default, configurable | T003 ✓ |
+| R3 | Concurrency triggers 429s not seen sequentially | **Measured (T003/T003b)**: 429s are budget-driven, not concurrency-driven — none at concurrency ≤20 for 250 creates; first 429 after ~364 creates in a larger burst. Mitigation is the D2 backoff-and-retry loop, which converged a 500-channel cold start in 40.6 s **in the T003b harness at concurrency 15** — the shipped `Reconciler` at the default concurrency 10 does it in 51.1 s (T041), and that is the figure SC-001 is judged on — and recovered even from a drained budget. Concurrency 10 default, configurable | T003 ✓ |
 | R4 | A socket death drops up to 300 channels at once | Rendezvous-hash routing plus fast reconcile. Alert on a subscription-count drop (FR-012) | — |
 | R5 | Removing IRC leaves no fallback if EventSub misbehaves in production | Deliberate. The operator accepted no intermediate compatibility. `git revert` of the branch is the fallback | — |
 

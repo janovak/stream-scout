@@ -164,7 +164,7 @@ def _score(broadcaster_id: int, connection_id: int) -> int:
 
 
 def to_epoch_ms(value) -> Optional[int]:
-    """Convert the envelope timestamp to epoch milliseconds.
+    """Convert the envelope timestamp to epoch milliseconds, or `None`.
 
     `sent_at` drives Flink's event time through `SentAtTimestampAssigner`, and
     the contract says it is an int or `null` -- never a string, or the
@@ -173,6 +173,14 @@ def to_epoch_ms(value) -> Optional[int]:
     pyTwitchAPI has already parsed `metadata.message_timestamp` into a
     tz-aware `datetime` by the time an event reaches us. The string branch is
     for tests and for any caller holding the raw envelope.
+
+    A value this cannot read returns `None` rather than raising. `spec.md`
+    Edge Cases require an envelope with a missing or unparseable
+    `message_timestamp` to STILL publish, with `sent_at` null so the assigner
+    falls back to record time. Raising sent it to `_on_eventsub_message`'s
+    handler instead, which logs and returns -- so the whole chat message was
+    dropped, against the constitution's no-data-loss rule, to save a field the
+    contract already allows to be null.
     """
     if value is None:
         return None
@@ -196,11 +204,22 @@ def to_epoch_ms(value) -> Optional[int]:
             while tail and tail[0].isdigit():
                 digits, tail = digits + tail[0], tail[1:]
             text = f"{head}.{digits[:6]:0<6}{tail}"
-        parsed = datetime.fromisoformat(text)
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            logger.warning(
+                "Unparseable message_timestamp, publishing with sent_at null",
+                extra={"message_timestamp": value},
+            )
+            return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return int(parsed.timestamp() * 1000)
-    raise TypeError(f"cannot convert {type(value).__name__} to epoch milliseconds")
+    logger.warning(
+        "Unexpected message_timestamp type, publishing with sent_at null",
+        extra={"type": type(value).__name__},
+    )
+    return None
 
 
 def map_chat_message(event, *, received_at_ms: Optional[int] = None) -> dict:
@@ -234,7 +253,12 @@ def map_chat_message(event, *, received_at_ms: Optional[int] = None) -> dict:
         # Twitch's send clock. T001 proved this is the same instant IRC's
         # `tmi-sent-ts` carried, to the millisecond -- there is no offset to
         # correct here (D3).
-        "sent_at": to_epoch_ms(event.metadata.message_timestamp),
+        #
+        # `getattr`, because `TwitchObject.__init__` skips any field the
+        # payload omits, so an envelope without `message_timestamp` has no such
+        # attribute at all rather than a None one. The spec's edge case wants
+        # that message published with `sent_at` null, not dropped.
+        "sent_at": to_epoch_ms(getattr(event.metadata, "message_timestamp", None)),
         "message_id": message_id or str(uuid.uuid4()),
         "text": data.message.text,
         "user_id": int(chatter_id) if chatter_id else 0,
@@ -439,6 +463,18 @@ class EventSubPoolTransport(SubscriptionTransport):
             self._forget_slot(existing)
 
         connection = await self._reserve(broadcaster_id)
+        # Read BEFORE the create, not after. The library builds the POST's
+        # transport from whatever session is current when the request is
+        # issued, and its socket thread can complete a reconnect -- new
+        # session, plus a `_resubscribe()` sweep -- while that request is in
+        # flight. Stamping the slot with the session read AFTER the await
+        # therefore labelled a subscription made on the OLD session with the
+        # NEW one, and `_slot_is_current` would then agree with itself for
+        # ever: the session check passes, the library's registry holds the id
+        # because `_subscribe` added it, and `create()` hands the ghost back
+        # with no Twitch call while nothing delivers for that channel. The
+        # session the request was actually issued on is the only honest stamp.
+        session_before = self._session_id(connection)
         subscription_id = None
         try:
             subscription_id = await connection.websocket.listen_channel_chat_message(
@@ -489,11 +525,39 @@ class EventSubPoolTransport(SubscriptionTransport):
                     f"connection {connection.connection_id} was lost while subscribing "
                     f"broadcaster {broadcaster_id}"
                 )
+            session_now = self._session_id(connection)
+            if (
+                session_before is not None
+                and session_now is not None
+                and session_before != session_now
+            ):
+                # The socket reconnected while this create was in flight. The
+                # subscription that came back belongs to a session Twitch has
+                # already closed, and `_resubscribe()` only re-creates what was
+                # in the registry when it took its snapshot -- so a create that
+                # landed after that moment is gone and nothing will restore it.
+                # Drop the library's entry (or the next reconnect resurrects a
+                # dead id) and let the channel be retried on the live session.
+                self._forget_library_subscription(connection, subscription_id)
+                logger.warning(
+                    "Connection reconnected mid-create, discarding the subscription",
+                    extra={
+                        "broadcaster_id": broadcaster_id,
+                        "connection": connection.connection_id,
+                        "subscription_id": subscription_id,
+                        "session_at_create": session_before,
+                        "session_now": session_now,
+                    },
+                )
+                raise TransportError(
+                    f"connection {connection.connection_id} reconnected while "
+                    f"subscribing broadcaster {broadcaster_id}"
+                )
             slot = _Slot(
                 broadcaster_id,
                 connection.connection_id,
                 subscription_id,
-                self._session_id(connection),
+                session_before,
             )
             connection.subscription_ids.add(subscription_id)
             self._slots[broadcaster_id] = slot
@@ -685,32 +749,29 @@ class EventSubPoolTransport(SubscriptionTransport):
                 timeout=self.connect_timeout_seconds,
             )
         except asyncio.TimeoutError as e:
-            # `start()` busy-waits on `_startup_complete`, which only
-            # `_handle_welcome` ever sets. If the socket thread died on its
-            # way up -- `_connect` gives up after a 255 s retry ladder and
-            # raises -- that flag is never set and `start()` spins for the
-            # life of the process. The future would never resolve, this lock
-            # would never be released, and every later create would block on
-            # it: one failed connect would freeze the reconciler for good.
-            # Setting the flag releases the busy-wait so the worker thread
-            # ends instead of spinning.
-            #
-            # That alone is not enough. `_keep_loop_alive()` runs on the
-            # socket's OWN loop and spins on `while not self._closing`, and
-            # only `_stop()` ever sets `_closing`. Without the teardown below
-            # every timed-out connect left a thread spinning at 10 Hz for the
-            # life of the process, holding an open `ClientSession` and its file
-            # descriptors -- and invisibly, because the connection is never
-            # appended to `self._connections`, so `reap_dead_connections()`
-            # could not see it either.
-            websocket._startup_complete = True
-            websocket._running = False
-            self._tear_down_socket(websocket)
+            self._abandon_socket(websocket)
             raise TransportError(
                 f"EventSub connection did not come up within "
                 f"{self.connect_timeout_seconds}s"
             ) from e
+        except asyncio.CancelledError:
+            # Shutdown cancels the reconciler task, and that cancellation lands
+            # wherever the pass happened to be -- including inside this connect.
+            # `except Exception` does NOT catch it on 3.11, so without this
+            # branch a SIGTERM during a cold-start `_grow` abandoned the socket
+            # in exactly the state the timeout branch exists to clean up: the
+            # executor thread still busy-waiting in `start()`, `_keep_loop_alive`
+            # still spinning on its own loop, and an open `ClientSession` behind
+            # both. Cancelling the future does not stop the thread the executor
+            # is already running; releasing its busy-wait is what lets it end.
+            # And the socket is never appended to `self._connections`, so
+            # neither `aclose()` nor `reap_dead_connections()` could reach it.
+            self._abandon_socket(websocket)
+            raise
         except Exception as e:
+            # No teardown here: `start()` raises only before it starts the
+            # socket thread (already running, or missing user auth -- see
+            # `EventSubWebsocket.start`), so there is nothing left behind.
             raise TransportError(f"could not open an EventSub connection: {e}") from e
 
         connection = _Connection(connection_id=self._next_connection_id, websocket=websocket)
@@ -731,6 +792,32 @@ class EventSubPoolTransport(SubscriptionTransport):
             if connection.connection_id == connection_id:
                 return connection
         return None
+
+    def _abandon_socket(self, websocket) -> None:
+        """Reclaim a socket that never joined the pool.
+
+        `_grow` can leave a half-open session behind two ways -- the connect
+        timing out, or the whole reconcile being cancelled at shutdown -- and
+        both need the same three steps.
+
+        `start()` busy-waits on `_startup_complete`, which only
+        `_handle_welcome` ever sets. If the socket thread died on its way up --
+        `_connect` gives up after a 255 s retry ladder and raises -- that flag
+        is never set and `start()` spins for the life of the process, holding
+        an executor worker. Setting it releases the busy-wait so the thread
+        ends instead of spinning.
+
+        That alone is not enough. `_keep_loop_alive()` runs on the socket's OWN
+        loop and spins on `while not self._closing`, and only `_stop()` ever
+        sets `_closing`. Without the teardown every abandoned connect left a
+        thread spinning at 10 Hz for the life of the process, holding an open
+        `ClientSession` and its file descriptors -- and invisibly, because the
+        connection is never appended to `self._connections`, so neither
+        `reap_dead_connections()` nor `aclose()` could see it.
+        """
+        websocket._startup_complete = True
+        websocket._running = False
+        self._tear_down_socket(websocket)
 
     # -- events -----------------------------------------------------------
 

@@ -194,9 +194,18 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   connection rather than let Twitch refuse the subscriptions on it
   (added 2026-08-29 — see `research.md` D1). The pool
   MUST start with no connections and grow on demand when the desired set needs
-  more than the open connections can hold. Routing MUST be stable across
-  reconciles and across restarts, and growing the pool MUST NOT move a channel
-  that is already placed.
+  more than the open connections can hold. Routing MUST be stable for a channel
+  that is already placed: it MUST keep its connection across reconciles, and
+  growing the pool MUST NOT move it. **Narrowed during implementation
+  (Phase 6 code review)**: an earlier wording also asked for stability "across
+  restarts". The pool cannot give that and does not need to. Placement depends
+  on which connections are open when a channel first arrives — the pool starts
+  empty and grows only when the open ones are full, so a cold start fills the
+  first socket before the second exists — and rank order differs between polls.
+  What makes it moot is that a websocket session dies with the process: a
+  restart has no subscriptions to preserve, so every channel is created afresh
+  wherever it lands. The property that carries D6's value is the one above,
+  plus a routing function that does not depend on `PYTHONHASHSEED`.
 - **FR-007**: Channels that refuse authorization MUST be recorded with the time
   of the refusal and skipped on later cycles. A refusal MUST be retried once it
   is more than 7 days old. The refusal record MUST NOT be written when the

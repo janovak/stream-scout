@@ -72,6 +72,14 @@ Subscriptions are spread over a pool of websocket connections, **300 per
 connection** (Twitch's cap). The pool starts empty and opens another connection
 when the ones it has are full, so ~500 channels run on two.
 
+**This transport tops out at 900 channels.** Twitch allows a maximum of **3
+websocket connections with enabled subscriptions** per client-id/user-id pair,
+at 300 each. The pool refuses to open a fourth rather than let Twitch reject the
+subscriptions on it one by one, so the ceiling shows up as a clear log line —
+`pool is at its 3-connection limit` — instead of a silent retry loop. Past 900
+the required transport is EventSub **webhook**, not more sockets; see
+`specs/004-eventsub-parallel-reconciler/research.md` D1.
+
 ### Reading the reconciler metrics
 
 All of these are on the stream-monitoring metrics endpoint, port **9100**:
@@ -82,7 +90,7 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_|reconcile_|subscrip
 
 | Metric | Read it as |
 |---|---|
-| `eventsub_subscription_count` | Live subscriptions held. Should equal the wanted set — compare against `ZCARD chat:desired`. A steady small gap is normally one channel refusing authorization; check the logs for `subscription missing proper authorization` |
+| `eventsub_subscription_count` | Live subscriptions held. Should equal the wanted set — compare against `ZCARD chat:desired`. It moves DURING a pass, not only at the end: it steps up as a cold start creates, and drops the moment a socket loss is reported, which is the dip to alert on. A steady small gap is normally one channel refusing authorization; check the logs for `subscription missing proper authorization` |
 | `reconcile_last_success_timestamp` | Unix time of the last pass that **ran to completion**. **This is the stalled-reconciler alarm.** If it stops advancing while polls keep succeeding, the reconciler is stuck and the subscription set is frozen — the poller cannot tell you this, because it still works. Two things it does **not** mean: it is not "a pass with no failures" (at 500 channels one broadcaster refuses every pass, so gating on that would freeze the gauge and destroy the signal — per-channel failures are `subscription_create_failures_total`); and **a gap of a few minutes during a cold start is normal, not a stall**. A pass that hits 429s backs off and retries inside the pass, up to `RECONCILE_MAX_RETRY_ROUNDS` × `RECONCILE_RATE_LIMIT_BACKOFF_SECONDS` ≈ 200 s at the defaults, and the stamp only lands when the pass ends. Before restarting anything, check `reconcile_duration_seconds` and whether the subscription count is still climbing |
 | `reconcile_duration_seconds` | Histogram of pass duration. A converged pass is milliseconds. Buckets run to 120 s because a cold start to 500 channels takes ~51 s |
 | `subscription_create_failures_total` | Counter, labelled by `reason`. **No series at all is the healthy state**, not a broken exporter: this client registers a labelled series on its first increment |
@@ -416,7 +424,16 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_subscription_count|r
 3. **The count is right but Kafka is empty.** The subscriptions exist and are
    silent, so the problem is downstream — check the Kafka producer logs and
    `kafka_messages_produced`.
-4. **Authentication errors of any other kind** mean the tokens expired. Re-seed
+4. **The count has plateaued and the log says `pool is at its 3-connection
+   limit`.** This is not a fault to restart: the monitored set has been raised
+   past what this transport can carry. Twitch allows 3 websocket connections ×
+   300 subscriptions = **900 channels** per client-id/user-id pair, and the pool
+   refuses a fourth socket deliberately. `subscription_create_failures_total
+   {reason="error"}` climbs while `eventsub_subscription_count` sits flat at
+   ~900. Either lower `LEAVE_THRESHOLD` back under 900, or move to EventSub
+   webhook — see `specs/004-eventsub-parallel-reconciler/research.md` D1.
+   Re-seeding the token and restarting both achieve nothing here.
+5. **Authentication errors of any other kind** mean the tokens expired. Re-seed
    as above.
 
 A single channel refusing on every pass is normal — roughly 1 in 500 does — and
