@@ -7,8 +7,8 @@ Uses Redis for online streamer state management with TTL-based expiration.
 
 The poll job decides intent and returns. It makes no chat connections and no
 subscriptions. `reconciler.py` reads the intent and does all network fan-out,
-in parallel, on its own task. The two only meet at the Redis keys that
-`reconciler.py` documents.
+in parallel, on its own task. The two only meet through the
+`DesiredSetStore` interface.
 """
 
 import asyncio
@@ -33,11 +33,9 @@ from twitchAPI.twitch import Twitch
 from twitchAPI.type import InvalidTokenException, MissingScopeException
 from twitchAPI.type import AuthScope
 
+from desired_set_store import DesiredSetStore, RedisDesiredSetStore
 from eventsub_pool import EventSubPoolTransport, map_chat_message
 from reconciler import (
-    DESIRED_GENERATION_KEY,
-    DESIRED_IDS_KEY,
-    DESIRED_KEY,
     PostgresRefusalStore,
     Reconciler,
     resolve_reconciler_config,
@@ -243,6 +241,7 @@ class StreamMonitoringService:
         self.kafka_producer: Optional[Producer] = None
         self.db_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
         self.redis_client: Optional[redis.Redis] = None
+        self.desired_store: Optional[DesiredSetStore] = None
         self.credentials: Optional[TwitchCredentials] = None
         self.running = True
         # The task running `initialize()`, so shutdown can do more than wait on
@@ -383,6 +382,7 @@ class StreamMonitoringService:
         # Initialize Redis
         self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
         self.redis_client.ping()
+        self.desired_store = RedisDesiredSetStore(self.redis_client)
         logger.info("Redis connection initialized")
 
         # Build the reconciler. It reads the desired set this service writes
@@ -414,7 +414,7 @@ class StreamMonitoringService:
 
         self.reconciler = Reconciler(
             transport=self.transport,
-            redis_client=self.redis_client,
+            desired_store=self.desired_store,
             config=resolve_reconciler_config(),
             # active_stream_count used to count IRC rooms. It now follows the
             # reconciler's actual set -- the subscriptions that really exist.
@@ -776,8 +776,9 @@ class StreamMonitoringService:
             # It is read back from Redis rather than held in memory, so a
             # restart keeps the retained band instead of collapsing coverage
             # to the top JOIN_THRESHOLD.
-            previous_desired = self._read_previous_desired()
-            previous_ids = self._read_previous_ids()
+            previous = self.desired_store.read()
+            previous_desired = set(previous.logins)
+            previous_ids = previous.ids
 
             for login in disabled_logins:
                 if login in previous_desired:
@@ -838,7 +839,12 @@ class StreamMonitoringService:
             # inside POLL_INTERVAL_SECONDS, because APScheduler runs it with
             # max_instances=1 and a skipped poll stops refreshing the online
             # keys that expire at REDIS_STREAMER_TTL.
-            self._write_desired_set(desired, broadcaster_ids)
+            self.desired_store.publish(desired, broadcaster_ids)
+
+            # The reconciler shares this event loop, so this is the fast path.
+            # Its idle timeout is the backstop if the signal is ever missed.
+            if self.reconciler is not None:
+                self.reconciler.notify_desired_changed()
 
             logger.info("Poll complete", extra={
                 "ranked": len(ranked_logins),
@@ -850,66 +856,6 @@ class StreamMonitoringService:
         except Exception as e:
             logger.error("Error polling streams", extra={"error": str(e)})
             twitch_api_errors_total.labels(error_type="poll_streams").inc()
-
-    def _read_previous_desired(self) -> Set[str]:
-        """Return the logins the last poll asked for. This is the hysteresis state."""
-        return {
-            login.decode("utf-8") if isinstance(login, bytes) else login
-            for login in self.redis_client.zrange(DESIRED_KEY, 0, -1)
-        }
-
-    def _read_previous_ids(self) -> Dict[str, int]:
-        """The login-to-id map the last poll wrote, for logins leaving the set.
-
-        A login only leaves the desired set by dropping out of this poll's
-        ranking, so this poll has no id for it -- which is why the offline
-        lifecycle event used to publish `broadcaster_id: 0` for every
-        streamer, and key every one of them to partition `b"0"`. Before
-        Phase 3 an instance-level dict carried ids across polls and supplied
-        it; that dict went with the IRC client.
-
-        The id is still on hand: the poller wrote it to `chat:desired:ids` in
-        the same transaction as the set it is leaving. Read it before
-        `_write_desired_set` overwrites both.
-        """
-        raw = self.redis_client.hgetall(DESIRED_IDS_KEY) or {}
-        ids = {}
-        for login, broadcaster_id in raw.items():
-            login = login.decode("utf-8") if isinstance(login, bytes) else login
-            try:
-                ids[login] = int(broadcaster_id)
-            except (TypeError, ValueError):
-                continue
-        return ids
-
-    def _write_desired_set(self, desired: Dict[str, int], broadcaster_ids: Dict[str, int]):
-        """Publish the desired set for the reconciler, in one transaction.
-
-        One round trip whatever changed, so the cost of this write follows the
-        SIZE of the desired set and never the size of the CHANGE (FR-003).
-
-        DEL then ZADD, not the rank trim that data-model.md describes: a member
-        that leaves the set keeps its old score, and that score is also a low
-        rank, so a ZREMRANGEBYRANK would keep the stale member and evict a
-        wanted one instead. The pipeline is a MULTI/EXEC, so the reconciler
-        never reads the gap between the delete and the write, and the set, the
-        id map, and the generation can never disagree.
-        """
-        pipe = self.redis_client.pipeline()
-        pipe.delete(DESIRED_KEY, DESIRED_IDS_KEY)
-        if desired:
-            pipe.zadd(DESIRED_KEY, desired)
-            pipe.hset(
-                DESIRED_IDS_KEY,
-                mapping={login: broadcaster_ids[login] for login in desired},
-            )
-        pipe.incr(DESIRED_GENERATION_KEY)
-        pipe.execute()
-
-        # The reconciler shares this event loop, so this is the fast path. Its
-        # idle timeout is the backstop if the signal is ever missed.
-        if self.reconciler is not None:
-            self.reconciler.notify_desired_changed()
 
     def _publish_chat_message(self, broadcaster_id: int, message: dict):
         """Publish chat message to Kafka."""

@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # here AND bind-mounted in docker-compose.yml -- the same class of gap that
 # bit the Flink job's -pyFiles list.
 COPY stream_monitoring_service.py .
+COPY desired_set_store.py .
 COPY reconciler.py .
 COPY eventsub_pool.py .
 COPY token_manager.py .
