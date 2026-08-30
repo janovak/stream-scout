@@ -30,6 +30,7 @@ from confluent_kafka import Producer
 from prometheus_client import Counter, Gauge, start_http_server
 from pythonjsonlogger import jsonlogger
 from twitchAPI.twitch import Twitch
+from twitchAPI.type import InvalidTokenException, MissingScopeException
 from twitchAPI.type import AuthScope
 
 from eventsub_pool import EventSubPoolTransport, map_chat_message
@@ -52,6 +53,26 @@ TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
 PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "9100"))
 HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", "8080"))
+# Token problems that no restart can fix, so the service degrades to "no chat"
+# rather than crash-looping. Anything else -- notably a transient Twitch or
+# network failure during the live token validation -- must propagate instead,
+# so the container restarts and recovers on its own.
+TOKEN_FAILURES = (
+    FileNotFoundError,
+    json.JSONDecodeError,
+    KeyError,
+    ValueError,
+    InvalidTokenException,
+    MissingScopeException,
+)
+# How long shutdown lets an in-flight reconcile pass finish before cancelling
+# it. Long enough for a create or delete already in flight to land; far short
+# of a full ramp, which shutdown has no reason to wait for.
+RECONCILER_STOP_TIMEOUT_SECONDS = float(os.getenv("RECONCILER_STOP_TIMEOUT_SECONDS", "5"))
+# How long shutdown waits for an in-flight `initialize()` to finish before
+# tearing down. Bounded, because a Twitch auth that never returns must not
+# block SIGTERM for ever.
+INITIALIZE_WAIT_SECONDS = float(os.getenv("INITIALIZE_WAIT_SECONDS", "20"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # Token-file scope strings -> pyTwitchAPI enums. One place, so adding a scope
@@ -224,6 +245,23 @@ class StreamMonitoringService:
         self.redis_client: Optional[redis.Redis] = None
         self.credentials: Optional[TwitchCredentials] = None
         self.running = True
+        # The task running `initialize()`, so shutdown can do more than wait on
+        # it. A wait alone was not enough: on timeout `stop()` went ahead and
+        # tore down, while `initialize()` carried on and built a Kafka
+        # producer, a Postgres pool, a Redis client and live websockets
+        # afterwards -- and `_stopping` was already True, so nothing would ever
+        # close them. Owning the task means it can be cancelled instead. Its
+        # completion also replaces the separate "initialized" event: a
+        # start-up that RAISES finishes the task just the same, so a shutdown
+        # racing a crash-loop does not wait out INITIALIZE_WAIT_SECONDS.
+        # `_stopping` makes `stop()` idempotent: a signal and a failing
+        # `start()` can both reach it.
+        self._init_task: Optional[asyncio.Task] = None
+        self._stopping = False
+        # `stop()` must not call `shutdown()` on a scheduler that was built but
+        # never started -- APScheduler raises there, and that exception used to
+        # abandon the whole teardown.
+        self._scheduler_started = False
         self.reconciler: Optional[Reconciler] = None
         self.transport: Optional[EventSubPoolTransport] = None
         # Both set from the token file in initialize(). No user auth at all
@@ -243,6 +281,17 @@ class StreamMonitoringService:
     async def initialize(self):
         """Initialize all connections and services."""
         logger.info("Initializing Stream Monitoring Service")
+        await self._initialize()
+
+    async def _initialize(self):
+
+        # The metrics server comes up FIRST, before the token, Kafka, Postgres,
+        # Redis or the transport -- every one of which can fail on a bad day.
+        # It used to start last, so any of those failures killed the process
+        # with no /metrics at all, taking down the FR-012 gauges an operator is
+        # told to check at exactly the moment the service is failing.
+        start_http_server(PROMETHEUS_PORT)
+        logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
 
         # Initialize Twitch API with app credentials
         self.twitch = await Twitch(TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET)
@@ -270,24 +319,45 @@ class StreamMonitoringService:
                     extra={"scopes": record.scopes},
                 )
 
-            # Set user authentication with loaded tokens
+            # Register the refresh callback BEFORE authenticating, not after.
+            # `set_user_authentication` validates the token and, on a 401,
+            # refreshes it internally and invokes this callback (twitch.py:716
+            # -721). Assigned afterwards it is still None at that moment, so
+            # the rotated refresh token is dropped on the floor and the file
+            # keeps the old one -- the exact failure `token_manager`'s
+            # `test_refresh_stores_rotated_refresh_token` exists to prevent.
+            self.twitch.user_auth_refresh_callback = self._on_token_refresh
+
             await self.twitch.set_user_authentication(
                 record.access_token,
                 auth_scopes,
                 record.refresh_token
             )
 
-            # Register callback for token refresh
-            self.twitch.user_auth_refresh_callback = self._on_token_refresh
-
             logger.info("User authentication configured with pre-seeded tokens", extra={
                 "scopes": record.scopes
             })
 
-        except FileNotFoundError as e:
-            logger.warning("Token file not found, running without user auth (chat will not work)", extra={
-                "error": str(e)
-            })
+        except TOKEN_FAILURES as e:
+            # Every way the TOKEN can fail, not just a missing file: expired
+            # and unrefreshable (InvalidTokenException), scope-reduced
+            # (MissingScopeException), truncated or hand-edited (raises out of
+            # `credentials.load()`). Those are permanent until someone re-seeds
+            # the file, so crash-looping the container achieves nothing and the
+            # fallback below is the right answer.
+            #
+            # Deliberately NOT `except Exception`. `set_user_authentication`
+            # makes a live validate call, so a network blip or a Twitch 5xx
+            # lands here too -- and degrading on those was worse than the crash
+            # it replaced: the service would run for the rest of the process
+            # lifetime with no chat ingestion at all, while the poll job kept
+            # working and /health kept returning OK, and nothing ever retried.
+            # A transient failure should propagate and let Docker restart us,
+            # which recovers on its own.
+            logger.warning(
+                "No usable user token, running without user auth (chat will not work)",
+                extra={"error": str(e), "error_type": type(e).__name__},
+            )
             # Fall back to app-only auth for streams API
             await self.twitch.authenticate_app([])
             self.has_user_auth = False
@@ -329,11 +399,19 @@ class StreamMonitoringService:
                 "Run 'python seed_twitch_tokens.py' and restart to ingest chat"
             )
             self._build_scheduler()
-            start_http_server(PROMETHEUS_PORT)
-            logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
             return
 
+        # NOT wrapped in a degrade-and-continue handler. `EventSubPoolTransport
+        # .start()` calls `get_users()`, so the failures here are transient by
+        # nature -- a network blip, a Twitch 5xx. Swallowing them left the
+        # service running with no transport, no reconciler and zero chat
+        # ingestion for the rest of the process lifetime, with /health still
+        # green and nothing ever retrying. Letting it propagate restarts the
+        # container, which recovers by itself. The metrics server is already up
+        # by this point, so the FR-012 gauges are still there to diagnose it --
+        # that was the real fix, and the swallow was never load-bearing.
         self.transport = await self._build_transport()
+
         self.reconciler = Reconciler(
             transport=self.transport,
             redis_client=self.redis_client,
@@ -345,10 +423,6 @@ class StreamMonitoringService:
         )
 
         self._build_scheduler()
-
-        # Start Prometheus metrics server
-        start_http_server(PROMETHEUS_PORT)
-        logger.info("Prometheus metrics server started", extra={"port": PROMETHEUS_PORT})
 
     def _build_scheduler(self):
         self.scheduler = AsyncIOScheduler()
@@ -413,7 +487,10 @@ class StreamMonitoringService:
             "lost_subscriptions": lost_subscriptions
         })
         if self.reconciler is not None:
-            self.reconciler.invalidate_actual_set()
+            # The count goes with it, so the FR-012 gauge can drop now instead
+            # of at the end of the next pass -- by which time a successful
+            # re-create would have hidden the dip entirely.
+            self.reconciler.invalidate_actual_set(lost_subscriptions)
 
     async def _on_eventsub_message(self, event):
         """Publish one EventSub chat message to Kafka.
@@ -440,8 +517,43 @@ class StreamMonitoringService:
 
     async def start(self):
         """Start the service."""
-        await self.initialize()
+        if not self.running:
+            # A signal beat us here -- `main()` awaits the health server before
+            # this, and `stop()` is a no-op while there is nothing built and no
+            # start-up task to wait on. Initializing now would allocate a Kafka
+            # producer, a Postgres pool, a Redis client and live websockets
+            # that the already-finished `stop()` can never come back to close.
+            logger.info("Shutdown signalled before start-up, not initializing")
+            return
+        # As a task, so `stop()` can cancel it rather than only wait on it.
+        self._init_task = asyncio.create_task(self.initialize())
+        try:
+            await self._init_task
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling() > 0:
+                # Aimed at THIS task, not at start-up. `stop()` cancels
+                # `_init_task` alone, which leaves our own cancel count at
+                # zero; anything that cancelled `start()` itself shows up here.
+                # `_stopping` was the wrong discriminator: a cancellation
+                # arriving from outside WHILE a shutdown is already running
+                # sets it too, and swallowing that one reported clean
+                # completion to a caller that had asked us to stop.
+                raise
+            # `stop()` ran out of patience with start-up. It owns the teardown
+            # of whatever got built, and it is awaiting this task, so return
+            # normally rather than propagating a cancellation that was never
+            # aimed at us.
+            logger.info("Start-up cancelled by shutdown")
+            return
+        if not self.running:
+            # A signal arrived while `initialize()` was still building things.
+            # Starting the scheduler and the reconciler now would hand
+            # `stop()` -- which is waiting for exactly this moment -- more to
+            # tear down, and race it while doing so.
+            logger.info("Shutdown signalled during start-up, not starting work")
+            return
         self.scheduler.start()
+        self._scheduler_started = True
 
         # The reconciler is a task in this process, beside the poll job. It is
         # not a separate container: it shares this process's /health endpoint
@@ -457,18 +569,123 @@ class StreamMonitoringService:
 
     async def stop(self):
         """Gracefully stop the service."""
+        if self._stopping:
+            return
+        self._stopping = True
         logger.info("Stopping Stream Monitoring Service")
         self.running = False
 
-        if self.scheduler:
-            self.scheduler.shutdown(wait=True)
+        # Wait for start-up to finish before tearing anything down. A signal
+        # can land while `initialize()` is mid-flight -- a `docker compose
+        # restart` during a slow Twitch auth does it -- and tearing down then
+        # closed the aiohttp session the auth call was still using, while every
+        # other branch no-opped on a Kafka producer, DB pool, Redis client and
+        # transport that did not exist yet. `initialize()` then built all of
+        # them and nothing ever closed them: an unflushed producer, an open
+        # Postgres pool and live websockets, after "stopped" had been logged.
+        #
+        # Bounded, because a Twitch auth that never returns must not block
+        # SIGTERM for ever -- and CANCELLED when that bound is hit, which is
+        # the part a plain wait was missing. Timing out and tearing down anyway
+        # left start-up running, so it went on to build exactly the resources
+        # this teardown had already decided did not exist, with `_stopping`
+        # set so no later `stop()` could reach them either.
+        if self._init_task is not None and not self._init_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._init_task), timeout=INITIALIZE_WAIT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Start-up did not finish before shutdown, cancelling it and "
+                    "tearing down what exists",
+                    extra={"timeout_seconds": INITIALIZE_WAIT_SECONDS},
+                )
+                self._init_task.cancel()
+                try:
+                    await self._init_task
+                except asyncio.CancelledError:
+                    # Deliberately swallowed, including a cancellation aimed at
+                    # `stop()` itself. This is the teardown; the rule for
+                    # everything below is that no single failure may skip the
+                    # steps after it, and abandoning the flush and the socket
+                    # close because someone cancelled the shutdown is exactly
+                    # the truncation this function was rewritten to prevent.
+                    # The discrimination two blocks up is a different case:
+                    # there the cancellation came from the shielded CHILD, and
+                    # continuing was the only correct answer.
+                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Start-up failed while being cancelled",
+                        extra={"error": str(e)},
+                    )
+            except Exception as e:
+                # `initialize()` raised. Its own handlers have already logged
+                # the detail; what matters here is that start-up is over, so
+                # the teardown below can run against whatever it managed to
+                # build.
+                logger.warning("Start-up failed before shutdown", extra={"error": str(e)})
+            except asyncio.CancelledError:
+                # The start-up task was cancelled by something other than this
+                # `stop()` -- an outer runtime unwinding its tasks while a
+                # signal-driven shutdown is already in flight. The shield lets
+                # that reach us, and letting it propagate abandoned the WHOLE
+                # teardown: nothing below here ran, so the producer was never
+                # flushed and the websockets were never closed. That is the
+                # opposite of what a shutdown racing a cancellation should do.
+                # Only a cancellation aimed at `stop()` ITSELF may stop it.
+                if asyncio.current_task().cancelling() > 0:
+                    raise
+                logger.warning(
+                    "Start-up was cancelled from elsewhere, tearing down what exists"
+                )
+
+        # Only if it was actually started. `start()` can now return before
+        # `scheduler.start()` when shutdown is signalled during start-up, and
+        # APScheduler's `shutdown()` on a never-started scheduler raises
+        # `AttributeError: 'NoneType' object has no attribute
+        # 'call_soon_threadsafe'`. That exception used to escape here and
+        # abandon EVERY step below it -- the reconciler never stopped, the
+        # websockets stayed open, and the Kafka producer was never flushed, so
+        # buffered chat was dropped. It also propagated into `main()`, so the
+        # process exited on a traceback with "stopped" never logged.
+        #
+        # Wrapped as well as guarded: no single failure in this teardown may
+        # skip the ones after it, which is the property that was missing.
+        if self.scheduler is not None and self._scheduler_started:
+            try:
+                self.scheduler.shutdown(wait=True)
+            except Exception as e:
+                logger.warning("Error shutting down the scheduler", extra={"error": str(e)})
 
         # Stop the reconciler before Redis closes underneath it. Ask first,
-        # then cancel, so a pass that is already running can finish its
-        # current operation instead of leaving a half-made subscription.
+        # then cancel, so a pass that is already running can finish its current
+        # operation instead of leaving a half-made subscription.
+        #
+        # The wait is what makes "ask first" real. `stop()` only sets a flag
+        # and wakes the loop; cancelling in the next statement never let the
+        # task run, so the cancellation landed at whatever await the pass was
+        # sitting on -- including between `transport.create()` returning and
+        # `_actual[bid]` being assigned, which is exactly the half-made
+        # subscription this ordering claims to avoid.
         if self.reconciler is not None:
             self.reconciler.stop()
         if self._reconciler_task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._reconciler_task),
+                    timeout=RECONCILER_STOP_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Reconciler did not stop in time, cancelling",
+                    extra={"timeout_seconds": RECONCILER_STOP_TIMEOUT_SECONDS},
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning("Reconciler stopped with an error", extra={"error": str(e)})
             self._reconciler_task.cancel()
             try:
                 await self._reconciler_task
@@ -560,6 +777,7 @@ class StreamMonitoringService:
             # restart keeps the retained band instead of collapsing coverage
             # to the top JOIN_THRESHOLD.
             previous_desired = self._read_previous_desired()
+            previous_ids = self._read_previous_ids()
 
             for login in disabled_logins:
                 if login in previous_desired:
@@ -599,12 +817,15 @@ class StreamMonitoringService:
 
             # Streamers that went offline. A login leaves `desired` only when
             # it drops out of the top LEAVE_THRESHOLD, so it is no longer in
-            # this poll's ranking and `broadcaster_ids` has no id for it.
+            # this poll's ranking and `broadcaster_ids` never has an id for it
+            # -- fall back to the map the last poll wrote, which does.
             for login in previous_desired:
                 if login not in desired:
                     redis_key = f"streamer:online:{login}"
                     if not self.redis_client.exists(redis_key):
-                        broadcaster_id = broadcaster_ids.get(login, 0)
+                        broadcaster_id = broadcaster_ids.get(
+                            login, previous_ids.get(login, 0)
+                        )
                         self._publish_lifecycle_event("offline", broadcaster_id, login, 0)
                         logger.info("Streamer offline", extra={
                             "broadcaster_login": login,
@@ -636,6 +857,30 @@ class StreamMonitoringService:
             login.decode("utf-8") if isinstance(login, bytes) else login
             for login in self.redis_client.zrange(DESIRED_KEY, 0, -1)
         }
+
+    def _read_previous_ids(self) -> Dict[str, int]:
+        """The login-to-id map the last poll wrote, for logins leaving the set.
+
+        A login only leaves the desired set by dropping out of this poll's
+        ranking, so this poll has no id for it -- which is why the offline
+        lifecycle event used to publish `broadcaster_id: 0` for every
+        streamer, and key every one of them to partition `b"0"`. Before
+        Phase 3 an instance-level dict carried ids across polls and supplied
+        it; that dict went with the IRC client.
+
+        The id is still on hand: the poller wrote it to `chat:desired:ids` in
+        the same transaction as the set it is leaving. Read it before
+        `_write_desired_set` overwrites both.
+        """
+        raw = self.redis_client.hgetall(DESIRED_IDS_KEY) or {}
+        ids = {}
+        for login, broadcaster_id in raw.items():
+            login = login.decode("utf-8") if isinstance(login, bytes) else login
+            try:
+                ids[login] = int(broadcaster_id)
+            except (TypeError, ValueError):
+                continue
+        return ids
 
     def _write_desired_set(self, desired: Dict[str, int], broadcaster_ids: Dict[str, int]):
         """Publish the desired set for the reconciler, in one transaction.
@@ -808,10 +1053,20 @@ async def main():
 
     # Set up signal handlers
     loop = asyncio.get_event_loop()
+    stop_task = None
 
     def signal_handler():
+        # Held and awaited below. `stop()` sets `running = False` before its
+        # first await, so `start()`'s keep-alive loop returns within a second
+        # and `main()` would return with the shutdown only part done --
+        # `asyncio.run` then cancels it where it stands. Everything after the
+        # reconciler wait (transport close, Kafka flush, Postgres, Redis) was
+        # being skipped: buffered chat dropped, subscriptions left for Twitch
+        # to reap, and "Stream Monitoring Service stopped" never logged.
+        nonlocal stop_task
         logger.info("Received shutdown signal")
-        asyncio.create_task(service.stop())
+        if stop_task is None:
+            stop_task = asyncio.create_task(service.stop())
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, signal_handler)
@@ -824,8 +1079,22 @@ async def main():
         await service.start()
     except Exception as e:
         logger.error("Service error", extra={"error": str(e)})
+        # If a signal already started a shutdown, `stop()` returns at once --
+        # it is idempotent -- so awaiting that task is what actually waits for
+        # the teardown. Without it `sys.exit(1)` raises SystemExit and
+        # `asyncio.run` cancels the in-flight stop mid-way, which is the
+        # truncated shutdown the await below exists to prevent.
         await service.stop()
+        if stop_task is not None:
+            try:
+                await stop_task
+            except Exception:
+                logger.exception("Shutdown failed")
         sys.exit(1)
+
+    # Let a shutdown that a signal started actually finish.
+    if stop_task is not None:
+        await stop_task
 
 
 if __name__ == "__main__":

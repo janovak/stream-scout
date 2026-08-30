@@ -95,8 +95,35 @@ count, not `total`) and maintained in memory after that.
 | Entity | Fields | Notes |
 |---|---|---|
 | `Connection` | `websocket`, `subscription_ids: set`, `occupancy` | `occupancy <= 300` (measured cap) |
-| `Pool` | `connections: list[Connection]` | Grows when `desired_count > len(connections) * 300` |
-| Routing | `connection_index = consistent_hash(broadcaster_id) % len(connections)` | A channel keeps its connection across reconciles (D6) |
+| `Pool` | `connections: list[Connection]` | Starts empty. Grows on demand when every open connection is at the cap |
+| Routing | Rendezvous hash: the connection whose `blake2b("{broadcaster_id}:{connection_id}")` digest scores highest, among those with room | A placed channel keeps its connection across reconciles and is never moved by growth (D6) |
+
+### Routing is rendezvous hashing, not modulo (corrected in Phase 2)
+
+This document first wrote the routing rule as
+`consistent_hash(id) % len(connections)`. **Modulo is the thing D6 exists to
+prevent.** Adding a connection changes the divisor, so nearly every channel
+moves to a different socket. That is a full reshuffle of the pool on growth.
+
+The implementation uses **rendezvous hashing**: score every connection against
+the broadcaster id and take the highest. Adding a connection moves only the
+channels that score higher on the new one. Two further details are
+load-bearing:
+
+- Connection ids come from a monotonic counter, so retiring one does not
+  renumber the survivors.
+- The digest is `blake2b`, not the built-in `hash()`. Python salts `hash()` of
+  a string per process, so `hash()` would reshuffle every channel on restart.
+
+**What this does not give you (narrowed in Phase 6).** The score is stable, but
+the *placement* is not stable across restarts, because `route()` only considers
+connections that are already open and the pool grows only once they are full. A
+cold start therefore fills connection 0 to the cap before connection 1 exists,
+so which socket a channel lands on depends on arrival order as well as its
+score. That is deliberate and it costs nothing: a websocket session dies with
+the process, so a restart has no subscriptions to preserve. The value D6 is
+after is entirely within one process lifetime — growth must not move a channel
+that is working, and a socket death must cost only that socket's channels.
 
 ## State transitions — a channel through the reconciler
 

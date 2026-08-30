@@ -106,3 +106,8 @@ services/stream-monitoring/phase5/*.json
 
 # Agent-created git worktrees (full duplicate checkouts)
 .claude/worktrees/
+
+# Python wheels. A venv build in the repo root once swept 16 of these
+# (~4 MB) into a commit via `git add -A`. Nothing here installs from a
+# local wheel: requirements.txt pins from PyPI.
+*.whl

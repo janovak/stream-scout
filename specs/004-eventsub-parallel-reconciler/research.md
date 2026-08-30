@@ -601,9 +601,24 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
   across 2 sockets with no broadcaster consent and `total_cost` 0.
 - **Alternatives considered**: webhook transport has a higher ceiling and
   server-side persistence across restarts, but needs a public HTTPS endpoint
-  and a challenge handshake. Revisit only if the connection pool becomes
-  unwieldy — that is far past 500 channels (about 7 sockets at 2000). Kept in
-  spec Out of Scope as the fallback.
+  and a challenge handshake. Kept in spec Out of Scope as the fallback.
+- **Corrected 2026-08-29 — the websocket ceiling is 900 channels, and this
+  decision had the number wrong.** The bullet above used to say the pool
+  becomes unwieldy "far past 500 channels (about 7 sockets at 2000)". There is
+  no 7-socket configuration: Twitch documents **"a maximum of 3 WebSockets
+  connections with enabled subscriptions"** per client-id/user-id pair, at 300
+  enabled subscriptions each
+  (`dev.twitch.tv/docs/eventsub/handling-websocket-events`, checked
+  2026-08-29). So websocket tops out at **3 × 300 = 900 channels**, and 2000
+  is not reachable on this transport at all.
+  Nothing measured in Phase 0 or Phase 5 contradicts this — the spike used 2
+  sockets for 394 and Phase 5 used 2 for 500, both inside the limit — which is
+  why it went unnoticed: every number this feature was verified at sits below
+  the cap. The consequence is only for the ramp beyond 900. **Webhook is
+  therefore not a "revisit if it gets unwieldy" option but the required
+  transport past 900 channels**, and the pool now refuses to open a fourth
+  socket rather than letting Twitch refuse each subscription with wording the
+  classifier does not recognise.
 
 ### D2 — Reconciler concurrency: 10, with mandatory 429 backoff-and-retry
 
@@ -626,6 +641,15 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
   15–20 shave ~10 s off cold start but buy nothing operationally and give the
   reconciler more in-flight work to unwind on a mid-ramp restart. 10 is the
   conservative default; the env var is there if a future channel count needs it.
+- **Outcome at the shipped default (T041, 2026-08-29)**. Read the two cold-start
+  numbers in this decision as the pair they are. **40.6 s is the T003b
+  throwaway harness at concurrency 15.** **51.1 s (99% of 500) is the shipped
+  `Reconciler` at the default concurrency 10**, and it is the number SC-001 is
+  judged on. The 10.5 s between them is the "~10 s" the bullet above predicted
+  for 15–20, now measured rather than argued, so the trade the default was
+  chosen on holds: 10 lands 8.9 s inside the 60 s target and 69 s inside the
+  120 s ceiling. Quote 51.1 s whenever the subject is what this feature ships;
+  40.6 s only ever described the harness.
 - **Alternatives considered**: unbounded fan-out (mirrors the `ClipCreator`
   thread bug this project is moving away from; and a burst >420 just 429s
   anyway); staying sequential (2.1/s — no better than IRC, 500 in ~240 s);
@@ -720,10 +744,10 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
 - **Clarified 2026-08-27**: both flags, 7-day interval (spec Clarifications,
   FR-007 and FR-013).
 
-### D6 — Connection pool routing: consistent hash
+### D6 — Connection pool routing: rendezvous hashing
 
-- **Decision**: route a channel to a connection by consistent hash of its
-  broadcaster id, so it lands on the same connection across reconciles. Track
+- **Decision**: route a channel to a connection by a hash that keeps it on the
+  same connection across reconciles. Track
   per-connection occupancy against the 300 cap. Grow the pool when the desired
   set needs more than `connections * 300` slots.
 - **Rationale**: on socket death only that connection's ~300 subscriptions need
@@ -733,6 +757,29 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
 - **Alternatives considered**: fill-first packing (a socket death forces a
   rebalance across the whole pool); fixed 2-socket pool (breaks silently above
   600 channels).
+- **Corrected during implementation (T018, 2026-08-28)**: this decision was
+  first written as "consistent hash", and `data-model.md` wrote the rule as
+  `hash(id) % len(connections)`. **Modulo is not consistent hashing, and it
+  defeats the decision.** Growing the pool changes the divisor and moves nearly
+  every channel, which is the reshuffle D6 exists to prevent. The
+  implementation uses **rendezvous hashing** — score each connection against
+  the broadcaster id, take the highest — so growth moves only the channels that
+  score higher on the new connection. Connection ids come from a monotonic
+  counter, so retiring one does not renumber the survivors. The digest is
+  `blake2b` rather than the built-in `hash()`, because Python salts `hash()` of
+  a string per process and would otherwise reshuffle every channel on restart.
+- **Narrowed in the Phase 6 code review (2026-08-29)**: the placement is stable
+  within a process, not across restarts. `route()` scores only the connections
+  that are already OPEN, and the pool grows only when those are full, so a cold
+  start fills connection 0 to the cap before connection 1 exists and arrival
+  order therefore contributes to where a channel lands. Making placement
+  restart-stable would mean routing against sockets that do not exist yet —
+  opening three for ten channels, against FR-006's "start with no connections"
+  and Twitch's habit of closing a session that has no subscription within ten
+  seconds. It would also buy nothing: a websocket session dies with the
+  process, so a restart re-creates every subscription wherever it lands. The
+  two properties D6 is actually for — growth never moves a working channel, and
+  a socket death costs only that socket's channels — hold as written.
 
 ## Risks
 
@@ -740,8 +787,8 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
 |---|---|---|---|
 | R1 | Events dropped during the subscribe ramp — `received event for unknown subscription` | **CLOSED (T004, 2026-08-28)**: 0 dropped events across a 500-channel cold ramp (12,555 events in the window), opening baseline not depressed (first-60 s / steady ratio 1.08). twitchAPI 4.5.0 registers the callback synchronously with the create POST. No warm-up gate — T040 skipped. Re-check only if the library is upgraded | T004 ✓ |
 | R2 | D3 shifts event time silently and corrupts detection | **CLOSED (T001, 2026-08-28)**: the two timestamps are identical (median offset +1 ms, 0 negative, over 24,473 messages). No event-time shift. T006 gate passed | T001 ✓ |
-| R3 | Concurrency triggers 429s not seen sequentially | **Measured (T003/T003b)**: 429s are budget-driven, not concurrency-driven — none at concurrency ≤20 for 250 creates; first 429 after ~364 creates in a larger burst. Mitigation is the D2 backoff-and-retry loop, which converged a 500-channel cold start in 40.6 s and recovered even from a drained budget. Concurrency 10 default, configurable | T003 ✓ |
-| R4 | A socket death drops up to 300 channels at once | Consistent-hash routing plus fast reconcile. Alert on a subscription-count drop (FR-012) | — |
+| R3 | Concurrency triggers 429s not seen sequentially | **Measured (T003/T003b)**: 429s are budget-driven, not concurrency-driven — none at concurrency ≤20 for 250 creates; first 429 after ~364 creates in a larger burst. Mitigation is the D2 backoff-and-retry loop, which converged a 500-channel cold start in 40.6 s **in the T003b harness at concurrency 15** — the shipped `Reconciler` at the default concurrency 10 does it in 51.1 s (T041), and that is the figure SC-001 is judged on — and recovered even from a drained budget. Concurrency 10 default, configurable | T003 ✓ |
+| R4 | A socket death drops up to 300 channels at once | Rendezvous-hash routing plus fast reconcile. Alert on a subscription-count drop (FR-012) | — |
 | R5 | Removing IRC leaves no fallback if EventSub misbehaves in production | Deliberate. The operator accepted no intermediate compatibility. `git revert` of the branch is the fallback | — |
 
 ## Deployment and token notes

@@ -110,9 +110,9 @@ reconcile_duration_seconds = Histogram(
     "reconcile_duration_seconds",
     "Wall-clock duration of one reconcile pass",
     # The default buckets stop at 10 s. A cold start to 500 channels takes
-    # about 40 s (research D2), so the interesting range would all land in
-    # +Inf. These buckets cover a converged pass (milliseconds) through the
-    # 120 s SC-001 ceiling.
+    # about 51 s at the default concurrency (measured, research T041), so the
+    # interesting range would all land in +Inf. These buckets cover a converged
+    # pass (milliseconds) through the 120 s SC-001 ceiling.
     buckets=(0.005, 0.05, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, float("inf")),
 )
 subscription_create_failures_total = Counter(
@@ -127,7 +127,7 @@ eventsub_connection_occupancy = Gauge(
 )
 reconcile_last_success_timestamp = Gauge(
     "reconcile_last_success_timestamp",
-    "Unix time of the last reconcile pass that completed without error",
+    "Unix time of the last reconcile pass that ran to completion",
 )
 
 
@@ -147,6 +147,8 @@ def resolve_reconciler_config(env=None):
     idle_timeout = float(env.get("RECONCILE_IDLE_TIMEOUT_SECONDS", "5"))
     backoff = float(env.get("RECONCILE_RATE_LIMIT_BACKOFF_SECONDS", "10"))
     max_rounds = int(env.get("RECONCILE_MAX_RETRY_ROUNDS", "20"))
+    readopt_interval = float(env.get("RECONCILE_READOPT_INTERVAL_SECONDS", "300"))
+    adopt_retry = float(env.get("RECONCILE_ADOPT_RETRY_SECONDS", "30"))
 
     if concurrency < 1:
         raise ValueError(f"RECONCILE_CONCURRENCY must be >= 1, got {concurrency}")
@@ -156,12 +158,22 @@ def resolve_reconciler_config(env=None):
         raise ValueError(f"RECONCILE_RATE_LIMIT_BACKOFF_SECONDS must be >= 0, got {backoff}")
     if max_rounds < 1:
         raise ValueError(f"RECONCILE_MAX_RETRY_ROUNDS must be >= 1, got {max_rounds}")
+    if readopt_interval <= 0:
+        raise ValueError(
+            f"RECONCILE_READOPT_INTERVAL_SECONDS must be > 0, got {readopt_interval}"
+        )
+    if adopt_retry < 0:
+        raise ValueError(
+            f"RECONCILE_ADOPT_RETRY_SECONDS must be >= 0, got {adopt_retry}"
+        )
 
     return ReconcilerConfig(
         concurrency=concurrency,
         idle_timeout_seconds=idle_timeout,
         rate_limit_backoff_seconds=backoff,
         max_retry_rounds=max_rounds,
+        readopt_interval_seconds=readopt_interval,
+        adopt_retry_seconds=adopt_retry,
     )
 
 
@@ -180,6 +192,24 @@ class ReconcilerConfig:
     idle_timeout_seconds: float = 5.0
     rate_limit_backoff_seconds: float = 10.0
     max_retry_rounds: int = 20
+    # How long the in-memory actual set may go without being checked against
+    # Twitch. Adoption used to run once and then never again unless a socket
+    # died or a revocation arrived -- both of which the pool has to observe
+    # first. A subscription lost by any route the pool CANNOT observe was
+    # therefore permanent, and `eventsub_subscription_count` went on reporting
+    # it, so the FR-012 alert could not fire. The known such route is the
+    # library's `_resubscribe()` failing part way through a reconnect: it
+    # swallows the exception and only restores the old map if nothing at all
+    # was re-created, so the channels past the failure point simply do not
+    # exist on Twitch any more. One listing every few minutes is cheap
+    # insurance against that whole class.
+    readopt_interval_seconds: float = 300.0
+    # How long to wait before retrying an enumeration that FAILED. Distinct
+    # from the interval above, and from the immediate retry a socket loss
+    # deserves: a walk that raised will probably raise again in 5 s, and
+    # retrying it every pass means a full multi-page Helix enumeration ~12
+    # times a minute on the token the clip job shares.
+    adopt_retry_seconds: float = 30.0
 
 
 class TransportError(Exception):
@@ -303,6 +333,7 @@ class StubTransport(SubscriptionTransport):
         self.connections = max(1, connections)
         self.create_calls: List[int] = []
         self.delete_calls: List[str] = []
+        self.list_calls: List[int] = []
         self._created_in_burst = 0
         self._budget_spent_at: Optional[float] = None
         self._next_id = 0
@@ -355,6 +386,7 @@ class StubTransport(SubscriptionTransport):
         # Already gone. Not an error.
 
     async def list(self) -> AsyncIterator[ExistingSubscription]:
+        self.list_calls.append(len(self.subscriptions))
         for index, (broadcaster_id, subscription_id) in enumerate(list(self.subscriptions.items())):
             if self.list_fails_after is not None and index >= self.list_fails_after:
                 raise TransportError("simulated pagination failure")
@@ -411,10 +443,15 @@ class PostgresRefusalStore(RefusalStore):
     read; the two writes happen only on a refusal or on a channel healing,
     which is rare by construction.
 
-    Every method swallows its own errors. A database that is briefly away must
-    not stop the reconciler from subscribing: the worst case of a failed read
-    is that a refused channel is tried once more, and of a failed write that a
-    refusal is re-learned next pass.
+    The WRITES swallow their own errors: a refusal that fails to record is
+    re-learned next pass, which is harmless. The READ does not, and must not.
+    Returning `{}` for a failed read is not a degraded answer, it is a wrong
+    one -- indistinguishable from "no channel is refused" -- and it silently
+    disabled the caller's own handling: `_drop_refused` has an `except` branch
+    and an explicit "Refusal cache unavailable" log for exactly this, and both
+    were unreachable for the real store. The visible cost was every refused
+    channel being retried every pass, one POST each, with nothing in the log
+    to say why.
     """
 
     def __init__(self, db_pool, recheck_days: int = REFUSAL_RECHECK_DAYS):
@@ -426,7 +463,8 @@ class PostgresRefusalStore(RefusalStore):
             return {}
         rows = self._run(
             "read",
-            lambda cur: cur.execute(
+            reraise=True,
+            work=lambda cur: cur.execute(
                 "SELECT streamer_id, "
                 "       eventsub_refused_at < NOW() - make_interval(days => %s) AS stale "
                 "FROM streamers "
@@ -436,6 +474,7 @@ class PostgresRefusalStore(RefusalStore):
             fetch=True,
         )
         return {} if rows is None else {row[0]: bool(row[1]) for row in rows}
+
 
     def mark_refused(self, broadcaster_id: int) -> None:
         self._run(
@@ -455,7 +494,7 @@ class PostgresRefusalStore(RefusalStore):
             ),
         )
 
-    def _run(self, operation: str, work, fetch: bool = False):
+    def _run(self, operation: str, work, fetch: bool = False, reraise: bool = False):
         conn = None
         try:
             conn = self.db_pool.getconn()
@@ -474,6 +513,8 @@ class PostgresRefusalStore(RefusalStore):
                     conn.rollback()
                 except Exception:
                     pass
+            if reraise:
+                raise
             return None
         finally:
             if conn is not None:
@@ -528,11 +569,35 @@ class Reconciler:
         # False until one enumeration finishes. While it is False the
         # reconciler knows its view of the world has holes.
         self._adoption_complete = False
+        # Bumped by every `invalidate_actual_set()`. `_adopt` reads it before
+        # and after its enumeration so a loss that lands mid-walk is not
+        # thrown away by the completion that follows it.
+        self._invalidations = 0
+        # Subscriptions the transport has reported lost that no enumeration has
+        # accounted for yet. `_actual` cannot be pruned on a loss -- the
+        # transport reports a count, not which channels -- so this is what
+        # keeps `eventsub_subscription_count` from going on reporting them. It
+        # accumulates, because several revocations can land between two passes,
+        # and it is cleared only by a clean walk.
+        self._unreconciled_losses = 0
+        # When the actual set was last rebuilt from Twitch, for the periodic
+        # re-check. -inf so the first pass always adopts.
+        self._last_adopt = float("-inf")
+        # Set when an enumeration FAILS, to hold off the retry. Separate from
+        # `_last_adopt`, which paces the healthy periodic re-check.
+        self._adopt_retry_after = float("-inf")
         # The live desired view. Workers read it, so that a channel which
         # leaves the set part way through a pass is not created (T014).
         self._desired_ids: Set[int] = set()
         self._pass_generation = -1
         self._wake = asyncio.Event()
+        # A SEPARATE event from `_wake`, deliberately. They mean different
+        # things -- "the poller wrote a new set" and "a socket died" -- and
+        # sharing one made each fix for the other break something: clearing it
+        # in the mid-pass refresh swallowed a socket loss, and re-setting it
+        # there left it set for the rest of the pass, so every remaining
+        # channel re-read Redis. Two events, no interaction.
+        self._invalidated = asyncio.Event()
         self._refresh_lock = asyncio.Lock()
         # Channels whose refusal has gone stale and that this pass is giving
         # one more try. A create that succeeds for one of these clears the
@@ -545,7 +610,7 @@ class Reconciler:
     def subscription_count(self) -> int:
         return len(self._actual)
 
-    def invalidate_actual_set(self):
+    def invalidate_actual_set(self, lost_subscriptions: int = 0):
         """Rebuild the actual set from the transport on the next pass.
 
         The transport calls this when it loses a connection (T023). Everything
@@ -555,11 +620,37 @@ class Reconciler:
         which is the alert path (FR-012) -- and the ordinary diff re-creates
         those channels on a surviving or new connection.
 
+        `lost_subscriptions` is how many went with the loss, and it is what
+        makes that drop real. `_actual` cannot be pruned here -- the transport
+        reports a count, not which channels -- so the count is carried in
+        `_unreconciled_losses` and subtracted until a clean walk settles it.
+        Without this the dip did not exist to be alerted on: the gauge was
+        written once, at the END of a pass, so a loss followed by a successful
+        re-create moved it from a value back to the same value and no scrape
+        could see it. Worse, if the re-enumeration then failed -- and a blip
+        that kills a socket is exactly what fails a walk -- `_adopt`
+        deliberately merges the stale entries back in, so the healthy-looking
+        count survived pass after pass.
+
         Drops stay switched off until an enumeration succeeds, so a failure to
         re-enumerate cannot turn into a mass delete.
         """
         self._adoption_complete = False
-        self._wake.set()
+        self._invalidations += 1
+        if lost_subscriptions > 0:
+            self._unreconciled_losses += lost_subscriptions
+            self._publish_subscription_count()
+        # Clear any failed-enumeration backoff. Round 7 added that backoff and
+        # claimed in a comment that a socket loss "does not come through here"
+        # -- it does: the gate in `reconcile_once` covers every adoption path.
+        # A failed walk and a dead socket are positively correlated (one blip
+        # causes both), so the pairing is likely, and it left up to 300
+        # channels dark for the whole backoff: `_actual` still held the dead
+        # socket's ids, so they never entered `to_create`. A loss earns one
+        # immediate attempt; if THAT walk fails, `_adopt` sets the backoff
+        # again, so this cannot become the hot loop the backoff prevents.
+        self._adopt_retry_after = float("-inf")
+        self._invalidated.set()
 
     def notify_desired_changed(self):
         """Tell the loop that the poller wrote a new desired set.
@@ -583,7 +674,30 @@ class Reconciler:
         )
         try:
             while self.running:
-                await self.reconcile_once()
+                try:
+                    await self.reconcile_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # `reconcile_once` guards the paths it expects to fail, so
+                    # reaching here means something unforeseen. Ending the task
+                    # would be silent: `self._reconciler_task` holds a live
+                    # reference, so asyncio's "Task exception was never
+                    # retrieved" handler never runs and no traceback is ever
+                    # printed. The service would go on polling and writing
+                    # `chat:desired` while no subscription was created or
+                    # dropped again, with a frozen
+                    # `reconcile_last_success_timestamp` as the only symptom.
+                    logger.exception("Reconcile pass raised, continuing")
+                if not self.running:
+                    # `stop()` signals through `_wake`, and
+                    # `_maybe_refresh_desired` clears that event for its own
+                    # purpose -- so the signal can be gone by the time the pass
+                    # ends. Re-check the flag directly rather than waiting on
+                    # an event that may already have been consumed, or shutdown
+                    # sits here for the whole idle timeout and the service's
+                    # bounded "ask first" wait always times out instead.
+                    break
                 await self._wait_for_work()
         except asyncio.CancelledError:
             logger.info("Reconciler cancelled")
@@ -599,7 +713,9 @@ class Reconciler:
         """Run one pass: read the intent, diff it, and act on the difference."""
         started = time.monotonic()
         try:
-            if not self._adoption_complete:
+            if (
+                not self._adoption_complete or self._readopt_due()
+            ) and time.monotonic() >= self._adopt_retry_after:
                 await self._adopt()
 
             desired = self._read_desired()
@@ -652,9 +768,16 @@ class Reconciler:
         await self._drop_all(to_drop)
         await self._create_all(to_create)
 
-        eventsub_subscription_count.set(len(self._actual))
+        self._publish_subscription_count()
         self._publish_occupancy()
         reconcile_duration_seconds.observe(time.monotonic() - started)
+        # "Ran to completion", not "had no failures". A pass where individual
+        # creates refused or errored still reached here, and that is on
+        # purpose: at 500 channels one broadcaster refuses on every pass, so a
+        # no-failures gate would hold this gauge still for ever and destroy the
+        # signal it exists for. What it detects is a reconciler that has
+        # stopped completing passes at all, while the poller keeps working.
+        # Per-channel failures are `subscription_create_failures_total`.
         reconcile_last_success_timestamp.set(time.time())
         if self.on_pass_complete is not None:
             self.on_pass_complete(len(self._actual))
@@ -665,12 +788,28 @@ class Reconciler:
 
     async def _wait_for_work(self):
         """Wait for a generation bump, or for the idle timeout."""
+        waiters = [
+            asyncio.ensure_future(self._wake.wait()),
+            asyncio.ensure_future(self._invalidated.wait()),
+        ]
         try:
-            await asyncio.wait_for(self._wake.wait(), timeout=self.config.idle_timeout_seconds)
-        except asyncio.TimeoutError:
-            pass
+            await asyncio.wait(
+                waiters,
+                timeout=self.config.idle_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         finally:
+            for waiter in waiters:
+                waiter.cancel()
             self._wake.clear()
+            self._invalidated.clear()
+
+    def _readopt_due(self) -> bool:
+        """True when the in-memory actual set is due a check against Twitch."""
+        return (
+            time.monotonic() - self._last_adopt
+            >= self.config.readopt_interval_seconds
+        )
 
     def _wake_if_generation_moved(self):
         """Run again at once if the poller wrote a new set during this pass."""
@@ -692,12 +831,24 @@ class Reconciler:
     def _read_desired(self) -> DesiredSet:
         ranked = self.redis_client.zrange(DESIRED_KEY, 0, -1)
         ids = self.redis_client.hgetall(DESIRED_IDS_KEY) or {}
+        # Per entry, not a comprehension that raises. One unparseable value
+        # used to take out `_read_desired` entirely, so `reconcile_once` hit
+        # its "could not read the desired set" early return and created and
+        # dropped nothing at all until the next poll rewrote the hash. The
+        # poller's own reader of this key already skips bad entries; a single
+        # bad member should cost that member, not the pass.
+        parsed: Dict[str, int] = {}
+        for login, broadcaster_id in ids.items():
+            try:
+                parsed[self._as_text(login)] = int(broadcaster_id)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Unparseable broadcaster id in the desired-set map, skipping it",
+                    extra={"login": self._as_text(login)},
+                )
         return DesiredSet(
             logins=[self._as_text(login) for login in ranked],
-            ids={
-                self._as_text(login): int(broadcaster_id)
-                for login, broadcaster_id in ids.items()
-            },
+            ids=parsed,
             generation=self._read_generation(),
         )
 
@@ -720,6 +871,19 @@ class Reconciler:
         not treated as absent, and drops stay switched off until a full pass
         succeeds (NFR-003).
         """
+        # `transport.list()` is a paginated walk with awaits in it, and the
+        # pool's supervisor runs on this same loop. A socket can die *during*
+        # the enumeration and call `invalidate_actual_set()`, and marking the
+        # adoption complete afterwards would throw that signal away: the
+        # enumeration's snapshot still holds the dead session, so its channels
+        # are recorded as covered while nothing delivers for them, and nothing
+        # re-enumerates until some later, unrelated loss. Count invalidations
+        # and re-check at the end.
+        invalidations_before = self._invalidations
+        # Stamped for every attempt, so a failed walk cannot leave
+        # `_readopt_due()` permanently true. This paces the healthy re-check;
+        # what bounds a FAILING one is `_adopt_retry_after`, set below.
+        self._last_adopt = time.monotonic()
         adopted: Dict[int, str] = {}
         skipped_status = 0
         complete = True
@@ -733,20 +897,58 @@ class Reconciler:
                     skipped_status += 1
         except Exception as e:
             complete = False
+            # Hold off the retry. Stamping `_last_adopt` alone did NOT bound
+            # this, which the comment there used to claim: a partial walk also
+            # clears `_adoption_complete`, and `reconcile_once` re-adopts on
+            # `not self._adoption_complete OR self._readopt_due()`, so the
+            # first disjunct forced a full multi-page enumeration on every 5 s
+            # pass however recently `_last_adopt` was stamped. A socket loss
+            # still retries at once -- it does not come through here.
+            self._adopt_retry_after = time.monotonic() + self.config.adopt_retry_seconds
             logger.error(
                 "Subscription enumeration failed part way, keeping what was seen",
-                extra={"error": str(e), "seen": len(adopted)},
+                extra={
+                    "error": str(e),
+                    "seen": len(adopted),
+                    "retry_after_seconds": self.config.adopt_retry_seconds,
+                },
             )
 
-        if complete:
+        invalidated_during = self._invalidations != invalidations_before
+
+        if complete and not invalidated_during:
             self._actual = adopted
             self._adoption_complete = True
+            # A clean walk IS the reconciliation: `adopted` is what Twitch says
+            # exists on a session this pool holds, so nothing is outstanding.
+            self._unreconciled_losses = 0
+        elif complete:
+            # A connection was lost while this enumeration ran. What it saw is
+            # still the freshest view available, so keep it -- but leave the
+            # adoption incomplete so the next pass re-enumerates and drops stay
+            # held back until one clean walk succeeds (NFR-003).
+            self._actual = adopted
+            logger.warning(
+                "Subscriptions were lost while enumerating, re-enumerating next pass",
+                extra={"adopted": len(adopted)},
+            )
         else:
             # Keep both views. A subscription seen before is still real, and
             # one seen now is new information.
             merged = dict(self._actual)
             merged.update(adopted)
             self._actual = merged
+            # And the view has holes again, so drops go back off until a clean
+            # walk succeeds (NFR-003). Before the periodic re-adopt existed
+            # this was implicit -- `_adopt` only ran while the flag was already
+            # False -- and the periodic path broke that implication by reaching
+            # here with it True.
+            self._adoption_complete = False
+
+        # The freshest count there is, and available before the creates below
+        # start: a loss is now visible as soon as the walk that confirms it
+        # finishes, rather than at the end of the whole pass.
+        self._publish_subscription_count()
 
         logger.info(
             "Adopted existing subscriptions",
@@ -821,6 +1023,7 @@ class Reconciler:
             return
         subscription_id = await self.transport.create(broadcaster_id)
         self._actual[broadcaster_id] = subscription_id
+        self._publish_subscription_count()
         if broadcaster_id in self._rechecking_refusals:
             # The channel refused more than REFUSAL_RECHECK_DAYS ago and has
             # just accepted. Clear the mark so it is a normal channel again.
@@ -837,6 +1040,7 @@ class Reconciler:
             return
         await self.transport.delete(subscription_id)
         self._actual.pop(broadcaster_id, None)
+        self._publish_subscription_count()
 
     async def _run_batch(self, broadcaster_ids: Iterable[int], handler, operation: str):
         """Run `handler` over the ids on a fixed pool of workers.
@@ -931,6 +1135,12 @@ class Reconciler:
                 # Keep the view we have. The next pass corrects it.
                 logger.warning("Mid-pass desired refresh failed", extra={"error": str(e)})
                 return
+            # Only the desired-set signal. A socket loss has its own event, so
+            # clearing this one cannot swallow it and there is nothing to put
+            # back -- which matters because this runs once per channel, and
+            # re-setting the event here left it set for the rest of the pass,
+            # turning "read Redis once per generation" into three synchronous
+            # round trips per channel.
             self._wake.clear()
             self._desired_ids = set(desired.broadcaster_ids())
             logger.info(
@@ -994,6 +1204,21 @@ class Reconciler:
         if self.refusal_store is None:
             return
         self.refusal_store.clear_refusal(broadcaster_id)
+
+    def _publish_subscription_count(self):
+        """The FR-012 gauge, from every place the live count can change.
+
+        `len(self._actual)` alone is not the live count between a reported loss
+        and the walk that confirms it: those subscriptions are gone from Twitch
+        but still in `_actual`, because the transport reports how many went,
+        not which. Subtracting the unreconciled losses is what makes the dip
+        the runbook alerts on real -- and it survives a failed enumeration,
+        where `_adopt` deliberately merges the stale entries back and would
+        otherwise re-inflate the gauge to the value the loss just corrected.
+        """
+        eventsub_subscription_count.set(
+            max(0, len(self._actual) - self._unreconciled_losses)
+        )
 
     def _publish_occupancy(self):
         try:
