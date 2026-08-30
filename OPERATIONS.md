@@ -104,6 +104,78 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_|reconcile_|subscrip
 
 ---
 
+## Ramping the monitored channel count
+
+Spec 004 removed the ingestion ceiling. The transport was verified to a
+synthetic 500 channels (`specs/004-eventsub-parallel-reconciler/research.md`
+Phase 5), but production still runs at `JOIN_THRESHOLD` 15 / `LEAVE_THRESHOLD`
+30. Raise the count in steps, not in one jump. Each step adds real message
+volume and real Flink load that the synthetic test did not exercise.
+
+### How to change the thresholds
+
+The poller reads `JOIN_THRESHOLD` and `LEAVE_THRESHOLD` from the environment
+(defaults 15 and 30). `LEAVE_THRESHOLD` must be greater than `JOIN_THRESHOLD`,
+or the service refuses to start.
+
+1. Add both variables to the `stream-monitoring` `environment:` block in
+   `docker-compose.yml`.
+2. Restart only that container:
+   ```bash
+   docker compose up -d --force-recreate stream-monitoring
+   ```
+3. The reconciler converges to the new set on its next pass. It adopts the
+   subscriptions it already holds and creates the rest. A larger set costs a
+   longer cold start, not a failed one.
+
+Also raise `CLIPPING_DISABLED_FETCH_BUFFER` (default 20) if the log line
+`Fewer than LEAVE_THRESHOLD clip-allowed streams found even after padding
+fetch` starts to appear. The buffer is a flat pad, so it thins out as the
+threshold grows.
+
+### The step ladder
+
+| Step | `JOIN_THRESHOLD` / `LEAVE_THRESHOLD` |
+|---|---|
+| 0 (today) | 15 / 30 |
+| 1 | 50 / 100 |
+| 2 | 150 / 300 |
+| 3 | 300 / 500 |
+
+Soak each step for at least 30 minutes before the next.
+
+### What to check at each step
+
+| Signal | Healthy | Stop and investigate |
+|---|---|---|
+| `eventsub_subscription_count` vs `ZCARD chat:desired` | equal, within one pass interval | a gap that does not close |
+| `reconcile_duration_seconds` | a converged pass is milliseconds | the median climbs step over step |
+| `subscription_create_failures_total{reason="429"}` | short bursts during the cold start, all retried | the counter keeps rising after convergence |
+| `eventsub_connection_occupancy` | no connection over 300; pool grows as needed | `pool is at its 3-connection limit` (that is the 900-channel hard cap) |
+| Kafka producer lag, Flink source watermark lag | flat | either grows and does not recover |
+| Flink TaskManager heap | stable below the 6 GB cap | approaches the cap |
+| `clips_created_failed_total` | low and flat | climbing — see below |
+
+### The clip ceiling is expected, not a regression
+
+Clip creation is capped per Twitch account. A larger monitored set detects far
+more anomalies than the account can clip — about 2.2 detections per
+broadcaster-hour (`research.md` §1). Somewhere on this ladder
+`clips_created_failed_total` starts to climb and `ClipCreator` spawns more
+threads than it retires. **That is the signal to stop ramping and start spec
+005** (anomaly ranking against a scarce clip budget). Record the channel count,
+the detections-per-hour, and the clip-failure rate at the step where it
+appears — those numbers are spec 005's Phase 0 input.
+
+### Rolling back a step
+
+Lower both numbers, restart `stream-monitoring`. The reconciler drops the
+now-unwanted subscriptions on its next pass. Nothing downstream breaks: Flink
+keeps the baseline state for a dropped channel until its TTL expires, so a
+re-raise inside that window keeps the warm-up.
+
+---
+
 ## Important: Postgres and Redis are remote
 
 Postgres and Redis do **not** run on this machine. They run on the Tailscale host `streamer-summaries-api` (100.112.97.111). `docker-compose.override.yml` points `api-frontend`, `stream-monitoring`, and both Flink containers at that host.
