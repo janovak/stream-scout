@@ -1304,38 +1304,67 @@ class TestReconcilerAdoption:
             "the re-enumeration did not notice the subscription had gone"
         )
 
-    def test_a_failed_re_enumeration_does_not_become_a_hot_loop(self):
-        """`_readopt_due()` compares against `_last_adopt`, which used to be
-        stamped only on a clean walk. A periodic re-adopt that failed part way
-        therefore left it true for ever, turning the 300 s re-check into a full
-        multi-page Helix enumeration on every 5 s pass -- on the same user
-        token the clip job shares."""
+    def test_a_failed_enumeration_backs_off(self):
+        """A walk that raised will probably raise again in 5 s, and retrying it
+        every pass is a full multi-page Helix enumeration ~12 times a minute on
+        the token the clip job shares.
+
+        Stamping `_last_adopt` does NOT bound this, though an earlier comment
+        here claimed it did: a partial walk also clears `_adoption_complete`,
+        and `reconcile_once` re-adopts on `not complete OR readopt_due`, so the
+        first disjunct fires however recently `_last_adopt` was stamped. The
+        earlier version of this test could not tell the difference -- it only
+        checked `_readopt_due()` after a SUCCESSFUL recovery walk, which stamps
+        `_last_adopt` either way.
+        """
         fake_redis = FakeRedis()
-        # Wanted, so the first pass keeps them and there is something to
-        # enumerate when the re-check comes due.
         seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3), ("d", 4)])
         transport = StubTransport()
         for broadcaster_id in (1, 2, 3, 4):
             asyncio.run(transport.create(broadcaster_id))
-        reconciler = make_reconciler(transport, fake_redis, readopt_interval_seconds=3600)
+        reconciler = make_reconciler(
+            transport, fake_redis, readopt_interval_seconds=3600, adopt_retry_seconds=30
+        )
         asyncio.run(reconciler.reconcile_once())
         assert reconciler._adoption_complete is True
 
-        # The periodic re-check comes due and fails part way through.
+        # The periodic re-check comes due and Twitch fails mid-pagination.
         reconciler._last_adopt = float("-inf")
         transport.list_fails_after = 2
         asyncio.run(reconciler.reconcile_once())
+        assert reconciler._adoption_complete is False
+        walks_after_failure = len(transport.list_calls)
 
-        # The view has holes, so it retries next pass -- that is by design.
-        # What it must NOT do is stay due for ever once it recovers.
-        assert reconciler._adoption_complete is False, (
-            "a partial walk left drops enabled on an incomplete view"
+        # The next passes must NOT re-enumerate, even though the view is known
+        # to be incomplete. That is the whole point of the backoff.
+        asyncio.run(reconciler.reconcile_once())
+        asyncio.run(reconciler.reconcile_once())
+        assert len(transport.list_calls) == walks_after_failure, (
+            "a failed enumeration is being retried on every pass"
         )
+
+        # And once the window passes it tries again and recovers.
+        reconciler._adopt_retry_after = float("-inf")
         transport.list_fails_after = None
         asyncio.run(reconciler.reconcile_once())
         assert reconciler._adoption_complete is True
-        assert reconciler._readopt_due() is False, (
-            "the re-adopt stayed due, so every pass will re-enumerate Twitch"
+        assert reconciler._readopt_due() is False
+
+    def test_a_socket_loss_is_not_delayed_by_the_enumeration_backoff(self):
+        """The backoff must not slow recovery from a dead socket: that path
+        does not come through a failed walk, and its enumeration will succeed."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1)])
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis, adopt_retry_seconds=30)
+        asyncio.run(reconciler.reconcile_once())
+        walks = len(transport.list_calls)
+
+        reconciler.invalidate_actual_set()
+        asyncio.run(reconciler.reconcile_once())
+
+        assert len(transport.list_calls) > walks, (
+            "a socket loss waited out the failed-enumeration backoff"
         )
 
     def test_partial_enumeration_never_deletes(self):
@@ -1362,7 +1391,9 @@ class TestReconcilerAdoption:
         for broadcaster_id in (1, 2, 3, 4):
             asyncio.run(transport.create(broadcaster_id))
         transport.list_fails_after = 2
-        reconciler = make_reconciler(transport, fake_redis)
+        # No failure backoff here: this test is about the retry converging,
+        # and `test_a_failed_enumeration_backs_off` covers the pacing.
+        reconciler = make_reconciler(transport, fake_redis, adopt_retry_seconds=0)
         asyncio.run(reconciler.reconcile_once())
 
         transport.list_fails_after = None
@@ -2689,6 +2720,29 @@ class TestPoolRaces:
             assert websocket._callbacks == {}
             assert pool._slots == {}
             assert pool.occupancy() == {"0": 0}
+
+        asyncio.run(run())
+
+    def test_the_pool_refuses_to_grow_past_the_twitch_connection_limit(self):
+        """Twitch allows 3 websocket connections with enabled subscriptions per
+        client-id/user-id pair, so this transport tops out at 900 channels.
+        Growth was unbounded and knew nothing about it. A fourth socket does
+        not fail at connect time -- it fails later, per subscription, with an
+        error this module cannot classify, and rendezvous routing keeps sending
+        the same channels back to it: a silent retry loop with only a WARNING.
+        """
+
+        async def run():
+            pool = make_pool(cap=1)
+            await pool.start()
+            for broadcaster_id in range(1, 4):
+                await pool.create(broadcaster_id)
+            assert len(pool._connections) == 3
+
+            with pytest.raises(TransportError) as caught:
+                await pool.create(4)
+            assert "connection limit" in str(caught.value)
+            assert len(pool._connections) == 3, "a fourth socket was opened"
 
         asyncio.run(run())
 

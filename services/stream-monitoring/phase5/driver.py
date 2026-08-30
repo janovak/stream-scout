@@ -32,6 +32,14 @@ What it shares with production, and why that is safe
   that happens to land in the same window. Production backs off ~10 s and
   retries, and never drops a channel (D2). The operator accepted this on
   2026-08-29.
+- **The websocket CONNECTION limit is shared too, and this analysis missed it
+  until the Phase 6 review (2026-08-29).** Twitch allows 3 connections with
+  enabled subscriptions per client-id/user-id pair. A 500-channel ramp here
+  needs 2, and production at 15/30 needs 1 -- exactly 3, with no headroom.
+  If production ever grows to a second socket while this driver is running,
+  the driver's second `_grow()` is refused, and so is any fourth connection
+  either side asks for. Run the driver only while production is on one
+  socket, i.e. below 300 channels.
 
 Redis
 -----

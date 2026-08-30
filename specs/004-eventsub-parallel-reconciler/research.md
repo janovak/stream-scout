@@ -601,9 +601,24 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
   across 2 sockets with no broadcaster consent and `total_cost` 0.
 - **Alternatives considered**: webhook transport has a higher ceiling and
   server-side persistence across restarts, but needs a public HTTPS endpoint
-  and a challenge handshake. Revisit only if the connection pool becomes
-  unwieldy — that is far past 500 channels (about 7 sockets at 2000). Kept in
-  spec Out of Scope as the fallback.
+  and a challenge handshake. Kept in spec Out of Scope as the fallback.
+- **Corrected 2026-08-29 — the websocket ceiling is 900 channels, and this
+  decision had the number wrong.** The bullet above used to say the pool
+  becomes unwieldy "far past 500 channels (about 7 sockets at 2000)". There is
+  no 7-socket configuration: Twitch documents **"a maximum of 3 WebSockets
+  connections with enabled subscriptions"** per client-id/user-id pair, at 300
+  enabled subscriptions each
+  (`dev.twitch.tv/docs/eventsub/handling-websocket-events`, checked
+  2026-08-29). So websocket tops out at **3 × 300 = 900 channels**, and 2000
+  is not reachable on this transport at all.
+  Nothing measured in Phase 0 or Phase 5 contradicts this — the spike used 2
+  sockets for 394 and Phase 5 used 2 for 500, both inside the limit — which is
+  why it went unnoticed: every number this feature was verified at sits below
+  the cap. The consequence is only for the ramp beyond 900. **Webhook is
+  therefore not a "revisit if it gets unwieldy" option but the required
+  transport past 900 channels**, and the pool now refuses to open a fourth
+  socket rather than letting Twitch refuse each subscription with wording the
+  classifier does not recognise.
 
 ### D2 — Reconciler concurrency: 10, with mandatory 429 backoff-and-retry
 

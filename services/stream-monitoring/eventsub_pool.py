@@ -86,6 +86,18 @@ logger = logging.getLogger("stream_monitoring")
 # Measured cap for one websocket session. Twitch documents 300 for a websocket
 # transport and the spike confirmed it.
 SUBSCRIPTIONS_PER_CONNECTION = 300
+# Twitch's other websocket limit, and the one nothing here used to know about:
+# "You can create a maximum of 3 WebSockets connections with enabled
+# subscriptions", per client-id/user-id pair
+# (dev.twitch.tv/docs/eventsub/handling-websocket-events, checked 2026-08-29).
+# So the real ceiling for this transport is 3 x 300 = 900 channels, not the
+# arbitrary number the growth rule implied. Past it Twitch refuses the
+# subscriptions on the fourth socket with wording that matches none of the
+# markers below, so the channels routed there would be retried for ever on a
+# socket that can never take them, with only a WARNING to show for it. Fail
+# loudly at the boundary instead.
+MAX_CONNECTIONS = 3
+MAX_SUBSCRIPTIONS = SUBSCRIPTIONS_PER_CONNECTION * MAX_CONNECTIONS
 
 # The only subscription type this pool creates. Also the filter for `list()`,
 # so a subscription made by something else never enters the actual set.
@@ -299,6 +311,7 @@ class EventSubPoolTransport(SubscriptionTransport):
         on_subscriptions_lost: Optional[Callable[[int], None]] = None,
         supervise_interval_seconds: float = DEFAULT_SUPERVISE_INTERVAL_SECONDS,
         connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        max_connections: int = MAX_CONNECTIONS,
     ):
         self.twitch = twitch
         self.message_handler = message_handler
@@ -308,6 +321,7 @@ class EventSubPoolTransport(SubscriptionTransport):
         self.on_subscriptions_lost = on_subscriptions_lost
         self.supervise_interval_seconds = supervise_interval_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
+        self.max_connections = max_connections
         # Monotonic deadline after a failed `_grow`, so the rest of a batch
         # fails fast instead of each channel waiting out its own connect.
         self._growth_blocked_until = 0.0
@@ -643,10 +657,25 @@ class EventSubPoolTransport(SubscriptionTransport):
     async def _grow(self) -> _Connection:
         """Open one more session. Called with the lock held.
 
+        Refuses past `MAX_CONNECTIONS`. Twitch allows three websocket
+        connections with enabled subscriptions per client-id/user-id pair, so
+        this transport tops out at `MAX_SUBSCRIPTIONS` channels. Opening a
+        fourth socket does not fail at connect time -- it fails later, per
+        subscription, with an error this module cannot classify, and rendezvous
+        routing keeps sending the same channels back to it. A clear refusal
+        here is the difference between "the pool is full" in the log and a
+        silent retry loop.
+
         `EventSubWebsocket.start()` blocks the calling thread until the
         session_welcome arrives, so it runs on the default executor rather
         than stalling the service's event loop for the length of a connect.
         """
+        if len(self._connections) >= self.max_connections:
+            raise TransportError(
+                f"pool is at its {self.max_connections}-connection limit "
+                f"({self.max_connections * self.cap} subscriptions); "
+                "Twitch allows no more websocket connections for this token"
+            )
         websocket = self._connection_factory()
         loop = asyncio.get_running_loop()
         try:
@@ -951,12 +980,31 @@ class EventSubPoolTransport(SubscriptionTransport):
             socket_loop = getattr(websocket, "_socket_loop", None)
             if socket_loop is not None and socket_loop.is_running():
                 async def teardown():
+                    # Not `_stop()` alone. Its first statement is
+                    # `await self._connection.close()`, and after a failed
+                    # `ws_connect` that attribute is None -- so it raises
+                    # straight away and never reaches
+                    # `await self._session.close()`. That is precisely the
+                    # timeout path this teardown exists for, so relying on
+                    # `_stop()` leaked the aiohttp ClientSession, its connector
+                    # sockets and the event loop every time, invisibly: the
+                    # connection is never appended to `_connections`, so the
+                    # supervisor cannot see it either. Close each piece on its
+                    # own, so one failure cannot skip the next.
+                    for closer in ("_connection", "_session"):
+                        target = getattr(websocket, closer, None)
+                        if target is None:
+                            continue
+                        try:
+                            await target.close()
+                        except Exception:
+                            pass
                     try:
-                        await websocket._stop()
+                        websocket._connection = None
+                        websocket._session = None
                     except Exception:
                         pass
-                    finally:
-                        websocket._closing = True
+                    websocket._closing = True
 
                 asyncio.run_coroutine_threadsafe(teardown(), socket_loop)
             else:

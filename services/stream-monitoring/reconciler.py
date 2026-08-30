@@ -148,6 +148,7 @@ def resolve_reconciler_config(env=None):
     backoff = float(env.get("RECONCILE_RATE_LIMIT_BACKOFF_SECONDS", "10"))
     max_rounds = int(env.get("RECONCILE_MAX_RETRY_ROUNDS", "20"))
     readopt_interval = float(env.get("RECONCILE_READOPT_INTERVAL_SECONDS", "300"))
+    adopt_retry = float(env.get("RECONCILE_ADOPT_RETRY_SECONDS", "30"))
 
     if concurrency < 1:
         raise ValueError(f"RECONCILE_CONCURRENCY must be >= 1, got {concurrency}")
@@ -161,6 +162,10 @@ def resolve_reconciler_config(env=None):
         raise ValueError(
             f"RECONCILE_READOPT_INTERVAL_SECONDS must be > 0, got {readopt_interval}"
         )
+    if adopt_retry < 0:
+        raise ValueError(
+            f"RECONCILE_ADOPT_RETRY_SECONDS must be >= 0, got {adopt_retry}"
+        )
 
     return ReconcilerConfig(
         concurrency=concurrency,
@@ -168,6 +173,7 @@ def resolve_reconciler_config(env=None):
         rate_limit_backoff_seconds=backoff,
         max_retry_rounds=max_rounds,
         readopt_interval_seconds=readopt_interval,
+        adopt_retry_seconds=adopt_retry,
     )
 
 
@@ -198,6 +204,12 @@ class ReconcilerConfig:
     # exist on Twitch any more. One listing every few minutes is cheap
     # insurance against that whole class.
     readopt_interval_seconds: float = 300.0
+    # How long to wait before retrying an enumeration that FAILED. Distinct
+    # from the interval above, and from the immediate retry a socket loss
+    # deserves: a walk that raised will probably raise again in 5 s, and
+    # retrying it every pass means a full multi-page Helix enumeration ~12
+    # times a minute on the token the clip job shares.
+    adopt_retry_seconds: float = 30.0
 
 
 class TransportError(Exception):
@@ -321,6 +333,7 @@ class StubTransport(SubscriptionTransport):
         self.connections = max(1, connections)
         self.create_calls: List[int] = []
         self.delete_calls: List[str] = []
+        self.list_calls: List[int] = []
         self._created_in_burst = 0
         self._budget_spent_at: Optional[float] = None
         self._next_id = 0
@@ -373,6 +386,7 @@ class StubTransport(SubscriptionTransport):
         # Already gone. Not an error.
 
     async def list(self) -> AsyncIterator[ExistingSubscription]:
+        self.list_calls.append(len(self.subscriptions))
         for index, (broadcaster_id, subscription_id) in enumerate(list(self.subscriptions.items())):
             if self.list_fails_after is not None and index >= self.list_fails_after:
                 raise TransportError("simulated pagination failure")
@@ -562,6 +576,9 @@ class Reconciler:
         # When the actual set was last rebuilt from Twitch, for the periodic
         # re-check. -inf so the first pass always adopts.
         self._last_adopt = float("-inf")
+        # Set when an enumeration FAILS, to hold off the retry. Separate from
+        # `_last_adopt`, which paces the healthy periodic re-check.
+        self._adopt_retry_after = float("-inf")
         # The live desired view. Workers read it, so that a channel which
         # leaves the set part way through a pass is not created (T014).
         self._desired_ids: Set[int] = set()
@@ -664,7 +681,9 @@ class Reconciler:
         """Run one pass: read the intent, diff it, and act on the difference."""
         started = time.monotonic()
         try:
-            if not self._adoption_complete or self._readopt_due():
+            if (
+                not self._adoption_complete or self._readopt_due()
+            ) and time.monotonic() >= self._adopt_retry_after:
                 await self._adopt()
 
             desired = self._read_desired()
@@ -817,11 +836,9 @@ class Reconciler:
         # re-enumerates until some later, unrelated loss. Count invalidations
         # and re-check at the end.
         invalidations_before = self._invalidations
-        # Stamped for every attempt, not only a clean one. `_readopt_due()`
-        # compares against this, and leaving it alone on the failure path kept
-        # it true for ever: a periodic re-adopt that failed part way turned the
-        # 300 s re-check into a full multi-page Helix enumeration on every
-        # pass -- roughly 12 a minute, on the token the clip job shares.
+        # Stamped for every attempt, so a failed walk cannot leave
+        # `_readopt_due()` permanently true. This paces the healthy re-check;
+        # what bounds a FAILING one is `_adopt_retry_after`, set below.
         self._last_adopt = time.monotonic()
         adopted: Dict[int, str] = {}
         skipped_status = 0
@@ -836,9 +853,21 @@ class Reconciler:
                     skipped_status += 1
         except Exception as e:
             complete = False
+            # Hold off the retry. Stamping `_last_adopt` alone did NOT bound
+            # this, which the comment there used to claim: a partial walk also
+            # clears `_adoption_complete`, and `reconcile_once` re-adopts on
+            # `not self._adoption_complete OR self._readopt_due()`, so the
+            # first disjunct forced a full multi-page enumeration on every 5 s
+            # pass however recently `_last_adopt` was stamped. A socket loss
+            # still retries at once -- it does not come through here.
+            self._adopt_retry_after = time.monotonic() + self.config.adopt_retry_seconds
             logger.error(
                 "Subscription enumeration failed part way, keeping what was seen",
-                extra={"error": str(e), "seen": len(adopted)},
+                extra={
+                    "error": str(e),
+                    "seen": len(adopted),
+                    "retry_after_seconds": self.config.adopt_retry_seconds,
+                },
             )
 
         invalidated_during = self._invalidations != invalidations_before

@@ -187,7 +187,12 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   one reconcile cycle; full coverage from a cold start MUST land inside the
   SC-001 bound.
 - **FR-006**: The system MUST distribute subscriptions across websocket
-  connections, respecting the measured **300 per connection** cap. The pool
+  connections, respecting the measured **300 per connection** cap and Twitch's
+  limit of **3 websocket connections** with enabled subscriptions per
+  client-id/user-id pair. The two together put a hard ceiling of **900
+  channels** on this transport; the system MUST refuse to open a fourth
+  connection rather than let Twitch refuse the subscriptions on it
+  (added 2026-08-29 — see `research.md` D1). The pool
   MUST start with no connections and grow on demand when the desired set needs
   more than the open connections can hold. Routing MUST be stable across
   reconciles and across restarts, and growing the pool MUST NOT move a channel
@@ -358,5 +363,9 @@ that restarts, partial failures, and Twitch-side revocations self-heal.
   feature.
 - The detector state work in 003, which measurement deflated.
 - Kafka partition and Flink parallelism re-provisioning.
-- Webhook transport, unless websocket proves insufficient (see `research.md`
-  decision D1).
+- Webhook transport, which is **required past 900 channels**, not optional.
+  Twitch allows 3 websocket connections of 300 enabled subscriptions each per
+  client-id/user-id pair, so 900 is this transport's hard ceiling — see
+  `research.md` D1, corrected 2026-08-29. Every number in this spec sits below
+  it (500 needs 2 sockets), so it does not affect the feature as delivered; it
+  is the wall the ramp meets after spec 005's clip budget.
