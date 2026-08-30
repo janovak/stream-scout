@@ -106,17 +106,25 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_|reconcile_|subscrip
 
 ## Ramping the monitored channel count
 
-Spec 004 removed the ingestion ceiling. The transport was verified to a
-synthetic 500 channels (`specs/004-eventsub-parallel-reconciler/research.md`
-Phase 5), but production runs at `JOIN_THRESHOLD` 15 / `LEAVE_THRESHOLD` 30.
+Spec 004 removed the ingestion ceiling. Production now runs at `JOIN_THRESHOLD`
+150 / `LEAVE_THRESHOLD` 300, raised from 15 / 30 by the 2026-08-30 ramp below.
 Raise the count in steps, not in one jump. Each step adds real message volume
-and real Flink load that the synthetic test did not exercise.
+and real Flink load.
+
+### What `JOIN_THRESHOLD` and `LEAVE_THRESHOLD` actually do
+
+`LEAVE_THRESHOLD` sets the monitored count, not `JOIN_THRESHOLD`. A channel
+enters the set on reaching the top `JOIN_THRESHOLD` by viewer rank and stays
+until it drops out of the top `LEAVE_THRESHOLD`. So 150 / 300 monitors roughly
+300 channels (minus the ~20% of the top 300 with clipping disabled), with a
+150-deep entry gate that keeps a channel near the boundary from flapping in and
+out. To run near a round number of channels, set `LEAVE_THRESHOLD` to it and
+`JOIN_THRESHOLD` to something below.
 
 ### How to change the thresholds
 
-The poller reads `JOIN_THRESHOLD` and `LEAVE_THRESHOLD` from the environment
-(defaults 15 and 30). `LEAVE_THRESHOLD` must be greater than `JOIN_THRESHOLD`,
-or the service refuses to start.
+The poller reads both from the environment. `LEAVE_THRESHOLD` must be greater
+than `JOIN_THRESHOLD`, or the service refuses to start.
 
 1. Set both variables in the `stream-monitoring` `environment:` block in
    `docker-compose.yml`.
@@ -124,23 +132,24 @@ or the service refuses to start.
    ```bash
    docker compose up -d --force-recreate stream-monitoring
    ```
-3. The reconciler converges to the new set on its next pass. It adopts the
-   subscriptions it already holds and creates the rest. A larger set costs a
-   longer cold start, not a failed one.
+3. The reconciler converges to the new set over the next few passes. A larger
+   set costs a longer cold start (about 2 minutes to ~480 channels), not a
+   failed one.
 
-Raise `CLIPPING_DISABLED_FETCH_BUFFER` (default 20) as well if the log line
+Raise `CLIPPING_DISABLED_FETCH_BUFFER` with the threshold if the log line
 `Fewer than LEAVE_THRESHOLD clip-allowed streams found even after padding
-fetch` starts to appear. The buffer is a flat pad, so it thins out as the
-threshold grows.
+fetch` appears. It is a flat pad, so it thins out as the threshold grows;
+`LEAVE_THRESHOLD` 300 needs a pad near 120.
 
 ### The step ladder
 
-| Step | `JOIN_THRESHOLD` / `LEAVE_THRESHOLD` |
-|---|---|
-| 0 (start) | 15 / 30 |
-| 1 | 50 / 100 |
-| 2 | 150 / 300 |
-| 3 | 300 / 500 |
+| Step | `JOIN_THRESHOLD` / `LEAVE_THRESHOLD` | Channels monitored |
+|---|---|---|
+| 0 | 15 / 30 | ~20 |
+| 1 | 50 / 100 | ~55 |
+| 2 | 150 / 300 | ~290 (current production) |
+| 3 | 300 / 500 | ~320 |
+| 4 | 480 / 500 | ~485 |
 
 Soak each step for at least 30 minutes before the next.
 
@@ -149,23 +158,45 @@ Soak each step for at least 30 minutes before the next.
 | Signal | Healthy | Stop and investigate |
 |---|---|---|
 | `eventsub_subscription_count` vs `ZCARD chat:desired` | equal, within one pass interval | a gap that does not close |
-| `reconcile_duration_seconds` | a converged pass is milliseconds | the median climbs step over step |
-| `subscription_create_failures_total{reason="429"}` | short bursts during the cold start, all retried | the counter keeps rising after convergence |
-| `eventsub_connection_occupancy` | no connection over 300; the pool grows as needed | `pool is at its 3-connection limit` (the 900-channel hard cap) |
+| `reconcile_duration_seconds` | a converged pass is milliseconds at ~50 channels, ~2–4 s at 300–485 | the median grows faster than the channel count |
+| `subscription_create_failures_total{reason="429"}` | absent, or brief cold-start bursts all retried | keeps rising after convergence |
+| `subscription_create_failures_total{reason="transient_session"}` | a cold-start burst (seen up to ~70), then static | keeps rising during steady state |
+| `eventsub_connection_occupancy` | no connection over 300; the pool grows at the cap | `pool is at its 3-connection limit` (the 900-channel hard cap) |
 | Kafka producer lag, Flink source watermark lag | flat | either grows and does not recover |
-| Flink TaskManager heap | stable below the 6 GB cap | approaches the cap |
-| `clips_created_failed_total` | low and flat | climbing — see below |
+| Flink TaskManager heap | flat (measured ~2.6 GB RSS through 485 channels, cap 6 GB) | approaches the cap |
+| Flink TaskManager thread count | flat (~135) | climbing — `ClipCreator` pileup |
+| `clips_created_failed_total` by reason | `api_error` / `metadata_fetch` only, scaling with volume | a `rate_limited` reason appears |
 
-### The clip ceiling is expected, not a regression
+### What the 2026-08-30 ramp found
 
-Clip creation is capped per Twitch account. A larger monitored set detects far
-more anomalies than the account can clip — about 2.2 detections per
-broadcaster-hour (`research.md` §1). Somewhere on this ladder
-`clips_created_failed_total` starts to climb and `ClipCreator` spawns more
-threads than it retires. **That is the signal to stop ramping and start spec
-005** (anomaly ranking against a scarce clip budget). Record the channel count,
-the detections per hour, and the clip-failure rate at the step where it
-appears — those numbers are spec 005's Phase 0 input.
+The ladder was walked 15/30 → 50/100 → 150/300 → 300/500 → 480/500, ~25 min
+soak each. **The system stayed clean through ~485 real channels.** Subscriptions
+tracked the desired set on every sample, TaskManager RSS held flat at ~2.6 GB,
+thread count held at ~135, and clip creation never returned a rate limit — every
+create logged `status=202`.
+
+**The clip ceiling was not reached, contrary to `research.md` §1/§3.** The
+corpus figure of ~2.2 detections per broadcaster-hour came from the top ~72
+channels, which are far hotter than the rest. The measured rate across ~485
+channels was **~0.3–0.5 per broadcaster-hour** — the rank 150–500 band is much
+quieter (`research.md` §1: median 32 messages per 60 s). At ~485 channels that
+is roughly 150 clip attempts per hour, well under any Twitch per-account limit.
+
+So the clip budget is a real constraint but a distant one. It is most likely to
+bite near the transport's own 900-channel hard cap, or during a synchronized
+event where many channels spike at once. **The `rate_limited` reason on
+`clips_created_failed_total` is the trigger for spec 005** — anomaly ranking
+against a scarce clip budget. It did not appear on this ramp.
+
+Two rough edges, neither blocking:
+
+- **Cold-start transient burst.** Every `--force-recreate` throws a burst of
+  `transient_session` failures (11 to 71, non-deterministic) as the first
+  websocket session reconnects under the create load. The reconciler recovers
+  every one on the next pass. Classified apart from real failures since
+  2026-08-30.
+- **Reconcile pass duration** grows from milliseconds at 50 channels to ~2–4 s
+  at 300–485. Still well inside the 5 s idle interval, but watch it past 500.
 
 ### Rolling back a step
 

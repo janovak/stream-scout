@@ -816,3 +816,28 @@ already, because Phase 3 did not change them. This belongs in `OPERATIONS.md`
   budget — a design change. Candidate for spec 005.
 - The detector state redesign from spec 003, which measurement deflated.
 - Kafka partition and Flink parallelism re-provisioning.
+
+### Post-merge: the 2026-08-30 channel-count ramp
+
+Production was ramped 15/30 → 50/100 → 150/300 → 300/500 → 480/500 with a
+~25 min soak per step (`OPERATIONS.md` "Ramping the monitored channel count"
+has the full record and the metrics table). Result: **the system stayed clean
+through ~485 real channels.** Subscriptions tracked the desired set on every
+sample, TaskManager RSS held flat at ~2.6 GB against the 6 GB cap, thread count
+held at ~135, and clip creation never returned a rate limit.
+
+**The clip ceiling this section predicts was not reached.** The ~2.2
+detections-per-broadcaster-hour figure in §1 came from the top ~72 channels;
+the measured rate across ~485 was ~0.3–0.5, because the rank 150–500 band is far
+quieter. At ~485 channels that is ~150 clip attempts per hour, well under any
+Twitch per-account limit. Spec 005 is still the right shape — it just does not
+block a ramp to the transport's own 900-channel cap. Its trigger is a
+`rate_limited` reason on `clips_created_failed_total`, which this ramp never
+produced. Production was left at 150/300 (~290 channels); going higher is proven
+safe and is the operator's call.
+
+One rough edge worth carrying: every cold start throws a burst of
+`transient_session` create failures (11–71, non-deterministic) as the first
+websocket session reconnects under load. All recover on the next pass. A commit
+on 2026-08-30 classified them apart from real failures and moved the logging
+from ERROR to WARNING.

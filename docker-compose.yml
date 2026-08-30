@@ -405,6 +405,19 @@ services:
       - PROMETHEUS_PORT=9100
       - HEALTH_CHECK_PORT=8080
       - LOG_LEVEL=INFO
+      # Monitored channel band. Raised from 15/30 after the 2026-08-30 ramp
+      # (OPERATIONS.md "Ramping the monitored channel count") soaked the system
+      # clean through ~485 channels: subscriptions tracked the desired set,
+      # TaskManager RSS flat at ~2.6 GB, no ClipCreator thread pileup, and clip
+      # creation never hit a rate limit. 150/300 is a 10x coverage increase
+      # with margin on every resource; going to ~500 is proven safe and is the
+      # operator's call.
+      - JOIN_THRESHOLD=150
+      - LEAVE_THRESHOLD=300
+      # ~84 of the top 380 have clipping disabled, so a pad of 80 left the
+      # eligible set one short of 300. 120 clears the "Fewer than
+      # LEAVE_THRESHOLD" warning with room to spare.
+      - CLIPPING_DISABLED_FETCH_BUFFER=120
     volumes:
       - ./secrets:/app/secrets:rw
       - ./services/stream-monitoring/stream_monitoring_service.py:/app/stream_monitoring_service.py:ro
