@@ -56,6 +56,10 @@ HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", "8080"))
 # it. Long enough for a create or delete already in flight to land; far short
 # of a full ramp, which shutdown has no reason to wait for.
 RECONCILER_STOP_TIMEOUT_SECONDS = float(os.getenv("RECONCILER_STOP_TIMEOUT_SECONDS", "5"))
+# How long shutdown waits for an in-flight `initialize()` to finish before
+# tearing down. Bounded, because a Twitch auth that never returns must not
+# block SIGTERM for ever.
+INITIALIZE_WAIT_SECONDS = float(os.getenv("INITIALIZE_WAIT_SECONDS", "20"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # Token-file scope strings -> pyTwitchAPI enums. One place, so adding a scope
@@ -228,6 +232,12 @@ class StreamMonitoringService:
         self.redis_client: Optional[redis.Redis] = None
         self.credentials: Optional[TwitchCredentials] = None
         self.running = True
+        # Set once `initialize()` has finished building everything, so a
+        # shutdown signalled DURING start-up tears down a whole service rather
+        # than a half-built one. `_stopping` makes `stop()` idempotent: a
+        # signal and a failing `start()` can both reach it.
+        self._initialized: Optional[asyncio.Event] = None
+        self._stopping = False
         self.reconciler: Optional[Reconciler] = None
         self.transport: Optional[EventSubPoolTransport] = None
         # Both set from the token file in initialize(). No user auth at all
@@ -247,6 +257,7 @@ class StreamMonitoringService:
     async def initialize(self):
         """Initialize all connections and services."""
         logger.info("Initializing Stream Monitoring Service")
+        self._initialized = asyncio.Event()
 
         # The metrics server comes up FIRST, before the token, Kafka, Postgres,
         # Redis or the transport -- every one of which can fail on a bad day.
@@ -354,6 +365,7 @@ class StreamMonitoringService:
                 "Run 'python seed_twitch_tokens.py' and restart to ingest chat"
             )
             self._build_scheduler()
+            self._initialized.set()
             return
 
         try:
@@ -370,6 +382,7 @@ class StreamMonitoringService:
             twitch_api_errors_total.labels(error_type="build_transport").inc()
             self.transport = None
             self._build_scheduler()
+            self._initialized.set()
             return
 
         self.reconciler = Reconciler(
@@ -383,6 +396,7 @@ class StreamMonitoringService:
         )
 
         self._build_scheduler()
+        self._initialized.set()
 
     def _build_scheduler(self):
         self.scheduler = AsyncIOScheduler()
@@ -475,6 +489,13 @@ class StreamMonitoringService:
     async def start(self):
         """Start the service."""
         await self.initialize()
+        if not self.running:
+            # A signal arrived while `initialize()` was still building things.
+            # Starting the scheduler and the reconciler now would hand
+            # `stop()` -- which is waiting for exactly this moment -- more to
+            # tear down, and race it while doing so.
+            logger.info("Shutdown signalled during start-up, not starting work")
+            return
         self.scheduler.start()
 
         # The reconciler is a task in this process, beside the poll job. It is
@@ -491,8 +512,30 @@ class StreamMonitoringService:
 
     async def stop(self):
         """Gracefully stop the service."""
+        if self._stopping:
+            return
+        self._stopping = True
         logger.info("Stopping Stream Monitoring Service")
         self.running = False
+
+        # Wait for start-up to finish before tearing anything down. A signal
+        # can land while `initialize()` is mid-flight -- a `docker compose
+        # restart` during a slow Twitch auth does it -- and tearing down then
+        # closed the aiohttp session the auth call was still using, while every
+        # other branch no-opped on a Kafka producer, DB pool, Redis client and
+        # transport that did not exist yet. `initialize()` then built all of
+        # them and nothing ever closed them: an unflushed producer, an open
+        # Postgres pool and live websockets, after "stopped" had been logged.
+        if self._initialized is not None and not self._initialized.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._initialized.wait(), timeout=INITIALIZE_WAIT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Start-up did not finish before shutdown, tearing down what exists",
+                    extra={"timeout_seconds": INITIALIZE_WAIT_SECONDS},
+                )
 
         if self.scheduler:
             self.scheduler.shutdown(wait=True)

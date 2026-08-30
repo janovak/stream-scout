@@ -618,6 +618,16 @@ class Reconciler:
         """
         self._adoption_complete = False
         self._invalidations += 1
+        # Clear any failed-enumeration backoff. Round 7 added that backoff and
+        # claimed in a comment that a socket loss "does not come through here"
+        # -- it does: the gate in `reconcile_once` covers every adoption path.
+        # A failed walk and a dead socket are positively correlated (one blip
+        # causes both), so the pairing is likely, and it left up to 300
+        # channels dark for the whole backoff: `_actual` still held the dead
+        # socket's ids, so they never entered `to_create`. A loss earns one
+        # immediate attempt; if THAT walk fails, `_adopt` sets the backoff
+        # again, so this cannot become the hot loop the backoff prevents.
+        self._adopt_retry_after = float("-inf")
         self._invalidated.set()
 
     def notify_desired_changed(self):
@@ -799,12 +809,24 @@ class Reconciler:
     def _read_desired(self) -> DesiredSet:
         ranked = self.redis_client.zrange(DESIRED_KEY, 0, -1)
         ids = self.redis_client.hgetall(DESIRED_IDS_KEY) or {}
+        # Per entry, not a comprehension that raises. One unparseable value
+        # used to take out `_read_desired` entirely, so `reconcile_once` hit
+        # its "could not read the desired set" early return and created and
+        # dropped nothing at all until the next poll rewrote the hash. The
+        # poller's own reader of this key already skips bad entries; a single
+        # bad member should cost that member, not the pass.
+        parsed: Dict[str, int] = {}
+        for login, broadcaster_id in ids.items():
+            try:
+                parsed[self._as_text(login)] = int(broadcaster_id)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Unparseable broadcaster id in the desired-set map, skipping it",
+                    extra={"login": self._as_text(login)},
+                )
         return DesiredSet(
             logins=[self._as_text(login) for login in ranked],
-            ids={
-                self._as_text(login): int(broadcaster_id)
-                for login, broadcaster_id in ids.items()
-            },
+            ids=parsed,
             generation=self._read_generation(),
         )
 

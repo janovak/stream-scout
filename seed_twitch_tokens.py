@@ -84,10 +84,23 @@ def save_tokens(access_token: str, refresh_token: str, scopes: list[str]) -> Non
             os.chmod(tmp_path, 0o640)
             shared = f"group {TWITCH_TOKEN_GID}, mode 0640"
         except PermissionError:
-            os.chmod(tmp_path, 0o644)
+            # NOT 0644. The chown just failed, so the containers cannot read
+            # this file by group whatever the mode is -- widening it buys
+            # nothing and publishes an OAuth access AND refresh token to every
+            # account on the host. The previous `open(path, "w")` preserved an
+            # existing file's mode, so re-seeding over the live 0640 token
+            # actively widened it. Keep it owner-only and say so loudly.
+            os.chmod(tmp_path, 0o600)
             shared = (
-                f"mode 0644 -- this user is not in gid {TWITCH_TOKEN_GID}, so the "
-                "file stays world-readable until a container rewrites it"
+                f"mode 0600 -- this user is not in gid {TWITCH_TOKEN_GID}, so the "
+                "chown failed and the containers CANNOT read this file. Re-run "
+                f"as a member of gid {TWITCH_TOKEN_GID}, or chown it by hand"
+            )
+            print(
+                f"\nWARNING: could not set group {TWITCH_TOKEN_GID} on the token "
+                "file. It is owner-only, and the containers will not be able to "
+                "read it until that is fixed.",
+                flush=True,
             )
         os.replace(tmp_path, TOKEN_FILE_PATH)
     except BaseException:

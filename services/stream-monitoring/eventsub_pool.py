@@ -673,7 +673,8 @@ class EventSubPoolTransport(SubscriptionTransport):
         if len(self._connections) >= self.max_connections:
             raise TransportError(
                 f"pool is at its {self.max_connections}-connection limit "
-                f"({self.max_connections * self.cap} subscriptions); "
+                f"({self.max_connections * self.cap} subscriptions, "
+                f"{MAX_SUBSCRIPTIONS} at the documented Twitch caps); "
                 "Twitch allows no more websocket connections for this token"
             )
         websocket = self._connection_factory()

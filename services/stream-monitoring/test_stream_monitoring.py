@@ -1351,8 +1351,15 @@ class TestReconcilerAdoption:
         assert reconciler._readopt_due() is False
 
     def test_a_socket_loss_is_not_delayed_by_the_enumeration_backoff(self):
-        """The backoff must not slow recovery from a dead socket: that path
-        does not come through a failed walk, and its enumeration will succeed."""
+        """The two failures are positively correlated -- one network blip both
+        fails a walk and kills a socket -- so this pairing is likely, not
+        exotic. While the backoff held, `_actual` still carried the dead
+        socket's ids, so its channels never entered `to_create` and stayed dark
+        for the full window.
+
+        The earlier version of this test set no backoff at all, so it passed
+        whether or not the loss path was gated. This one arms it first.
+        """
         fake_redis = FakeRedis()
         seed_desired(fake_redis, [("a", 1)])
         transport = StubTransport()
@@ -1360,12 +1367,16 @@ class TestReconcilerAdoption:
         asyncio.run(reconciler.reconcile_once())
         walks = len(transport.list_calls)
 
+        # A failed walk arms the backoff, then the socket dies a second later.
+        reconciler._adopt_retry_after = time.monotonic() + 30
         reconciler.invalidate_actual_set()
         asyncio.run(reconciler.reconcile_once())
 
         assert len(transport.list_calls) > walks, (
-            "a socket loss waited out the failed-enumeration backoff"
+            "a socket loss waited out the failed-enumeration backoff, so up to "
+            "300 channels stay dark for the whole window"
         )
+        assert reconciler._adoption_complete is True
 
     def test_partial_enumeration_never_deletes(self):
         """The dangerous move is deleting on an incomplete picture: an unseen
@@ -1725,17 +1736,66 @@ class TestReconcilerLifecycle:
 
         async def run_briefly():
             service.initialize = fake_initialize
-            service.running = False  # start() returns once its keep-alive sees this
-            await service.start()
+            # Let start() run for real and stop it the way a signal would.
+            # Pre-setting `running = False` no longer works as a shortcut:
+            # start() now treats that as "shutdown was signalled during
+            # start-up" and deliberately launches nothing.
+            starter = asyncio.create_task(service.start())
+            await asyncio.sleep(0.05)
             assert service._reconciler_task is not None
             assert not service._reconciler_task.done()
-            await asyncio.sleep(0.05)
-            return service._reconciler_task
+            service.running = False
+            await starter
+            task = service._reconciler_task
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return task
 
         task = asyncio.run(run_briefly())
 
         assert sorted(transport.subscriptions) == [1], "the task never reconciled"
         assert task.cancelled() or task.done(), "the loop outlived its event loop"
+
+    def test_a_signal_during_start_up_tears_down_a_whole_service(self):
+        """A signal can land while `initialize()` is still building things --
+        a `docker compose restart` during a slow Twitch auth does it. Tearing
+        down then closed the aiohttp session the auth call was using, while
+        every other branch no-opped on a Kafka producer, DB pool, Redis client
+        and transport that did not exist yet. `initialize()` went on to build
+        all of them and nothing ever closed them, after "stopped" was logged.
+        """
+
+        async def run():
+            service = StreamMonitoringService()
+            built = asyncio.Event()
+
+            async def slow_initialize():
+                service._initialized = asyncio.Event()
+                await asyncio.sleep(0.1)          # the Twitch auth
+                service.scheduler = MagicMock()
+                service.redis_client = MagicMock()
+                service.kafka_producer = MagicMock()
+                service.reconciler = None
+                built.set()
+                service._initialized.set()
+
+            service.initialize = slow_initialize
+
+            starter = asyncio.create_task(service.start())
+            await asyncio.sleep(0.02)             # SIGTERM lands mid-auth
+            stopper = asyncio.create_task(service.stop())
+            await asyncio.wait_for(starter, timeout=2)
+            await asyncio.wait_for(stopper, timeout=2)
+
+            assert built.is_set(), "initialize() did not finish"
+            # The resources initialize() built were actually torn down.
+            service.redis_client.close.assert_called_once()
+            service.kafka_producer.flush.assert_called_once()
+
+        asyncio.run(run())
 
     def test_stop_cancels_the_reconciler_before_closing_redis(self):
         service = StreamMonitoringService()
