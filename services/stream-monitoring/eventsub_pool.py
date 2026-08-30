@@ -582,6 +582,16 @@ class EventSubPoolTransport(SubscriptionTransport):
         # `subscription_ids` while it may well still exist on Twitch, so
         # another worker could route a channel into a slot that was not really
         # free and push the session past its cap.
+        #
+        # Residual, accepted: if the DELETE itself FAILS, the reservation is
+        # still released while a possibly-live subscription remains. The
+        # alternatives are worse -- holding the reservation for ever leaks the
+        # slot, and counting a subscription with no slot as occupancy leaves
+        # something nothing can clear. It needs this reconnect race AND a
+        # failed delete AND the session to be at its cap before it costs
+        # anything, and what it then costs is one refused create that
+        # `_classify` already understands, repaired on the next pass when the
+        # 409 is adopted.
         logger.warning(
             "Connection reconnected mid-create, discarding the subscription",
             extra={

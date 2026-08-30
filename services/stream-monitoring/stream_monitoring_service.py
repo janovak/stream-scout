@@ -605,6 +605,15 @@ class StreamMonitoringService:
                 try:
                     await self._init_task
                 except asyncio.CancelledError:
+                    # Deliberately swallowed, including a cancellation aimed at
+                    # `stop()` itself. This is the teardown; the rule for
+                    # everything below is that no single failure may skip the
+                    # steps after it, and abandoning the flush and the socket
+                    # close because someone cancelled the shutdown is exactly
+                    # the truncation this function was rewritten to prevent.
+                    # The discrimination two blocks up is a different case:
+                    # there the cancellation came from the shielded CHILD, and
+                    # continuing was the only correct answer.
                     pass
                 except Exception as e:
                     logger.warning(
