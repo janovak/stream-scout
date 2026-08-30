@@ -38,6 +38,7 @@ from reconciler import (
     RefusalStore,
     StubTransport,
     SubscriptionRefusedError,
+    TransientSessionError,
     TransportError,
 )
 from stream_monitoring_service import StreamMonitoringService, compute_desired_set
@@ -1375,6 +1376,40 @@ class TestReconcilerResilience:
 
         assert sorted(transport.subscriptions) == [1, 3]
 
+    def test_a_rotating_session_is_counted_apart_and_retried_next_pass(self):
+        """The 2026-08-30 ramp: a cold start throws a burst of these as the
+        first session reconnects. They are not real failures -- the next pass
+        recreates the channel -- so they must not land in the "error" count."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2)])
+
+        class RotatingOnce(StubTransport):
+            def __init__(self):
+                super().__init__()
+                self._rotated = False
+
+            async def create(self, broadcaster_id):
+                if broadcaster_id == 2 and not self._rotated:
+                    self._rotated = True
+                    raise TransientSessionError(
+                        "websocket transport session does not exist"
+                    )
+                return await super().create(broadcaster_id)
+
+        transport = RotatingOnce()
+        reconciler = make_reconciler(transport, fake_redis)
+
+        before_transient = counter_value("transient_session")
+        before_error = counter_value("error")
+        asyncio.run(reconciler.reconcile_once())
+        assert sorted(transport.subscriptions) == [1]
+        assert counter_value("transient_session") == before_transient + 1
+        assert counter_value("error") == before_error
+
+        # Still wanted, so the next pass creates it.
+        asyncio.run(reconciler.reconcile_once())
+        assert sorted(transport.subscriptions) == [1, 2]
+
     def test_the_loop_keeps_running_across_a_failing_pass(self):
         """The asyncio task must outlive a bad pass, or a stalled reconciler
         would look exactly like a healthy one."""
@@ -2415,6 +2450,11 @@ class TestPoolErrorClassification:
             ("Forbidden", SubscriptionRefusedError),
             ("Too Many Requests", RateLimitedError),
             ("you have exceeded the rate limit", RateLimitedError),
+            (
+                "websocket transport session does not exist or has already disconnected",
+                TransientSessionError,
+            ),
+            ("the websocket session has already disconnected", TransientSessionError),
             ("something else entirely", TransportError),
         ],
     )

@@ -78,6 +78,7 @@ from reconciler import (
     RateLimitedError,
     SubscriptionRefusedError,
     SubscriptionTransport,
+    TransientSessionError,
     TransportError,
 )
 
@@ -147,6 +148,16 @@ _SESSION_FULL_MARKERS = (
     "maximum number of subscriptions",
     "subscriptions per websocket",
     "session limit",
+)
+
+# A create that raced a reconnect: the session id it carried is already gone.
+# The 2026-08-30 ramp saw bursts of these on every cold start (up to ~70 in one
+# pass), all recovered on the next pass. Classified so the reconciler counts
+# them apart from real failures and logs them at WARNING, not ERROR.
+_TRANSIENT_SESSION_MARKERS = (
+    "session does not exist",
+    "has already disconnected",
+    "session has already disconnected",
 )
 
 
@@ -1032,6 +1043,18 @@ class EventSubPoolTransport(SubscriptionTransport):
             # 429. No Retry-After survives the library, so the reconciler
             # falls back to its configured backoff (D2).
             return RateLimitedError(message)
+        if any(marker in lowered for marker in _TRANSIENT_SESSION_MARKERS):
+            # The session rotated under this create. Not a failure -- the next
+            # pass recreates the channel on whatever session is live then.
+            logger.warning(
+                "EventSub session rotated mid-create, will retry next pass",
+                extra={
+                    "connection": connection.connection_id,
+                    "occupancy": connection.occupancy,
+                    "error": message,
+                },
+            )
+            return TransientSessionError(message)
 
         # Nothing matched. The marker lists are string matches against wording
         # nobody has seen from a genuinely full websocket session -- the spike

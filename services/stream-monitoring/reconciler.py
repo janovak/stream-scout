@@ -213,6 +213,18 @@ class SubscriptionRefusedError(TransportError):
     """
 
 
+class TransientSessionError(TransportError):
+    """A create landed while the websocket session was rotating.
+
+    The 2026-08-30 ramp found that a cold start fires a burst of these -- up to
+    ~70 in one pass, non-deterministic -- as the library reconnects its first
+    session under the rapid create load and the in-flight creates carry the old
+    session id. Every one recovered on the next pass. This is a normal reconnect
+    race, not a failed subscription, so the reconciler counts it under its own
+    metric reason and logs it at WARNING, not ERROR.
+    """
+
+
 @dataclass(frozen=True)
 class ExistingSubscription:
     """One subscription that already exists, as the transport reports it."""
@@ -999,6 +1011,16 @@ class Reconciler:
                 except RateLimitedError as e:
                     rate_limited.append((broadcaster_id, e))
                     count_failure("rate_limited")
+                except TransientSessionError as e:
+                    # A reconnect race, not a failed subscription. The channel
+                    # keeps its place and the next pass recreates it. Its own
+                    # reason keeps these out of the "error" count, which a cold
+                    # start would otherwise spike into the dozens.
+                    count_failure("transient_session")
+                    logger.warning(
+                        "Create hit a rotating websocket session, will retry next pass",
+                        extra={"broadcaster_id": broadcaster_id, "error": str(e)},
+                    )
                 except SubscriptionRefusedError as e:
                     count_failure("refused")
                     if operation == "create":
