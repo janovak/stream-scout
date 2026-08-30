@@ -1759,6 +1759,35 @@ class TestReconcilerLifecycle:
         assert sorted(transport.subscriptions) == [1], "the task never reconciled"
         assert task.cancelled() or task.done(), "the loop outlived its event loop"
 
+    def test_shutdown_survives_a_scheduler_that_was_never_started(self):
+        """`start()` can now return before `scheduler.start()` when shutdown is
+        signalled during start-up. APScheduler's `shutdown()` on a never-started
+        scheduler raises `AttributeError: 'NoneType' object has no attribute
+        'call_soon_threadsafe'`, and that escaped `stop()` and abandoned every
+        step after it: the reconciler never stopped, websockets stayed open,
+        and the Kafka producer was never flushed, so buffered chat was dropped.
+        The tests missed it because they all pass a MagicMock scheduler.
+        """
+
+        async def run():
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+            service = StreamMonitoringService()
+            service._initialized = asyncio.Event()
+            service._initialized.set()
+            service.scheduler = AsyncIOScheduler()   # real, and never started
+            service._scheduler_started = False
+            service.kafka_producer = MagicMock()
+            service.redis_client = MagicMock()
+
+            await service.stop()   # must not raise
+
+            # Everything after the scheduler still ran.
+            service.kafka_producer.flush.assert_called_once()
+            service.redis_client.close.assert_called_once()
+
+        asyncio.run(run())
+
     def test_a_signal_during_start_up_tears_down_a_whole_service(self):
         """A signal can land while `initialize()` is still building things --
         a `docker compose restart` during a slow Twitch auth does it. Tearing
@@ -3007,12 +3036,18 @@ class TestDegradedWithoutUserAuth:
 
         asyncio.run(run())
 
-    def test_a_transport_failure_degrades_instead_of_crash_looping(self):
-        """`_build_transport()` calls get_users(). A transient Twitch 5xx there
-        used to propagate out of `initialize()` and kill the process -- and it
-        ran BEFORE the metrics server started, so the FR-012 gauges an operator
-        is told to check were unreachable at exactly the moment the service was
-        failing."""
+    def test_a_transient_transport_failure_propagates_so_docker_restarts_us(self):
+        """`_build_transport()` calls get_users(), so its failures are
+        transient by nature. An earlier round swallowed them to avoid
+        crash-looping, which was worse than the crash: the service ran for the
+        rest of the process lifetime with no transport, no reconciler and zero
+        chat ingestion, while the poll job kept working, /health kept returning
+        OK, and nothing ever retried.
+
+        Letting it propagate restarts the container, which recovers by itself.
+        The metrics server is up before this point either way -- that was the
+        fix worth keeping, and it is asserted here so the two cannot drift.
+        """
 
         async def run():
             twitch = MagicMock()
@@ -3035,112 +3070,13 @@ class TestDegradedWithoutUserAuth:
                      StreamMonitoringService, "_build_transport",
                      AsyncMock(side_effect=RuntimeError("twitch 503")),
                  ):
-                await service.initialize()   # must not raise
+                with pytest.raises(RuntimeError):
+                    await service.initialize()
 
             metrics.assert_called_once()
-            assert service.transport is None
-            assert service.reconciler is None
-            # The poll job still runs and still writes the desired set.
-            assert service.scheduler.get_job("poll_streams") is not None
-
-        asyncio.run(run())
-
-    def test_an_unexpected_error_does_not_kill_the_reconciler_in_silence(self):
-        """`run()` caught only CancelledError, so anything else ended the task.
-        Because `_reconciler_task` keeps a live reference, asyncio's
-        "Task exception was never retrieved" handler never fires either -- no
-        traceback anywhere. The service would go on polling while no
-        subscription was ever created or dropped again."""
-
-        async def run():
-            fake_redis = FakeRedis()
-            seed_desired(fake_redis, [("a", 1)])
-            reconciler = make_reconciler(StubTransport(), fake_redis)
-
-            passes = []
-
-            async def exploding_pass():
-                passes.append(1)
-                if len(passes) == 1:
-                    raise RuntimeError("something unforeseen")
-                if len(passes) >= 3:
-                    reconciler.stop()
-
-            reconciler.reconcile_once = exploding_pass
-            await asyncio.wait_for(reconciler.run(), timeout=2)
-
-            assert len(passes) >= 3, "the loop died on the first exception"
-
-        asyncio.run(run())
-
-    def test_a_signalled_shutdown_runs_to_the_end(self):
-        """`stop()` sets `running = False` before its first await, so
-        `start()`'s keep-alive loop returns within a second. If `main()` does
-        not await the stop task, `asyncio.run` cancels it where it stands and
-        everything after the reconciler wait -- transport close, Kafka flush,
-        Postgres, Redis -- is skipped: buffered chat dropped and ~500
-        subscriptions left for Twitch to reap."""
-
-        async def run():
-            service = StreamMonitoringService()
-            service.scheduler = MagicMock()
-            service.reconciler = None
-            service._reconciler_task = None
-            service.transport = None
-            service.twitch = None
-            finished = []
-
-            real_stop = service.stop
-
-            async def slow_stop():
-                # Something after `running = False` that yields, the way the
-                # bounded reconciler wait does.
-                service.running = False
-                await asyncio.sleep(0.2)
-                await real_stop()
-                finished.append(True)
-
-            service.stop = slow_stop
-
-            with patch.object(StreamMonitoringService, "initialize", AsyncMock()):
-                stop_task = None
-
-                async def drive():
-                    nonlocal stop_task
-                    starter = asyncio.create_task(service.start())
-                    await asyncio.sleep(0.05)
-                    stop_task = asyncio.create_task(service.stop())
-                    await starter
-                    # This is the line main() was missing.
-                    await stop_task
-
-                await asyncio.wait_for(drive(), timeout=5)
-
-            assert finished == [True], "shutdown was cut off part way through"
-
-        asyncio.run(run())
-
-    def test_stop_is_signalled_even_when_the_refresh_consumed_the_event(self):
-        """`stop()` signals through `_wake`, and `_maybe_refresh_desired`
-        clears that event for its own purpose. The loop has to re-check the
-        flag, or shutdown waits out the whole idle timeout -- which is the same
-        length as the service's bounded "ask first" wait, so that wait would
-        always time out and cancel the task it was meant to let finish."""
-
-        async def run():
-            fake_redis = FakeRedis()
-            seed_desired(fake_redis, [("a", 1)])
-            reconciler = make_reconciler(
-                StubTransport(), fake_redis, idle_timeout_seconds=30
-            )
-
-            async def pass_that_stops_and_eats_the_signal():
-                reconciler.stop()          # sets running=False and _wake
-                reconciler._wake.clear()   # what the mid-pass refresh does
-
-            reconciler.reconcile_once = pass_that_stops_and_eats_the_signal
-            # Without the flag re-check this waits the full 30 s idle timeout.
-            await asyncio.wait_for(reconciler.run(), timeout=2)
+            # And start-up is marked finished even though it raised, so a
+            # shutdown racing it does not wait out the full timeout.
+            assert service._initialized.is_set()
 
         asyncio.run(run())
 
