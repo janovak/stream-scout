@@ -73,10 +73,11 @@ import redis  # noqa: E402
 # .git/info/exclude and is in no clone but this machine's.
 from common import load_env, make_twitch, top_logins  # noqa: E402
 
-from reconciler import (  # noqa: E402
-    DESIRED_GENERATION_KEY,
-    DESIRED_IDS_KEY,
+from desired_set_store import (  # noqa: E402
     DESIRED_KEY,
+    RedisDesiredSetStore,
+)
+from reconciler import (  # noqa: E402
     Reconciler,
     ReconcilerConfig,
     resolve_reconciler_config,
@@ -117,25 +118,10 @@ def redis_client():
 
 
 def write_desired(client, channels):
-    """Write the desired set the way the poller does (`_write_desired_set`).
-
-    Same MULTI/EXEC, same DEL + ZADD + HSET + INCR shape. Copied rather than
-    imported because importing the service module pulls in the Kafka producer
-    and the APScheduler wiring, neither of which this driver wants; the
-    flatness mode below calls the real method instead.
-    """
+    """Publish through the same desired-set implementation as production."""
     desired = {login: rank for rank, (login, _) in enumerate(channels, start=1)}
     ids = {login: bid for login, bid in channels}
-    pipe = client.pipeline()
-    pipe.delete(DESIRED_KEY, DESIRED_IDS_KEY)
-    # The `if desired` guard is the real method's, and it matters: ZADD with an
-    # empty mapping raises DataError, so an empty channel list would die
-    # pointing at Redis instead of at channel resolution.
-    if desired:
-        pipe.zadd(DESIRED_KEY, desired)
-        pipe.hset(DESIRED_IDS_KEY, mapping={login: ids[login] for login in desired})
-    pipe.incr(DESIRED_GENERATION_KEY)
-    pipe.execute()
+    RedisDesiredSetStore(client).publish(desired, ids)
     return desired
 
 
@@ -183,7 +169,7 @@ class Harness:
         await self.transport.start()
         self.reconciler = Reconciler(
             transport=self.transport,
-            redis_client=self.client,
+            desired_store=RedisDesiredSetStore(self.client),
             config=config,
             on_pass_complete=self.pass_sizes.append,
             refusal_store=None,  # no Postgres writes from a measurement harness
@@ -441,19 +427,9 @@ async def mode_restart(harness, channels):
 def mode_flatness(client, channels):
     """T042: the poller's write cost must follow set SIZE, not change SIZE.
 
-    Calls the real `_write_desired_set` on a stand-in object carrying only the
-    two attributes it touches, so this measures production code and not a
-    copy of it.
+    Calls the production Redis desired-set implementation directly.
     """
-    from stream_monitoring_service import StreamMonitoringService
-
-    class Stub:
-        pass
-
-    stub = Stub()
-    stub.redis_client = client
-    stub.reconciler = None
-    write = StreamMonitoringService._write_desired_set
+    store = RedisDesiredSetStore(client)
 
     # Two DISJOINT sets of TARGET_CHANNELS each. Alternating between them is a
     # complete turnover on every write -- 500 members leave and 500 arrive.
@@ -474,7 +450,7 @@ def mode_flatness(client, channels):
     ids = {login: int(bid) for login, bid in channels}
 
     # Warm the connection so the first call does not pay for the TCP setup.
-    write(stub, full, ids)
+    store.publish(full, ids)
 
     def commands_processed():
         # Server-wide, not per-database. Sound here because this is the local
@@ -489,7 +465,7 @@ def mode_flatness(client, channels):
         before = commands_processed()
         for _ in range(repeats):
             t0 = time.perf_counter()
-            write(stub, desired, ids)
+            store.publish(desired, ids)
             durations.append((time.perf_counter() - t0) * 1000)
         # One INFO per call is inside this delta; subtract it so the number is
         # the write's own command count.
@@ -512,7 +488,7 @@ def mode_flatness(client, channels):
     for i in range(15):
         target = swapped_a if i % 2 else swapped_b
         t0 = time.perf_counter()
-        write(stub, target, ids)
+        store.publish(target, ids)
         durations.append((time.perf_counter() - t0) * 1000)
     used = commands_processed() - before - 1
     changed = {

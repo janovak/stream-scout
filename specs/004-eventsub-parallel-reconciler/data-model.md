@@ -53,6 +53,10 @@ COMMIT;
 
 ## Redis — desired set
 
+`services/stream-monitoring/desired_set_store.py` owns this representation.
+The poller and reconciler depend on its `DesiredSetStore` interface rather
+than importing keys or repeating decoding and transaction rules.
+
 | Key | Type | Written by | Read by | TTL |
 |---|---|---|---|---|
 | `chat:desired` | Sorted set: member = broadcaster login, score = rank (1 = top) | Poller, once per poll | Reconciler | none — overwritten each poll |

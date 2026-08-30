@@ -4,7 +4,7 @@ Subscription reconciler -- makes the live subscription set match the poller's
 intent.
 
 The poller decides WHAT to watch. The reconciler makes it so. The two only
-share Redis, and they never wait for each other.
+share a `DesiredSetStore`, and they never wait for each other.
 
 Why the split
 -------------
@@ -19,35 +19,12 @@ The poll now writes intent and returns. This module owns all network fan-out
 and does it in parallel. The cost of a poll no longer depends on how much the
 desired set changed (FR-003).
 
-Redis layout (data-model.md)
-----------------------------
-| Key                     | Type       | Written by | Read by     |
-|-------------------------|------------|------------|-------------|
-| `chat:desired`          | Sorted set | Poller     | Reconciler  |
-| `chat:desired:ids`      | Hash       | Poller     | Reconciler  |
-| `chat:desired:generation` | String   | Poller     | Reconciler  |
-
-- `chat:desired`  -- member = broadcaster login, score = rank, 1 = top. The
-  score order lets the reconciler work highest rank first, so the most-watched
-  channels come up first during a cold start.
-- `chat:desired:ids` -- login -> broadcaster id. EventSub subscribes by
-  broadcaster id, but the poller ranks by login, so the map must cross the
-  seam. It is written in the same transaction as `chat:desired`, so the two
-  can never disagree.
-- `chat:desired:generation` -- a counter. The poller increments it each time it
-  writes a new desired set. The reconciler uses it to notice that its own view
-  went stale while a pass was running.
-
-The poller writes all three in one MULTI/EXEC. Its cost scales with the SIZE of
-the desired set, not with the size of the CHANGE, which is what FR-003 asks
-for.
-
-Note on the write shape: data-model.md describes the write as one `ZADD` plus a
-`ZREMRANGEBYRANK` trim. A rank trim cannot do the job. A member that leaves the
-desired set keeps its old score, which is also a low rank, so the trim would
-keep the stale member and evict a wanted one instead. The poller does
-`DEL` + `ZADD` inside a MULTI, which is still one round trip and is exact. A
-reader never sees the empty window, because Redis runs the transaction whole.
+Desired-set seam
+----------------
+`desired_set_store.py` owns the Redis layout, decoding rules, and atomic
+publish. The reconciler sees one ranked domain value through the
+`DesiredSetStore` interface. The Redis implementation preserves the
+`DEL` + `ZADD` + `HSET` + `INCR` MULTI/EXEC required by data-model.md.
 
 Refusals are durable
 --------------------
@@ -74,17 +51,14 @@ import os
 import random
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Dict, Iterable, List, Optional, Set
 
 from prometheus_client import Counter, Gauge, Histogram
 
-logger = logging.getLogger("stream_monitoring")
+from desired_set_store import DesiredSetStore
 
-# Redis keys. Everything that crosses the poller/reconciler seam is here.
-DESIRED_KEY = "chat:desired"
-DESIRED_IDS_KEY = "chat:desired:ids"
-DESIRED_GENERATION_KEY = "chat:desired:generation"
+logger = logging.getLogger("stream_monitoring")
 
 # Only an `enabled` subscription counts as live. Twitch keeps dead ones around
 # with statuses such as `authorization_revoked` and `websocket_disconnected`,
@@ -521,19 +495,6 @@ class PostgresRefusalStore(RefusalStore):
                 self.db_pool.putconn(conn)
 
 
-@dataclass(frozen=True)
-class DesiredSet:
-    """One read of the poller's intent."""
-
-    logins: List[str] = field(default_factory=list)  # rank order, best first
-    ids: Dict[str, int] = field(default_factory=dict)
-    generation: int = 0
-
-    def broadcaster_ids(self) -> List[int]:
-        """Broadcaster ids in rank order, skipping any login with no id."""
-        return [self.ids[login] for login in self.logins if login in self.ids]
-
-
 class Reconciler:
     """Drives the live subscription set toward `chat:desired`.
 
@@ -549,13 +510,13 @@ class Reconciler:
     def __init__(
         self,
         transport: SubscriptionTransport,
-        redis_client,
+        desired_store: DesiredSetStore,
         config: Optional[ReconcilerConfig] = None,
         on_pass_complete: Optional[Callable[[int], None]] = None,
         refusal_store: Optional[RefusalStore] = None,
     ):
         self.transport = transport
-        self.redis_client = redis_client
+        self.desired_store = desired_store
         self.config = config or resolve_reconciler_config()
         self.on_pass_complete = on_pass_complete
         # Optional: without it every channel is attempted every pass, which is
@@ -718,7 +679,7 @@ class Reconciler:
             ) and time.monotonic() >= self._adopt_retry_after:
                 await self._adopt()
 
-            desired = self._read_desired()
+            desired = self.desired_store.read()
             self._pass_generation = desired.generation
             self._desired_ids = set(desired.broadcaster_ids())
         except Exception as e:
@@ -814,51 +775,12 @@ class Reconciler:
     def _wake_if_generation_moved(self):
         """Run again at once if the poller wrote a new set during this pass."""
         try:
-            current = self._read_generation()
+            current = self.desired_store.read_generation()
         except Exception as e:
             logger.warning("Could not re-read the generation", extra={"error": str(e)})
             return
         if current != self._pass_generation:
             self._wake.set()
-
-    # -- Redis ------------------------------------------------------------
-    #
-    # These calls are synchronous, which matches how the poller already uses
-    # Redis in this service. There are three of them per pass and a ZRANGE of
-    # 500 members costs well under a millisecond, so the event loop does not
-    # notice. Do not add per-channel Redis calls here.
-
-    def _read_desired(self) -> DesiredSet:
-        ranked = self.redis_client.zrange(DESIRED_KEY, 0, -1)
-        ids = self.redis_client.hgetall(DESIRED_IDS_KEY) or {}
-        # Per entry, not a comprehension that raises. One unparseable value
-        # used to take out `_read_desired` entirely, so `reconcile_once` hit
-        # its "could not read the desired set" early return and created and
-        # dropped nothing at all until the next poll rewrote the hash. The
-        # poller's own reader of this key already skips bad entries; a single
-        # bad member should cost that member, not the pass.
-        parsed: Dict[str, int] = {}
-        for login, broadcaster_id in ids.items():
-            try:
-                parsed[self._as_text(login)] = int(broadcaster_id)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Unparseable broadcaster id in the desired-set map, skipping it",
-                    extra={"login": self._as_text(login)},
-                )
-        return DesiredSet(
-            logins=[self._as_text(login) for login in ranked],
-            ids=parsed,
-            generation=self._read_generation(),
-        )
-
-    def _read_generation(self) -> int:
-        raw = self.redis_client.get(DESIRED_GENERATION_KEY)
-        return int(raw) if raw else 0
-
-    @staticmethod
-    def _as_text(value) -> str:
-        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
     # -- adoption ---------------------------------------------------------
 
@@ -1130,7 +1052,7 @@ class Reconciler:
             if not self._wake.is_set():
                 return
             try:
-                desired = self._read_desired()
+                desired = self.desired_store.read()
             except Exception as e:
                 # Keep the view we have. The next pass corrects it.
                 logger.warning("Mid-pass desired refresh failed", extra={"error": str(e)})

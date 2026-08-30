@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from desired_set_store import DESIRED_IDS_KEY, DesiredSet, RedisDesiredSetStore
 import eventsub_pool
 import reconciler as reconciler_module
 import stream_monitoring_service
@@ -29,9 +30,6 @@ from eventsub_pool import (
     to_epoch_ms,
 )
 from reconciler import (
-    DESIRED_GENERATION_KEY,
-    DESIRED_IDS_KEY,
-    DESIRED_KEY,
     REFUSAL_RECHECK_DAYS,
     PostgresRefusalStore,
     RateLimitedError,
@@ -43,119 +41,8 @@ from reconciler import (
     TransportError,
 )
 from stream_monitoring_service import StreamMonitoringService, compute_desired_set
+from test_support import FakeRedis
 from token_manager import TokenRecord, TwitchCredentials
-
-
-class FakeRedis:
-    """Enough Redis for the poller/reconciler seam, held in memory.
-
-    Both sides of the seam use one instance in these tests, so a test
-    exercises the real key layout rather than an assumption about it. Every
-    operation is recorded in `calls`, which is what the FR-003 test counts: a
-    pipeline records one `pipeline.execute`, because that is one round trip
-    however many commands it carries.
-    """
-
-    def __init__(self):
-        self.strings = {}
-        self.zsets = {}
-        self.hashes = {}
-        self.calls = []
-        self.fail_on = set()
-        self._recording = True
-
-    def _record(self, name):
-        if name in self.fail_on:
-            raise ConnectionError(f"simulated Redis failure on {name}")
-        if self._recording:
-            self.calls.append(name)
-
-    def exists(self, key):
-        self._record("exists")
-        return 1 if key in self.strings or key in self.zsets or key in self.hashes else 0
-
-    def setex(self, key, ttl, value):
-        self._record("setex")
-        self.strings[key] = str(value)
-
-    def get(self, key):
-        self._record("get")
-        return self.strings.get(key)
-
-    def incr(self, key):
-        self._record("incr")
-        self.strings[key] = str(int(self.strings.get(key, 0)) + 1)
-        return int(self.strings[key])
-
-    def delete(self, *keys):
-        self._record("delete")
-        for key in keys:
-            self.strings.pop(key, None)
-            self.zsets.pop(key, None)
-            self.hashes.pop(key, None)
-
-    def zadd(self, key, mapping):
-        self._record("zadd")
-        self.zsets.setdefault(key, {}).update(
-            {member: float(score) for member, score in mapping.items()}
-        )
-
-    def zrange(self, key, start, end):
-        self._record("zrange")
-        ordered = sorted(self.zsets.get(key, {}).items(), key=lambda kv: (kv[1], kv[0]))
-        if end == -1:
-            end = len(ordered) - 1
-        return [member for member, _ in ordered[start:end + 1]]
-
-    def hset(self, key, mapping=None):
-        self._record("hset")
-        self.hashes.setdefault(key, {}).update(
-            {field: str(value) for field, value in (mapping or {}).items()}
-        )
-
-    def hgetall(self, key):
-        self._record("hgetall")
-        return dict(self.hashes.get(key, {}))
-
-    def pipeline(self):
-        return FakePipeline(self)
-
-
-class FakePipeline:
-    """A MULTI/EXEC that applies its queued commands as one round trip."""
-
-    def __init__(self, client):
-        self.client = client
-        self.queued = []
-
-    def delete(self, *keys):
-        self.queued.append(("delete", (keys), {}))
-        return self
-
-    def zadd(self, key, mapping):
-        self.queued.append(("zadd", (key, mapping), {}))
-        return self
-
-    def hset(self, key, mapping=None):
-        self.queued.append(("hset", (key,), {"mapping": mapping}))
-        return self
-
-    def incr(self, key):
-        self.queued.append(("incr", (key,), {}))
-        return self
-
-    def execute(self):
-        self.client._recording = False
-        try:
-            for name, args, kwargs in self.queued:
-                if name == "delete":
-                    self.client.delete(*args)
-                else:
-                    getattr(self.client, name)(*args, **kwargs)
-        finally:
-            self.client._recording = True
-        self.client.calls.append("pipeline.execute")
-        self.queued = []
 
 
 def make_stream(login, user_id):
@@ -189,6 +76,7 @@ def make_poller(logins, fake_redis, reconciler=None):
     service = StreamMonitoringService()
     service.twitch = FakeTwitch([make_stream(login, 1000 + i) for i, login in enumerate(logins)])
     service.redis_client = fake_redis
+    service.desired_store = RedisDesiredSetStore(fake_redis)
     service.reconciler = reconciler
     service._get_clipping_disabled_ids = MagicMock(return_value=set())
     service._upsert_streamer = MagicMock()
@@ -749,14 +637,13 @@ class TestFetchBudget:
 
 def seed_desired(fake_redis, logins_with_ids):
     """Write a desired set the way the poller writes it, for reconciler tests."""
-    fake_redis.zsets[DESIRED_KEY] = {
-        login: float(rank) for rank, (login, _) in enumerate(logins_with_ids, 1)
+    desired = {
+        login: rank for rank, (login, _) in enumerate(logins_with_ids, 1)
     }
-    fake_redis.hashes[DESIRED_IDS_KEY] = {
-        login: str(broadcaster_id) for login, broadcaster_id in logins_with_ids
+    ids = {
+        login: broadcaster_id for login, broadcaster_id in logins_with_ids
     }
-    previous = int(fake_redis.strings.get(DESIRED_GENERATION_KEY, 0))
-    fake_redis.strings[DESIRED_GENERATION_KEY] = str(previous + 1)
+    RedisDesiredSetStore(fake_redis).publish(desired, ids)
 
 
 def make_reconciler(transport, fake_redis, refusal_store=None, **config_overrides):
@@ -770,7 +657,7 @@ def make_reconciler(transport, fake_redis, refusal_store=None, **config_override
     settings.update(config_overrides)
     return Reconciler(
         transport=transport,
-        redis_client=fake_redis,
+        desired_store=RedisDesiredSetStore(fake_redis),
         config=ReconcilerConfig(**settings),
         refusal_store=refusal_store,
     )
@@ -910,23 +797,23 @@ class TestPollWritesIntentOnly:
 
         asyncio.run(service.poll_top_streams())
 
-        assert fake_redis.zrange(DESIRED_KEY, 0, -1) == logins[:15]
-        assert fake_redis.hgetall(DESIRED_IDS_KEY) == {
-            login: str(broadcaster_id_for(logins, login)) for login in logins[:15]
-        }
-        assert fake_redis.get(DESIRED_GENERATION_KEY) == "1"
+        assert service.desired_store.read() == DesiredSet(
+            logins=logins[:15],
+            ids={
+                login: broadcaster_id_for(logins, login) for login in logins[:15]
+            },
+            generation=1,
+        )
 
-    def test_desired_set_is_scored_by_rank_best_first(self):
-        """The reconciler reads the set in score order to work highest rank
-        first, so the score must be the rank and 1 must be the top."""
+    def test_desired_set_reads_back_in_rank_order(self):
+        """The reconciler works highest rank first."""
         fake_redis = FakeRedis()
         logins = [f"s{i}" for i in range(1, 31)]
         service = make_poller(logins, fake_redis)
 
         asyncio.run(service.poll_top_streams())
 
-        assert fake_redis.zsets[DESIRED_KEY]["s1"] == 1.0
-        assert fake_redis.zsets[DESIRED_KEY]["s15"] == 15.0
+        assert service.desired_store.read().logins == logins[:15]
 
     def test_poll_makes_no_chat_connection_and_no_subscription(self):
         """FR-002. The poll path must not touch the transport at all."""
@@ -981,7 +868,7 @@ class TestPollWritesIntentOnly:
             no_change_seconds = time.perf_counter() - start
             no_change_calls = list(fake_redis.calls)
 
-        assert len(fake_redis.zrange(DESIRED_KEY, 0, -1)) == 500
+        assert len(service.desired_store.read().logins) == 500
         assert len(full_change_calls) == len(no_change_calls), (
             "the poll did more work when more changed -- something in it "
             "still scales with the change, not the set"
@@ -1030,7 +917,7 @@ class TestPollWritesIntentOnly:
         logins = [f"s{i}" for i in range(1, 31)]
         service = make_poller(logins, fake_redis)
         asyncio.run(service.poll_top_streams())
-        assert fake_redis.zrange(DESIRED_KEY, 0, -1) == logins[:15]
+        assert service.desired_store.read().logins == logins[:15]
 
         # s15 slips to rank 16 -- inside the retained band, so it stays. A
         # brand-new service instance reads the band from Redis, not memory.
@@ -1038,7 +925,7 @@ class TestPollWritesIntentOnly:
         restarted = make_poller(reordered, fake_redis)
         asyncio.run(restarted.poll_top_streams())
 
-        wanted = fake_redis.zrange(DESIRED_KEY, 0, -1)
+        wanted = restarted.desired_store.read().logins
         assert "s15" in wanted, "the retained band did not survive the poll"
         assert "newcomer" in wanted
         assert "s16" not in wanted, "a newcomer entered through the band"
@@ -1051,7 +938,7 @@ class TestPollWritesIntentOnly:
         # s1 disappears from the ranking altogether.
         asyncio.run(make_poller(logins[1:], fake_redis).poll_top_streams())
 
-        assert "s1" not in fake_redis.zrange(DESIRED_KEY, 0, -1)
+        assert "s1" not in RedisDesiredSetStore(fake_redis).read().logins
 
 
 class TestReconcilerDiff:
@@ -1796,7 +1683,7 @@ class TestReconcilerMetrics:
         observed = []
         reconciler = Reconciler(
             transport=StubTransport(),
-            redis_client=fake_redis,
+            desired_store=RedisDesiredSetStore(fake_redis),
             config=ReconcilerConfig(concurrency=4, idle_timeout_seconds=0.01),
             on_pass_complete=observed.append,
         )

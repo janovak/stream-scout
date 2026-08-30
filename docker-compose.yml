@@ -408,6 +408,7 @@ services:
     volumes:
       - ./secrets:/app/secrets:rw
       - ./services/stream-monitoring/stream_monitoring_service.py:/app/stream_monitoring_service.py:ro
+      - ./services/stream-monitoring/desired_set_store.py:/app/desired_set_store.py:ro
       - ./services/stream-monitoring/reconciler.py:/app/reconciler.py:ro
       - ./services/stream-monitoring/eventsub_pool.py:/app/eventsub_pool.py:ro
       - ./services/stream-monitoring/token_manager.py:/app/token_manager.py:ro
