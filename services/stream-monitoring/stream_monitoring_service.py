@@ -530,11 +530,14 @@ class StreamMonitoringService:
         try:
             await self._init_task
         except asyncio.CancelledError:
-            if not self._stopping:
-                # Not our cancellation. Only `stop()` cancels `_init_task`, and
-                # it sets `_stopping` before it does -- anything else means the
-                # cancellation is aimed at THIS coroutine and passing through,
-                # so swallowing it here would break cancellation for the caller.
+            if asyncio.current_task().cancelling() > 0:
+                # Aimed at THIS task, not at start-up. `stop()` cancels
+                # `_init_task` alone, which leaves our own cancel count at
+                # zero; anything that cancelled `start()` itself shows up here.
+                # `_stopping` was the wrong discriminator: a cancellation
+                # arriving from outside WHILE a shutdown is already running
+                # sets it too, and swallowing that one reported clean
+                # completion to a caller that had asked us to stop.
                 raise
             # `stop()` ran out of patience with start-up. It owns the teardown
             # of whatever got built, and it is awaiting this task, so return
@@ -614,6 +617,20 @@ class StreamMonitoringService:
                 # the teardown below can run against whatever it managed to
                 # build.
                 logger.warning("Start-up failed before shutdown", extra={"error": str(e)})
+            except asyncio.CancelledError:
+                # The start-up task was cancelled by something other than this
+                # `stop()` -- an outer runtime unwinding its tasks while a
+                # signal-driven shutdown is already in flight. The shield lets
+                # that reach us, and letting it propagate abandoned the WHOLE
+                # teardown: nothing below here ran, so the producer was never
+                # flushed and the websockets were never closed. That is the
+                # opposite of what a shutdown racing a cancellation should do.
+                # Only a cancellation aimed at `stop()` ITSELF may stop it.
+                if asyncio.current_task().cancelling() > 0:
+                    raise
+                logger.warning(
+                    "Start-up was cancelled from elsewhere, tearing down what exists"
+                )
 
         # Only if it was actually started. `start()` can now return before
         # `scheduler.start()` when shutdown is signalled during start-up, and

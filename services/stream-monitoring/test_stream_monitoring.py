@@ -1995,6 +1995,40 @@ class TestReconcilerLifecycle:
 
         asyncio.run(run())
 
+    def test_a_cancellation_during_shutdown_does_not_abandon_the_teardown(self):
+        """`_stopping` said "a shutdown is running", not "the shutdown
+        cancelled you". An outer runtime unwinding its tasks while a
+        signal-driven `stop()` was already waiting cancelled `start()` from
+        outside: `start()` swallowed it because `_stopping` was set, and the
+        same cancellation came back through `stop()`'s shielded wait, where
+        nothing caught it -- so every teardown step below was skipped and the
+        producer was never flushed. Both sides now ask whether the
+        cancellation was aimed at THEM."""
+
+        async def run():
+            service = StreamMonitoringService()
+            service.kafka_producer = MagicMock()
+            service.redis_client = MagicMock()
+
+            async def slow_initialize():
+                await asyncio.sleep(60)
+
+            service.initialize = slow_initialize
+            starter = asyncio.create_task(service.start())
+            await asyncio.sleep(0.02)
+            stopper = asyncio.create_task(service.stop())
+            await asyncio.sleep(0.02)
+            starter.cancel()                     # from outside, mid-shutdown
+
+            with pytest.raises(asyncio.CancelledError):
+                await starter
+            await asyncio.wait_for(stopper, timeout=2)
+
+            service.kafka_producer.flush.assert_called_once()
+            service.redis_client.close.assert_called_once()
+
+        asyncio.run(run())
+
     def test_stop_cancels_the_reconciler_before_closing_redis(self):
         service = StreamMonitoringService()
         fake_redis = FakeRedis()
@@ -3182,6 +3216,107 @@ class TestPoolRaces:
             )
             assert pool._slots == {}
             assert connection.reserved == 0
+
+        asyncio.run(run())
+
+    def test_the_reservation_is_held_across_the_discarding_delete(self):
+        """The subscription may still exist on Twitch for the length of that
+        round trip. Releasing the slot first counted it in neither `reserved`
+        nor `subscription_ids`, so another worker could route a channel into a
+        slot that was not really free and push the session past its cap."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_pool(cap=1, twitch=twitch)
+            await pool.start()
+            await pool._grow()
+            connection = pool._connections[0]
+            websocket = connection.websocket
+            original_listen = websocket.listen_channel_chat_message
+
+            async def reconnect_during_create(broadcaster_user_id, user_id, callback):
+                subscription_id = await original_listen(
+                    broadcaster_user_id, user_id, callback
+                )
+                websocket.active_session = type(
+                    "Session", (), {"id": "session-after-reconnect"}
+                )()
+                return subscription_id
+
+            websocket.listen_channel_chat_message = reconnect_during_create
+
+            during_delete = []
+
+            async def slow_delete(subscription_id, target_token=None):
+                during_delete.append(pool.route(7))
+                await asyncio.sleep(0)
+
+            twitch.delete_eventsub_subscription = slow_delete
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+
+            assert during_delete == [None], (
+                "the slot looked free while the subscription might still exist, "
+                "so another worker could oversubscribe the session"
+            )
+            assert connection.reserved == 0, "the reservation was never released"
+
+        asyncio.run(run())
+
+    def test_the_retry_ladder_is_emptied_only_after_the_socket_is_closed(self):
+        """Ordering, and it is load-bearing.
+
+        The moment `reconnect_delay_steps` is empty, `_connect` can unwind
+        `run_until_complete` and STOP the socket loop -- and the teardown that
+        closes the ClientSession is scheduled on that same loop. Emptying the
+        list first therefore raced the cleanup it was paired with: the loop
+        stopped with the teardown still pending, so the session was never
+        closed and the connector leaked, with only a "coroutine was never
+        awaited" warning to show for it.
+        """
+
+        class OrderRecordingSocket:
+            """Records the two events whose ORDER is the whole point."""
+
+            def __init__(self, order, loop):
+                self.order = order
+                self._socket_loop = loop
+                self._connection = None
+                self._session = self
+                self._closing = False
+                self._startup_complete = False
+                self._running = True
+                self._steps = [0, 1, 2, 4, 8]
+
+            async def close(self):
+                self.order.append("session closed")
+
+            @property
+            def reconnect_delay_steps(self):
+                return self._steps
+
+            @reconnect_delay_steps.setter
+            def reconnect_delay_steps(self, value):
+                if value == []:
+                    self.order.append("ladder emptied")
+                self._steps = value
+
+        async def run():
+            pool = make_pool()
+            order = []
+            websocket = OrderRecordingSocket(order, asyncio.get_running_loop())
+
+            pool._abandon_socket(websocket)
+            await asyncio.sleep(0.05)
+
+            assert order == ["session closed", "ladder emptied"], (
+                f"the ladder was emptied out of order (saw {order}); "
+                "_connect can stop the socket loop the moment it is empty, "
+                "leaving the teardown pending and the session unclosed"
+            )
+            assert websocket._closing is True
+            assert websocket._startup_complete is True
 
         asyncio.run(run())
 

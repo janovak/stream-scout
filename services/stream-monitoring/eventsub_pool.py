@@ -465,15 +465,15 @@ class EventSubPoolTransport(SubscriptionTransport):
         connection = await self._reserve(broadcaster_id)
         # Read BEFORE the create, not after. The library builds the POST's
         # transport from whatever session is current when the request is
-        # issued, and its socket thread can complete a reconnect -- new
-        # session, plus a `_resubscribe()` sweep -- while that request is in
-        # flight. Stamping the slot with the session read AFTER the await
-        # therefore labelled a subscription made on the OLD session with the
-        # NEW one, and `_slot_is_current` would then agree with itself for
-        # ever: the session check passes, the library's registry holds the id
-        # because `_subscribe` added it, and `create()` hands the ghost back
-        # with no Twitch call while nothing delivers for that channel. The
-        # session the request was actually issued on is the only honest stamp.
+        # issued, and its socket thread can complete a reconnect -- and so
+        # change the session -- while that request is in flight. Stamping the
+        # slot with the session read AFTER the await therefore labelled a
+        # subscription made on the OLD session with the NEW one, and
+        # `_slot_is_current` would then agree with itself for ever: the session
+        # check passes, the library's registry holds the id because
+        # `_subscribe` added it, and `create()` hands the ghost back with no
+        # Twitch call while nothing delivers for that channel. The session the
+        # request was actually issued on is the only honest stamp.
         session_before = self._session_id(connection)
         subscription_id = None
         try:
@@ -506,8 +506,8 @@ class EventSubPoolTransport(SubscriptionTransport):
                 await self._release(connection)
 
         async with self._lock:
-            connection.reserved = max(0, connection.reserved - 1)
             if self._connection_by_id(connection.connection_id) is None:
+                connection.reserved = max(0, connection.reserved - 1)
                 # The supervisor retired this connection while the create was
                 # in flight -- it runs on this loop and the create above is an
                 # await. Recording the slot now would re-add an entry
@@ -532,6 +532,9 @@ class EventSubPoolTransport(SubscriptionTransport):
                 and session_before != session_now
             )
             if not reconnected:
+                # Decremented in the SAME critical section that records the
+                # subscription, so `load` never dips between the two.
+                connection.reserved = max(0, connection.reserved - 1)
                 slot = _Slot(
                     broadcaster_id,
                     connection.connection_id,
@@ -562,13 +565,23 @@ class EventSubPoolTransport(SubscriptionTransport):
         # Twitch's 409 and adopt it -- `_adopt_conflict` restores the pool's
         # indexes but not the library's callback -- so the channel was counted
         # as covered and dark for good. That is the exact failure this whole
-        # check exists to prevent.
+        # check exists to prevent. And the live case is not hypothetical:
+        # Twitch's graceful `session_reconnect` changes the session id AND
+        # migrates the subscriptions, and the library does not call
+        # `_resubscribe()` on that path at all.
         #
         # The delete runs OUTSIDE the lock (it is a Twitch round trip) and
         # BEFORE the registry is cleared. If it fails, the registry entry
         # stays, which is the safe side of that error: on the live-session
         # branch the subscription and its callback are both still intact and
         # the next enumeration simply adopts a working subscription.
+        #
+        # The RESERVATION is held across that round trip, and released only
+        # once it is over. Giving it up with the delete still in flight left
+        # the subscription counted in neither `reserved` nor
+        # `subscription_ids` while it may well still exist on Twitch, so
+        # another worker could route a channel into a slot that was not really
+        # free and push the session past its cap.
         logger.warning(
             "Connection reconnected mid-create, discarding the subscription",
             extra={
@@ -579,8 +592,11 @@ class EventSubPoolTransport(SubscriptionTransport):
                 "session_now": session_now,
             },
         )
-        await self._delete_one(subscription_id)
-        self._forget_library_subscription(connection, subscription_id)
+        try:
+            await self._delete_one(subscription_id)
+            self._forget_library_subscription(connection, subscription_id)
+        finally:
+            await self._release(connection)
         raise TransportError(
             f"connection {connection.connection_id} reconnected while "
             f"subscribing broadcaster {broadcaster_id}"
@@ -850,14 +866,14 @@ class EventSubPoolTransport(SubscriptionTransport):
         next condition check -- `retry >= len(...)` is then true, so `_connect`
         raises and `_run_socket` unwinds -- which bounds the thread by whatever
         sleep is already in progress instead of by the whole ladder.
+
+        `_tear_down_socket` does the emptying, at the END of the teardown, for
+        the reason spelled out there: the moment the list is empty `_connect`
+        can stop the socket loop, and the teardown runs on that loop.
         """
         websocket._startup_complete = True
         websocket._running = False
-        try:
-            websocket.reconnect_delay_steps = []
-        except Exception:  # pragma: no cover -- a double without the attribute
-            pass
-        self._tear_down_socket(websocket)
+        self._tear_down_socket(websocket, stop_retrying=True)
 
     # -- events -----------------------------------------------------------
 
@@ -1090,7 +1106,7 @@ class EventSubPoolTransport(SubscriptionTransport):
             raise TransportError(f"could not delete {subscription_id}: {e}") from e
 
     @staticmethod
-    def _tear_down_socket(websocket) -> None:
+    def _tear_down_socket(websocket, *, stop_retrying: bool = False) -> None:
         """Close one library socket without blocking this service's loop.
 
         `EventSubWebsocket.stop()` blocks on a future the socket's own loop has
@@ -1103,6 +1119,17 @@ class EventSubPoolTransport(SubscriptionTransport):
         spins on: a teardown that raised on the way would otherwise leave that
         thread looping at 10 Hz for the life of the process. `_stop()` itself
         raises when the connection is already None, which is exactly that case.
+
+        `stop_retrying` empties `reconnect_delay_steps`, which is what ends a
+        socket still inside `_connect`'s retry ladder (see `_abandon_socket`).
+        It happens HERE, at the end of the teardown, and not before it: the
+        moment that list is empty `_connect` can unwind `run_until_complete`
+        and stop the socket loop, and this coroutine is scheduled ON that loop.
+        Emptying it first therefore raced the very cleanup it was paired with
+        -- the loop stopped with `teardown` still pending, so `_session` was
+        never closed and the aiohttp connector leaked, with a "coroutine was
+        never awaited" warning as the only trace. Ordering it last makes the
+        unwind harmless, because by then there is nothing left to close.
         """
         try:
             socket_loop = getattr(websocket, "_socket_loop", None)
@@ -1133,10 +1160,20 @@ class EventSubPoolTransport(SubscriptionTransport):
                     except Exception:
                         pass
                     websocket._closing = True
+                    if stop_retrying:
+                        try:
+                            websocket.reconnect_delay_steps = []
+                        except Exception:  # pragma: no cover -- odd double
+                            pass
 
                 asyncio.run_coroutine_threadsafe(teardown(), socket_loop)
             else:
                 websocket._closing = True
+                if stop_retrying:
+                    try:
+                        websocket.reconnect_delay_steps = []
+                    except Exception:  # pragma: no cover -- odd double
+                        pass
         except Exception as e:  # pragma: no cover -- a test double without them
             logger.debug("Could not tear down a socket", extra={"error": str(e)})
 
