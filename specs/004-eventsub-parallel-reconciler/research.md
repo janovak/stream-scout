@@ -841,3 +841,16 @@ One rough edge worth carrying: every cold start throws a burst of
 websocket session reconnects under load. All recover on the next pass. A commit
 on 2026-08-30 classified them apart from real failures and moved the logging
 from ERROR to WARNING.
+
+**A later attempt at 800/1000 (~800 channels) did not converge and was rolled
+back.** The transport's 900-connection cap is not what binds first. The poller
+does a remote Postgres upsert and a Kafka lifecycle publish per channel, so at
+~800 channels one `poll_top_streams` ran past 100 s and APScheduler
+(`max_instances=1`) missed the next poll by 104 s — the FR-003 "poll never
+blocks" guarantee breaking under the per-channel remote write. Separately, 800
+creates from cold is ~2x Twitch's ~400 burst budget, so the reconciler spends
+200 s+ per pass grinding through 429 backoff. **The safe ceiling for the current
+design is ~500 channels.** Raising it needs the poll's per-channel write batched
+or moved out of the poll loop — a design change, candidate for its own spec
+alongside 005. `OPERATIONS.md` "Ramping the monitored channel count" carries the
+detail.

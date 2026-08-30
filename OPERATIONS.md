@@ -143,13 +143,14 @@ fetch` appears. It is a flat pad, so it thins out as the threshold grows;
 
 ### The step ladder
 
-| Step | `JOIN_THRESHOLD` / `LEAVE_THRESHOLD` | Channels monitored |
-|---|---|---|
-| 0 | 15 / 30 | ~20 |
-| 1 | 50 / 100 | ~55 |
-| 2 | 150 / 300 | ~290 (current production) |
-| 3 | 300 / 500 | ~320 |
-| 4 | 480 / 500 | ~485 |
+| Step | `JOIN_THRESHOLD` / `LEAVE_THRESHOLD` | Channels monitored | Result |
+|---|---|---|---|
+| 0 | 15 / 30 | ~20 | baseline |
+| 1 | 50 / 100 | ~55 | clean |
+| 2 | 150 / 300 | ~290 | clean — **current production** |
+| 3 | 300 / 500 | ~320 | clean |
+| 4 | 480 / 500 | ~485 | clean |
+| 5 | 800 / 1000 | ~800 | **did not converge, rolled back** — see below |
 
 Soak each step for at least 30 minutes before the next.
 
@@ -182,11 +183,11 @@ channels was **~0.3–0.5 per broadcaster-hour** — the rank 150–500 band is 
 quieter (`research.md` §1: median 32 messages per 60 s). At ~485 channels that
 is roughly 150 clip attempts per hour, well under any Twitch per-account limit.
 
-So the clip budget is a real constraint but a distant one. It is most likely to
-bite near the transport's own 900-channel hard cap, or during a synchronized
-event where many channels spike at once. **The `rate_limited` reason on
-`clips_created_failed_total` is the trigger for spec 005** — anomaly ranking
-against a scarce clip budget. It did not appear on this ramp.
+So the clip budget is a real constraint but a distant one — and the 800/1000
+attempt below hit the poller's ceiling well before the clip budget's. **The
+`rate_limited` reason on `clips_created_failed_total` is the trigger for spec
+005** — anomaly ranking against a scarce clip budget. It did not appear at any
+tested channel count.
 
 Two rough edges, neither blocking:
 
@@ -197,6 +198,32 @@ Two rough edges, neither blocking:
   2026-08-30.
 - **Reconcile pass duration** grows from milliseconds at 50 channels to ~2–4 s
   at 300–485. Still well inside the 5 s idle interval, but watch it past 500.
+
+### 800/1000 was tried and rolled back — the poller is the ceiling
+
+A jump to `JOIN_THRESHOLD` 800 / `LEAVE_THRESHOLD` 1000 (~800 channels) did
+**not** converge and was rolled back after ~10 minutes. Two limits bind before
+the transport's 900-connection cap does:
+
+- **The poll job stalls.** `poll_top_streams` does one Helix page fetch, one
+  Postgres `INSERT ... ON CONFLICT`, and one Kafka lifecycle publish *per
+  channel*. Postgres is remote (over Tailscale), so ~800 upserts per poll plus
+  ~12 Helix pages plus hundreds of lifecycle publishes pushed one poll past
+  100 s. APScheduler runs the poll `max_instances=1`, so the next poll was
+  `missed by 0:01:44`. A delayed poll stops refreshing `streamer:online:*`
+  (180 s TTL) and streamers start to flap. This is the FR-003 "poll never
+  blocks" guarantee breaking at scale — the per-channel remote write in the
+  poll loop is the bottleneck, and fixing it is a design change, not a config.
+- **The reconciler cannot outrun the 429 budget.** Twitch's create burst
+  budget is ~360–420 per token (`research.md` D2). 800 channels from cold is
+  twice that, so a pass drains the budget, backs off, drains again, and takes
+  200 s+ while `reconcile_last_success_timestamp` sits frozen well past the
+  "normal cold start" window.
+
+**The safe ceiling for the current design is around 500 channels.** Going above
+that needs the poll's per-channel Postgres write batched or moved out of the
+poll loop, and probably a gentler reconciler ramp (create in budget-sized
+waves) — both candidates for their own spec alongside 005.
 
 ### Rolling back a step
 
