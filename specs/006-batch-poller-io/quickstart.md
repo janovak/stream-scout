@@ -77,7 +77,9 @@ completed service invocation (the service exposes these in its immutable
 `last_poll_result`). Returning fixture intent without observing the invocation
 does not satisfy the driver. Operation-count callbacks must instrument the
 supplied counter; a separate count map is accepted only when it exactly agrees
-with that counter.
+with that counter. The observed final outcome must be `success`; a caught
+`metadata_failed`, `desired_publish_failed`, or other failed invocation is
+excluded rather than counted as valid evidence.
 
 ## 2. Unit and Behavioral Validation
 
@@ -272,7 +274,9 @@ datastore, or broker failure; never subtract failed time.
 Every completed measured poll must report the actual post-filter eligible
 count and effective test-only entry, retention, and fetch-buffer values. The
 driver rejects the profile if any count differs from the nominal scale or if
-the effective configuration differs from the fixture.
+the effective configuration differs from the fixture. Warm-up and all 20
+measured outcomes must be `success`; the `excluded` flag cannot convert a
+failed bounded outcome into a completed sample.
 
 Acceptance:
 
@@ -319,6 +323,7 @@ Acceptance:
   across the run (an empty scheduler event list is invalid);
 - no maximum-instance/overlap skip occurs;
 - every pass completion is recorded directly in process;
+- leading and trailing run-boundary gaps are included with adjacent pass gaps;
 - maximum adjacent completion gap is at most 15 seconds at 500;
 - maximum adjacent completion gap is at most 20 seconds at 900.
 

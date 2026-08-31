@@ -2124,6 +2124,7 @@ class TestFeature006DriverFoundation:
             {
                 "duration_ms": 100.0,
                 "excluded": False,
+                "outcome": "success",
                 "observed_eligible_records": 500,
                 "effective_join_threshold": 500,
                 "effective_leave_threshold": 500,
@@ -2143,6 +2144,7 @@ class TestFeature006DriverFoundation:
             {
                 "duration_ms": float(index),
                 "excluded": False,
+                "outcome": "success",
                 "observed_eligible_records": 500,
                 "effective_join_threshold": 500,
                 "effective_leave_threshold": 500,
@@ -2187,6 +2189,7 @@ class TestFeature006DriverFoundation:
             run_poll=lambda fixture_id: {
                 "duration_ms": 10.0,
                 "excluded": False,
+                "outcome": "success",
                 "observed_eligible_records": 900,
                 "effective_join_threshold": 900,
                 "effective_leave_threshold": 900,
@@ -2214,7 +2217,32 @@ class TestFeature006DriverFoundation:
                 run_poll=lambda _fixture_id: {
                     "duration_ms": 1.0,
                     "excluded": False,
+                    "outcome": "success",
                     "observed_eligible_records": 300,
+                    "effective_join_threshold": 500,
+                    "effective_leave_threshold": 500,
+                    "effective_fetch_buffer": 125,
+                    "phase_durations_ms": {},
+                    "dispatch_counts": {},
+                    "overlap_skip_count": 0,
+                },
+            )
+
+    def test_profile_rejects_a_caught_failed_poll_outcome(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        with pytest.raises(ValueError, match="successful poll outcome"):
+            driver.run_profile_measurements(
+                scale=500,
+                profile="stable",
+                warmups=1,
+                measured_polls=20,
+                prepare_state=lambda _fixture_id: None,
+                run_poll=lambda _fixture_id: {
+                    "duration_ms": 1.0,
+                    "excluded": False,
+                    "outcome": "desired_publish_failed",
+                    "observed_eligible_records": 500,
                     "effective_join_threshold": 500,
                     "effective_leave_threshold": 500,
                     "effective_fetch_buffer": 125,
@@ -2340,6 +2368,8 @@ class TestFeature006DriverFoundation:
             "poll-profile": {
                 "scale": 500,
                 "profile": "stable",
+                "warmup_outcome": "success",
+                "poll_outcomes": ["success"] * 20,
                 "observed_eligible_records": [500] * 20,
                 "test_join_threshold": 500,
                 "test_leave_threshold": 500,
@@ -2371,9 +2401,15 @@ class TestFeature006DriverFoundation:
                 "scale": 500,
                 "post_convergence_started_at": "2026-08-31T00:00:00+00:00",
                 "run_duration_seconds": 1800,
-                "pass_completion_monotonic_ns": [1, 2],
-                "adjacent_gaps_ms": [0.000001],
-                "maximum_gap_ms": 0.000001,
+                "run_started_monotonic_ns": 0,
+                "run_ended_monotonic_ns": 1_800_000_000_000,
+                "pass_completion_monotonic_ns": [
+                    5_000_000_000,
+                    1_795_000_000_000,
+                ],
+                "adjacent_gaps_ms": [1_790_000.0],
+                "boundary_gaps_ms": [5_000.0, 5_000.0],
+                "maximum_gap_ms": 1_790_000.0,
                 "scheduler_events": [
                     {
                         "kind": "executed",
@@ -2408,6 +2444,7 @@ class TestFeature006DriverFoundation:
         no_passes = dict(valid_records["reconciler-gap"])
         no_passes["pass_completion_monotonic_ns"] = []
         no_passes["adjacent_gaps_ms"] = []
+        no_passes["boundary_gaps_ms"] = []
         no_passes["maximum_gap_ms"] = 0.0
         with pytest.raises(ValueError, match="pass completions"):
             driver.validate_evidence_record("reconciler-gap", no_passes)
@@ -2416,6 +2453,37 @@ class TestFeature006DriverFoundation:
         no_backoff["rate_limit_events"] = []
         with pytest.raises(ValueError, match="rate-limit"):
             driver.validate_evidence_record("cold-start", no_backoff)
+
+    def test_steady_state_boundary_gap_detects_a_reconciler_that_stops_early(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        scheduler_events = [
+            {
+                "kind": "executed",
+                "monotonic_ns": index,
+                "job_id": "poll_streams",
+            }
+            for index in range(15)
+        ]
+
+        record = driver.build_reconciler_gap_record(
+            scale=500,
+            post_convergence_started_at="2026-08-31T00:00:00Z",
+            run_duration_seconds=1800,
+            run_started_monotonic_ns=0,
+            run_ended_monotonic_ns=1_800_000_000_000,
+            pass_completion_monotonic_ns=[
+                5_000_000_000,
+                10_000_000_000,
+            ],
+            scheduler_events=scheduler_events,
+        )
+
+        assert record["adjacent_gaps_ms"] == [5_000.0]
+        assert record["boundary_gaps_ms"] == [
+            5_000.0,
+            1_790_000.0,
+        ]
+        assert record["maximum_gap_ms"] == 1_790_000.0
 
     def test_operation_count_records_require_positive_exact_dispatches(self):
         driver = importlib.import_module("phase5.feature006_driver")
@@ -2435,6 +2503,7 @@ class TestFeature006DriverFoundation:
             case="stable",
             scale=500,
             counts=successful,
+            outcome="success",
             observed_eligible_records=500,
             effective_join_threshold=500,
             effective_leave_threshold=500,
@@ -2456,6 +2525,7 @@ class TestFeature006DriverFoundation:
                     case="stable",
                     scale=500,
                     counts=invalid,
+                    outcome="success",
                     observed_eligible_records=500,
                     effective_join_threshold=500,
                     effective_leave_threshold=500,
@@ -2468,6 +2538,7 @@ class TestFeature006DriverFoundation:
                 case="stable",
                 scale=500,
                 counts=unexpected,
+                outcome="success",
                 observed_eligible_records=500,
                 effective_join_threshold=500,
                 effective_leave_threshold=500,
@@ -2478,7 +2549,19 @@ class TestFeature006DriverFoundation:
                 case="stable",
                 scale=500,
                 counts=successful,
+                outcome="success",
                 observed_eligible_records=300,
+                effective_join_threshold=500,
+                effective_leave_threshold=500,
+                effective_fetch_buffer=0,
+            )
+        with pytest.raises(ValueError, match="successful poll outcome"):
+            driver.build_operation_count_record(
+                case="stable",
+                scale=500,
+                counts=successful,
+                outcome="desired_publish_failed",
+                observed_eligible_records=500,
                 effective_join_threshold=500,
                 effective_leave_threshold=500,
                 effective_fetch_buffer=0,
@@ -2542,6 +2625,7 @@ class TestFeature006DriverFoundation:
                 "online_snapshot_mget": snapshot_count,
                 "desired_publication_execute": 1,
             },
+            outcome="success",
             observed_eligible_records=0,
             effective_join_threshold=1,
             effective_leave_threshold=1,
@@ -2598,6 +2682,7 @@ class TestFeature006DriverFoundation:
                     for _ in range(count):
                         counter.increment(boundary)
                 return {
+                    "outcome": "success",
                     "observed_eligible_records": observed,
                     "effective_join_threshold": join,
                     "effective_leave_threshold": leave,
@@ -2647,6 +2732,7 @@ class TestFeature006DriverFoundation:
                         counter.increment(boundary)
                 return {
                     "dispatch_counts": {},
+                    "outcome": "success",
                     "observed_eligible_records": scale,
                     "effective_join_threshold": scale,
                     "effective_leave_threshold": scale,
@@ -2767,6 +2853,7 @@ class TestFeature006DriverFoundation:
                 self.polls += 1
                 return {
                     "excluded": False,
+                    "outcome": "success",
                     "observed_eligible_records": 500,
                     "effective_join_threshold": 500,
                     "effective_leave_threshold": 500,
@@ -2816,7 +2903,13 @@ class TestFeature006DriverFoundation:
         class Runtime:
             def __init__(self):
                 self.production_counts = []
-                self._clocks = iter([0, 1_800_000_000_000])
+                self.completion_times = [
+                    seconds * 1_000_000_000
+                    for seconds in range(10, 1800, 10)
+                ]
+                self._clocks = iter(
+                    [0, *self.completion_times, 1_800_000_000_000]
+                )
                 self.production_pass_callback = self.production_counts.append
 
             def monotonic_ns(self):
@@ -2836,8 +2929,8 @@ class TestFeature006DriverFoundation:
             ):
                 assert scale == 500
                 assert duration_seconds == 1800
-                pass_callback(500)
-                pass_callback(500)
+                for _ in self.completion_times:
+                    pass_callback(500)
                 from apscheduler.events import EVENT_JOB_EXECUTED
 
                 for _ in range(15):
@@ -2862,9 +2955,16 @@ class TestFeature006DriverFoundation:
         )
 
         record = json.loads(output.read_text())
-        assert runtime.production_counts == [500, 500]
-        assert len(record["pass_completion_monotonic_ns"]) == 2
+        assert runtime.production_counts == [500] * len(
+            runtime.completion_times
+        )
+        assert record["run_started_monotonic_ns"] == 0
+        assert record["run_ended_monotonic_ns"] == 1_800_000_000_000
+        assert len(record["pass_completion_monotonic_ns"]) == len(
+            runtime.completion_times
+        )
         assert record["run_duration_seconds"] == 1800
+        assert record["maximum_gap_ms"] == 10_000.0
         assert record["acceptance_valid"] is True
 
     def test_cold_start_command_enforces_initialized_zero_state_and_progress(

@@ -197,10 +197,11 @@ Required omission cases:
 
 Every operation-count evidence record also carries the actual post-filter
 eligible count and effective in-process entry threshold, retention threshold,
-and fetch buffer. Non-empty evidence is rejected unless the observed count and
-effective thresholds equal the requested scale. The supplied dispatch counter
-is authoritative: a runtime-reported count map must agree with it, and any
-unexpected nonzero Redis or SQL boundary invalidates the record.
+fetch buffer, plus the poll's bounded final outcome. Non-empty evidence is
+rejected unless the outcome is `success`, the observed count and effective
+thresholds equal the requested scale, and the supplied dispatch counter is
+authoritative. A runtime-reported count map must agree with that counter, and
+any unexpected nonzero Redis or SQL boundary invalidates the record.
 
 ## Completion and Telemetry Contract
 
@@ -278,6 +279,8 @@ Required fields:
 ```text
 scale
 profile (stable | complete_turnover)
+warmup_outcome (`success`)
+poll_outcomes (exactly 20 `success` values)
 observed_eligible_records (exactly 20 values, each equal to scale)
 test_join_threshold
 test_leave_threshold
@@ -299,8 +302,11 @@ Required fields:
 scale
 post_convergence_started_at
 run_duration_seconds (at least 1800)
+run_started_monotonic_ns
+run_ended_monotonic_ns
 pass_completion_monotonic_ns
 adjacent_gaps_ms
+boundary_gaps_ms
 maximum_gap_ms
 scheduler_events
 ```
@@ -308,7 +314,9 @@ scheduler_events
 Pass timestamps come from every in-process completion callback, not metrics
 scrapes. `scheduler_events` must contain the completed `poll_streams`
 executions expected across the full run duration; an empty or incomplete event
-stream cannot satisfy the steady-state gate.
+stream cannot satisfy the steady-state gate. The maximum gap includes the
+leading interval from run start to the first pass and the trailing interval
+from the last pass to run end, so an end-of-window stall cannot disappear.
 
 ### Cold-start record
 

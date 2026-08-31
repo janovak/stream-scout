@@ -95,6 +95,8 @@ REQUIRED_EVIDENCE_FIELDS = {
         {
             "scale",
             "profile",
+            "warmup_outcome",
+            "poll_outcomes",
             "observed_eligible_records",
             "test_join_threshold",
             "test_leave_threshold",
@@ -113,8 +115,11 @@ REQUIRED_EVIDENCE_FIELDS = {
             "scale",
             "post_convergence_started_at",
             "run_duration_seconds",
+            "run_started_monotonic_ns",
+            "run_ended_monotonic_ns",
             "pass_completion_monotonic_ns",
             "adjacent_gaps_ms",
+            "boundary_gaps_ms",
             "maximum_gap_ms",
             "scheduler_events",
         }
@@ -344,6 +349,17 @@ def validate_evidence_record(kind: str, fields: Mapping[str, Any]) -> Mapping[st
     elif kind == "poll-profile":
         if fields["profile"] not in {"stable", "complete_turnover"}:
             raise ValueError("profile must be stable or complete_turnover")
+        if fields["warmup_outcome"] != "success":
+            raise ValueError("poll-profile warmup must have a successful outcome")
+        poll_outcomes = fields["poll_outcomes"]
+        if (
+            not isinstance(poll_outcomes, Sequence)
+            or len(poll_outcomes) != 20
+            or any(outcome != "success" for outcome in poll_outcomes)
+        ):
+            raise ValueError(
+                "poll-profile requires twenty successful poll outcomes"
+            )
         observed_counts = fields["observed_eligible_records"]
         if (
             not isinstance(observed_counts, Sequence)
@@ -430,10 +446,41 @@ def validate_evidence_record(kind: str, fields: Mapping[str, Any]) -> Mapping[st
             raise ValueError(
                 "reconciler-gap requires at least two pass completions"
             )
-        calculated = adjacent_gaps_ms(fields["pass_completion_monotonic_ns"])
+        run_started = fields["run_started_monotonic_ns"]
+        run_ended = fields["run_ended_monotonic_ns"]
+        if (
+            not isinstance(run_started, int)
+            or not isinstance(run_ended, int)
+            or run_ended < run_started
+        ):
+            raise ValueError("reconciler-gap run boundaries are invalid")
+        measured_run_duration = (
+            run_ended - run_started
+        ) / 1_000_000_000.0
+        if not math.isclose(
+            fields["run_duration_seconds"],
+            measured_run_duration,
+            rel_tol=0.0,
+            abs_tol=0.001,
+        ):
+            raise ValueError(
+                "run duration does not match monotonic run boundaries"
+            )
+        completions = fields["pass_completion_monotonic_ns"]
+        if completions[0] < run_started or completions[-1] > run_ended:
+            raise ValueError(
+                "pass completions must fall inside the run boundaries"
+            )
+        calculated = adjacent_gaps_ms(completions)
         if list(fields["adjacent_gaps_ms"]) != calculated:
             raise ValueError("adjacent gaps do not match pass completions")
-        expected_max = max(calculated, default=0.0)
+        expected_boundaries = [
+            (completions[0] - run_started) / 1_000_000.0,
+            (run_ended - completions[-1]) / 1_000_000.0,
+        ]
+        if list(fields["boundary_gaps_ms"]) != expected_boundaries:
+            raise ValueError("boundary gaps do not match the run window")
+        expected_max = max(calculated + expected_boundaries)
         if fields["maximum_gap_ms"] != expected_max:
             raise ValueError("maximum gap is inconsistent")
         scheduler_events = fields["scheduler_events"]
@@ -666,6 +713,10 @@ def _normalized_profile(profile: str) -> str:
 def _profile_observation(
     result: Mapping[str, Any], scale: int
 ) -> tuple[int, int, int, int]:
+    if result.get("outcome") != "success":
+        raise ValueError(
+            "profile measurement requires a successful poll outcome"
+        )
     fields = (
         "observed_eligible_records",
         "effective_join_threshold",
@@ -717,6 +768,7 @@ def run_profile_measurements(
         return "A" if attempt_index % 2 == 0 else "B"
 
     warmup_duration = 0.0
+    warmup_outcome = None
     effective_configuration = None
     for _ in range(warmups):
         selected = "A"
@@ -725,6 +777,7 @@ def run_profile_measurements(
         if result.get("excluded"):
             raise ValueError("warmup poll failed and cannot establish warm state")
         effective_configuration = _profile_observation(result, scale)
+        warmup_outcome = result["outcome"]
         warmup_duration = float(result["duration_ms"])
     # Warmup establishes process/connection state but is not part of the
     # measured A/B sequence. Complete turnover starts from fixture A.
@@ -736,6 +789,7 @@ def run_profile_measurements(
     excluded = 0
     overlap = 0
     observed_eligible_records = []
+    poll_outcomes = []
     while len(completed) < measured_polls:
         selected = fixture_id()
         prepare_state(selected)
@@ -751,6 +805,7 @@ def run_profile_measurements(
                 "effective profile configuration changed during measurement"
             )
         observed_eligible_records.append(observation[0])
+        poll_outcomes.append(result["outcome"])
         completed.append(float(result["duration_ms"]))
         for phase, duration in result.get("phase_durations_ms", {}).items():
             phases.setdefault(phase, []).append(float(duration))
@@ -760,6 +815,8 @@ def run_profile_measurements(
     return {
         "scale": scale,
         "profile": normalized,
+        "warmup_outcome": warmup_outcome,
+        "poll_outcomes": poll_outcomes,
         "observed_eligible_records": observed_eligible_records,
         "effective_join_threshold": effective_configuration[1],
         "effective_leave_threshold": effective_configuration[2],
@@ -797,12 +854,14 @@ async def run_profile_measurements_async(
     if warmup.get("excluded"):
         raise ValueError("warmup poll failed and cannot establish warm state")
     effective_configuration = _profile_observation(warmup, scale)
+    warmup_outcome = warmup["outcome"]
 
     completed: list[float] = []
     phases: dict[str, list[float]] = {}
     dispatches: dict[str, list[int]] = {}
     excluded = overlap = attempt = 0
     observed_eligible_records = []
+    poll_outcomes = []
     while len(completed) < measured_polls:
         selected = "A" if normalized == "stable" or attempt % 2 == 0 else "B"
         await _invoke(prepare_state, selected)
@@ -818,6 +877,7 @@ async def run_profile_measurements_async(
                 "effective profile configuration changed during measurement"
             )
         observed_eligible_records.append(observation[0])
+        poll_outcomes.append(result["outcome"])
         completed.append(float(result["duration_ms"]))
         for phase, duration in result.get("phase_durations_ms", {}).items():
             phases.setdefault(phase, []).append(float(duration))
@@ -826,6 +886,8 @@ async def run_profile_measurements_async(
     return {
         "scale": scale,
         "profile": normalized,
+        "warmup_outcome": warmup_outcome,
+        "poll_outcomes": poll_outcomes,
         "observed_eligible_records": observed_eligible_records,
         "effective_join_threshold": effective_configuration[1],
         "effective_leave_threshold": effective_configuration[2],
@@ -932,17 +994,36 @@ def build_reconciler_gap_record(
     scale: int,
     post_convergence_started_at: str,
     run_duration_seconds: float,
+    run_started_monotonic_ns: int,
+    run_ended_monotonic_ns: int,
     pass_completion_monotonic_ns: Sequence[int],
     scheduler_events: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     gaps = adjacent_gaps_ms(pass_completion_monotonic_ns)
+    if not pass_completion_monotonic_ns:
+        raise ValueError("reconciler-gap requires pass completions")
+    boundary_gaps = [
+        (
+            pass_completion_monotonic_ns[0]
+            - run_started_monotonic_ns
+        )
+        / 1_000_000.0,
+        (
+            run_ended_monotonic_ns
+            - pass_completion_monotonic_ns[-1]
+        )
+        / 1_000_000.0,
+    ]
     record = {
         "scale": scale,
         "post_convergence_started_at": post_convergence_started_at,
         "run_duration_seconds": run_duration_seconds,
+        "run_started_monotonic_ns": run_started_monotonic_ns,
+        "run_ended_monotonic_ns": run_ended_monotonic_ns,
         "pass_completion_monotonic_ns": list(pass_completion_monotonic_ns),
         "adjacent_gaps_ms": gaps,
-        "maximum_gap_ms": max(gaps, default=0.0),
+        "boundary_gaps_ms": boundary_gaps,
+        "maximum_gap_ms": max(gaps + boundary_gaps),
         "scheduler_events": [dict(event) for event in scheduler_events],
     }
     validate_evidence_record("reconciler-gap", record)
@@ -953,6 +1034,8 @@ def build_poll_profile_record(
     scale: int,
     profile: str,
     fixture: RankingFixture,
+    warmup_outcome: str,
+    poll_outcomes: Sequence[str],
     observed_eligible_records: Sequence[int],
     effective_join_threshold: int,
     effective_leave_threshold: int,
@@ -979,6 +1062,8 @@ def build_poll_profile_record(
     record = {
         "scale": scale,
         "profile": _normalized_profile(profile),
+        "warmup_outcome": warmup_outcome,
+        "poll_outcomes": list(poll_outcomes),
         "observed_eligible_records": list(observed_eligible_records),
         "test_join_threshold": effective_join_threshold,
         "test_leave_threshold": effective_leave_threshold,
@@ -1319,6 +1404,7 @@ def build_operation_count_record(
     case: str,
     scale: int | None,
     counts: Mapping[str, int],
+    outcome: str,
     observed_eligible_records: int,
     effective_join_threshold: int,
     effective_leave_threshold: int,
@@ -1331,6 +1417,10 @@ def build_operation_count_record(
         raise ValueError("non-empty operation-count scale must be 50, 500, or 900")
     if any(not isinstance(value, int) or value < 0 for value in counts.values()):
         raise ValueError("operation counts must be non-negative integers")
+    if outcome != "success":
+        raise ValueError(
+            "operation counts require a successful poll outcome"
+        )
     expected = dict(NON_EMPTY_DISPATCH_COUNTS)
     if case in {"stable", "complete_turnover"}:
         if observed_eligible_records != scale:
@@ -1375,6 +1465,7 @@ def build_operation_count_record(
     return {
         "case": case,
         "scale": scale,
+        "outcome": outcome,
         "observed_eligible_records": observed_eligible_records,
         "effective_join_threshold": effective_join_threshold,
         "effective_leave_threshold": effective_leave_threshold,
@@ -1524,6 +1615,7 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
                         case=evidence_case,
                         scale=scale,
                         counts=actual_counts,
+                        outcome=str(counts["outcome"]),
                         observed_eligible_records=int(
                             counts["observed_eligible_records"]
                         ),
@@ -1619,6 +1711,8 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
             scale=args.scale,
             profile=profile,
             fixture=fixtures["A"],
+            warmup_outcome=record["warmup_outcome"],
+            poll_outcomes=record["poll_outcomes"],
             observed_eligible_records=record[
                 "observed_eligible_records"
             ],
@@ -1652,7 +1746,6 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
     elif args.command == "steady-state":
         if args.minutes < 30:
             raise ValueError("steady-state acceptance requires at least 30 minutes")
-        pass_recorder = PassCompletionRecorder()
         scheduler = SchedulerEventRecorder()
         started_at = await _invoke(runtime.wait_for_convergence, args.scale)
         if started_at is None:
@@ -1665,6 +1758,7 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
                 "steady-state runtime must expose production_pass_callback"
             )
         clock_ns = getattr(runtime, "monotonic_ns", time.monotonic_ns)
+        pass_recorder = PassCompletionRecorder(clock_ns)
         run_started_ns = clock_ns()
         pass_callback = compose_pass_callbacks(
             production_callback,
@@ -1677,11 +1771,16 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
             pass_callback=pass_callback,
             scheduler_callback=scheduler.record,
         )
-        run_duration_seconds = (clock_ns() - run_started_ns) / 1_000_000_000.0
+        run_ended_ns = clock_ns()
+        run_duration_seconds = (
+            run_ended_ns - run_started_ns
+        ) / 1_000_000_000.0
         record = build_reconciler_gap_record(
             scale=args.scale,
             post_convergence_started_at=started_at,
             run_duration_seconds=run_duration_seconds,
+            run_started_monotonic_ns=run_started_ns,
+            run_ended_monotonic_ns=run_ended_ns,
             pass_completion_monotonic_ns=pass_recorder.completions,
             scheduler_events=scheduler.events,
         )
