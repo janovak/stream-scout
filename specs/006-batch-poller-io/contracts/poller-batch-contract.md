@@ -336,13 +336,17 @@ poll_start_end_monotonic_ns
 poll_durations_ms
 overlap_skip_count
 scheduler_events
+effective_reconciler_config
 final_subscription_count
 ```
 
 At least one backoff is required. Every accepted window must increase coverage;
 every poll interval must have one completed `poll_streams` scheduler event,
-and missed/error/max-instance events invalidate the record. The existing policy
-controls whether/when final convergence occurs.
+and missed/error/max-instance events invalidate the record. The effective
+reconciler configuration must retain production concurrency 10, idle timeout
+5 seconds, rate-limit backoff 10 seconds, 20 retry rounds, re-adoption interval
+300 seconds, and adoption retry 30 seconds. That unchanged policy controls
+whether/when final convergence occurs.
 
 ## Compatibility Contract
 

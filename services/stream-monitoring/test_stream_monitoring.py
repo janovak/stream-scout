@@ -2485,6 +2485,14 @@ class TestFeature006DriverFoundation:
                         "job_id": "poll_streams",
                     }
                 ],
+                "effective_reconciler_config": {
+                    "concurrency": 10,
+                    "idle_timeout_seconds": 5.0,
+                    "rate_limit_backoff_seconds": 10.0,
+                    "max_retry_rounds": 20,
+                    "readopt_interval_seconds": 300.0,
+                    "adopt_retry_seconds": 30.0,
+                },
                 "final_subscription_count": 2,
             },
         }
@@ -2519,6 +2527,14 @@ class TestFeature006DriverFoundation:
         ]
         with pytest.raises(ValueError, match="scheduler failure"):
             driver.validate_evidence_record("cold-start", missed_poll)
+
+        modified_policy = dict(valid_records["cold-start"])
+        modified_policy["effective_reconciler_config"] = {
+            **modified_policy["effective_reconciler_config"],
+            "rate_limit_backoff_seconds": 0.0,
+        }
+        with pytest.raises(ValueError, match="production policy"):
+            driver.validate_evidence_record("cold-start", modified_policy)
 
         wrong_scale = dict(valid_records["reconciler-gap"])
         wrong_scale["converged_subscription_count"] = 300
@@ -3079,6 +3095,9 @@ class TestFeature006DriverFoundation:
                     "desired_count": 900,
                     "initialization_complete_at": "2026-08-31T00:00:00Z",
                     "transport": Delegate(),
+                    "reconciler_config": dict(
+                        driver.PRODUCTION_RECONCILER_CONFIG
+                    ),
                 }
 
             async def run_cold_start(
@@ -3123,7 +3142,23 @@ class TestFeature006DriverFoundation:
         assert record["initial_subscription_count"] == 0
         assert record["overlap_skip_count"] == 0
         assert record["final_subscription_count"] == 1
+        assert record["effective_reconciler_config"] == dict(
+            driver.PRODUCTION_RECONCILER_CONFIG
+        )
         assert record["acceptance_valid"] is True
+
+    def test_driver_cold_start_policy_matches_production_defaults(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        config = reconciler_module.resolve_reconciler_config({})
+
+        assert driver.PRODUCTION_RECONCILER_CONFIG == {
+            "concurrency": config.concurrency,
+            "idle_timeout_seconds": config.idle_timeout_seconds,
+            "rate_limit_backoff_seconds": config.rate_limit_backoff_seconds,
+            "max_retry_rounds": config.max_retry_rounds,
+            "readopt_interval_seconds": config.readopt_interval_seconds,
+            "adopt_retry_seconds": config.adopt_retry_seconds,
+        }
 
 
 class TestPollDispatchCounts:

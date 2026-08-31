@@ -69,7 +69,7 @@ missing factory fail before any datastore or Twitch call.
 | `calibrate` | `get_streams()` or `fetch_live_page()`, plus `redis_round_trip()`, `postgres_round_trip()`, and `observed_disabled_proportion()` |
 | `poll-profile` | `prepare_profile_state(profile, fixture, opposite_fixture)` and `run_profile_poll(fixture)` |
 | `steady-state` | `wait_for_convergence(scale)`, the existing production pass callback as `production_pass_callback`, and `run_steady_state(...)` |
-| `cold-start` | `initialize_cold_start(target)` and `run_cold_start(...)`, using the supplied recording transport, poll recorder, and scheduler callback |
+| `cold-start` | `initialize_cold_start(target)` (including the effective reconciler configuration) and `run_cold_start(...)`, using the supplied recording transport, poll recorder, and scheduler callback |
 
 Callbacks may be synchronous or asynchronous. The factory must delegate the
 real production behavior unchanged; it must not shorten backoff, replace the
@@ -387,6 +387,9 @@ Acceptance:
 - subscription coverage increases after every retry window in which Twitch
   accepts creates;
 - retry/backoff/concurrency/round configuration equals production;
+- recorded effective reconciler values are concurrency 10, idle timeout 5 s,
+  rate-limit backoff 10 s, 20 retry rounds, re-adoption 300 s, and adoption
+  retry 30 s;
 - no requirement is imposed on last-success advancement while the one long
   pass is still in progress;
 - eventual final convergence remains conditional on existing policy and

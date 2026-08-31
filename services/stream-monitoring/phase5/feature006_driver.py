@@ -70,6 +70,14 @@ EMPTY_DISPATCH_COUNTS = {
     "online_refresh_execute": 0,
     "desired_publication_execute": 1,
 }
+PRODUCTION_RECONCILER_CONFIG = {
+    "concurrency": 10,
+    "idle_timeout_seconds": 5.0,
+    "rate_limit_backoff_seconds": 10.0,
+    "max_retry_rounds": 20,
+    "readopt_interval_seconds": 300.0,
+    "adopt_retry_seconds": 30.0,
+}
 
 REQUIRED_EVIDENCE_FIELDS = {
     "calibration": frozenset(
@@ -140,6 +148,7 @@ REQUIRED_EVIDENCE_FIELDS = {
             "poll_durations_ms",
             "overlap_skip_count",
             "scheduler_events",
+            "effective_reconciler_config",
             "final_subscription_count",
         }
     ),
@@ -598,6 +607,18 @@ def validate_evidence_record(kind: str, fields: Mapping[str, Any]) -> Mapping[st
                 raise ValueError(
                     "cold-start scheduler completion precedes its poll interval"
                 )
+        effective_config = fields["effective_reconciler_config"]
+        if (
+            not isinstance(effective_config, Mapping)
+            or set(effective_config) != set(PRODUCTION_RECONCILER_CONFIG)
+            or any(
+                effective_config[key] != expected
+                for key, expected in PRODUCTION_RECONCILER_CONFIG.items()
+            )
+        ):
+            raise ValueError(
+                "cold-start reconciler configuration must match production policy"
+            )
         counts = fields["subscription_count_by_window"]
         if (
             not isinstance(counts, Sequence)
@@ -1257,6 +1278,7 @@ def build_cold_start_record(
     transport: RecordingTransportProxy,
     poll_start_end_monotonic_ns: Sequence[Sequence[int]],
     scheduler_events: Sequence[Mapping[str, Any]],
+    effective_reconciler_config: Mapping[str, Any],
     final_subscription_count: int,
     require_rate_limit_backoff: bool = True,
 ) -> dict[str, Any]:
@@ -1295,6 +1317,9 @@ def build_cold_start_record(
         "scheduler_events": [
             dict(event) for event in scheduler_events
         ],
+        "effective_reconciler_config": dict(
+            effective_reconciler_config
+        ),
         "final_subscription_count": final_subscription_count,
     }
     validate_evidence_record("cold-start", record)
@@ -1940,6 +1965,8 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
             or not initialization.get("transport_started")
             or initialization.get("subscription_count") != 0
             or initialization.get("desired_count") != 900
+            or initialization.get("reconciler_config")
+            != PRODUCTION_RECONCILER_CONFIG
         ):
             raise ValueError("cold-start preconditions were not satisfied")
         scheduler = SchedulerEventRecorder()
@@ -1966,6 +1993,9 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
                 transport=proxy,
                 poll_start_end_monotonic_ns=polls.intervals,
                 scheduler_events=scheduler.events,
+                effective_reconciler_config=initialization[
+                    "reconciler_config"
+                ],
                 final_subscription_count=int(final_count),
                 require_rate_limit_backoff=True,
             ),
