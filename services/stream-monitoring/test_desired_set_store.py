@@ -2,6 +2,9 @@
 
 import logging
 
+import pytest
+from redis.exceptions import ResponseError
+
 from desired_set_store import (
     DESIRED_GENERATION_KEY,
     DESIRED_IDS_KEY,
@@ -10,6 +13,119 @@ from desired_set_store import (
     RedisDesiredSetStore,
 )
 from test_support import FakeRedis
+
+
+class TestFakeRedisBatchContract:
+    def test_mget_returns_ordered_values_and_none_entries(self):
+        fake_redis = FakeRedis()
+        fake_redis.strings.update({"first": "1", "third": "3"})
+
+        assert fake_redis.mget(["first", "second", "third"]) == [
+            "1",
+            None,
+            "3",
+        ]
+
+    def test_transactional_and_non_transactional_pipelines_return_ordered_results(self):
+        fake_redis = FakeRedis()
+
+        desired = fake_redis.pipeline()
+        desired.incr("generation")
+        assert desired.transaction is True
+        assert desired.execute() == [1]
+
+        refresh = fake_redis.pipeline(transaction=False)
+        refresh.setex("streamer:online:first", 180, 101)
+        refresh.setex("streamer:online:second", 180, 202)
+        assert refresh.transaction is False
+        assert refresh.execute(raise_on_error=True) == [True, True]
+        assert fake_redis.strings["streamer:online:first"] == "101"
+        assert fake_redis.strings["streamer:online:second"] == "202"
+
+    def test_element_error_applies_other_commands_and_raises_first_error(self):
+        fake_redis = FakeRedis()
+        first_error = ResponseError("first rejected command")
+        later_error = ResponseError("later rejected command")
+        fake_redis.inject_pipeline_response_error(
+            "online_refresh", 1, first_error
+        )
+        fake_redis.inject_pipeline_response_error(
+            "online_refresh", 2, later_error
+        )
+        pipeline = fake_redis.pipeline(transaction=False)
+        pipeline.setex("streamer:online:first", 180, 101)
+        pipeline.setex("streamer:online:second", 180, 202)
+        pipeline.setex("streamer:online:third", 180, 303)
+
+        with pytest.raises(ResponseError, match="first rejected command"):
+            pipeline.execute(raise_on_error=True)
+
+        assert fake_redis.strings["streamer:online:first"] == "101"
+        assert "streamer:online:second" not in fake_redis.strings
+        assert "streamer:online:third" not in fake_redis.strings
+        assert fake_redis.last_pipeline_responses == [
+            True,
+            first_error,
+            later_error,
+        ]
+
+    def test_transport_failure_before_application_differs_from_ack_loss(self):
+        fake_redis = FakeRedis()
+        fake_redis.inject_pipeline_failure("online_refresh", when="before")
+        pipeline = fake_redis.pipeline(transaction=False)
+        pipeline.setex("streamer:online:before", 180, 101)
+
+        with pytest.raises(ConnectionError, match="before application"):
+            pipeline.execute(raise_on_error=True)
+
+        assert "streamer:online:before" not in fake_redis.strings
+
+        fake_redis.inject_pipeline_failure("online_refresh", when="after")
+        pipeline = fake_redis.pipeline(transaction=False)
+        pipeline.setex("streamer:online:after", 180, 202)
+
+        with pytest.raises(ConnectionError, match="acknowledgement lost"):
+            pipeline.execute(raise_on_error=True)
+
+        assert fake_redis.strings["streamer:online:after"] == "202"
+
+    def test_dispatch_recording_counts_batches_not_queued_commands(self):
+        fake_redis = FakeRedis()
+
+        fake_redis.mget(["streamer:online:first", "streamer:online:second"])
+        refresh = fake_redis.pipeline(transaction=False)
+        refresh.setex("streamer:online:first", 180, 101)
+        refresh.setex("streamer:online:second", 180, 202)
+        refresh.execute()
+        desired = fake_redis.pipeline()
+        desired.delete("chat:desired")
+        desired.incr("chat:desired:generation")
+        desired.execute()
+
+        assert fake_redis.calls == [
+            "mget",
+            "pipeline.execute",
+            "pipeline.execute",
+        ]
+        assert fake_redis.dispatches == [
+            {
+                "phase": "online_snapshot",
+                "kind": "command",
+                "operation": "mget",
+            },
+            {
+                "phase": "online_refresh",
+                "kind": "pipeline",
+                "operation": "execute",
+                "transaction": False,
+            },
+            {
+                "phase": "desired_set_publication",
+                "kind": "pipeline",
+                "operation": "execute",
+                "transaction": True,
+            },
+        ]
 
 
 class TestRedisDesiredSetStore:

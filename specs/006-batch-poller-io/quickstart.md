@@ -38,6 +38,39 @@ CLIPPING_DISABLED_FETCH_BUFFER=120
 There must be no requirement, Python image, schema, scheduler, EventSub policy,
 Flink, or feature 005 change in the implementation diff.
 
+The validation driver refuses implicit or production-like datastore targets.
+Before any driver command, provide an explicitly isolated Redis database,
+Postgres test database/schema namespace, operator-assigned run ID, and the
+production-equivalent host adapter:
+
+```bash
+export TEST_REDIS_URL='redis://.../15'
+export TEST_POSTGRES_URL='postgresql://.../twitch_test'
+export FEATURE006_NAMESPACE='feature006-acceptance'
+export FEATURE006_RUN_ID='feature006-operator-run-id'
+export FEATURE006_RUNTIME_FACTORY='feature006_environment:build_runtime'
+```
+
+The runtime factory is the deployment adapter on the separate validation
+machine. It receives the parsed command arguments and supplies the real
+initialized process/client callbacks requested by that command. The tracked
+driver owns target validation, fixtures, dispatch proxies, measurements,
+acceptance calculations, and JSONL validation; the adapter owns credentials
+and references to that machine's isolated process. Missing targets or a
+missing factory fail before any datastore or Twitch call.
+
+| Command | Runtime adapter surface |
+|---|---|
+| `operation-counts` | `run_operation_count(case, scale, fixture, counter)` |
+| `calibrate` | `get_streams()` or `fetch_live_page()`, plus `redis_round_trip()`, `postgres_round_trip()`, and `observed_disabled_proportion()` |
+| `poll-profile` | `prepare_profile_state(profile, fixture, opposite_fixture)` and `run_profile_poll(fixture)` |
+| `steady-state` | `wait_for_convergence(scale)`, the existing production pass callback as `production_pass_callback`, and `run_steady_state(...)` |
+| `cold-start` | `initialize_cold_start(target)` and `run_cold_start(...)`, using the supplied recording transport, poll recorder, and scheduler callback |
+
+Callbacks may be synchronous or asynchronous. The factory must delegate the
+real production behavior unchanged; it must not shorten backoff, replace the
+poll/reconciler policy, or return synthetic success evidence.
+
 ## 2. Unit and Behavioral Validation
 
 Run the targeted poller, desired-store, reconciler, metrics, and failure tests:
@@ -356,3 +389,25 @@ are separate decisions.
 Rollback requires only reverting the feature revision and recreating
 `stream-monitoring`. There is no schema, dependency, threshold, Redis layout,
 EventSub policy, or Flink rollback.
+
+## 11. Stage 4 Evidence Status
+
+The local implementation gate creates and tests the opt-in Postgres cases,
+deterministic fixtures, dispatch proxies, evidence builders, and all five
+driver commands without contacting infrastructure.
+
+The following execution tasks remain explicitly deferred to the separate
+production-equivalent machine:
+
+```text
+T026       real-Postgres atomicity, rollback, reuse, and next-poll retry
+T076       isolated 50/500/900 operation-count and empty-case runs
+T077       live calibration and four 20-poll duration profiles
+T078       separate 30-minute 500/900 steady-state sessions
+T079       isolated 900-channel real-backoff cold-start session
+T090-T091 unchanged-value deployment evidence and one-revision rollback evidence
+```
+
+Do not mark any of these tasks complete from unit tests, fixture calculations,
+help output, or a locally generated record. Completion requires the external
+evidence described in the corresponding sections above.

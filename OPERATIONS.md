@@ -199,7 +199,7 @@ Two rough edges, neither blocking:
 - **Reconcile pass duration** grows from milliseconds at 50 channels to ~2–4 s
   at 300–485. Still well inside the 5 s idle interval, but watch it past 500.
 
-### 800/1000 was tried and rolled back — the poller is the ceiling
+### Historical 800/1000 attempt before datastore batching
 
 A jump to `JOIN_THRESHOLD` 800 / `LEAVE_THRESHOLD` 1000 (~800 channels) did
 **not** converge and was rolled back after ~10 minutes. Two limits bind before
@@ -220,10 +220,64 @@ the transport's 900-connection cap does:
   200 s+ while `reconcile_last_success_timestamp` sits frozen well past the
   "normal cold start" window.
 
-**The safe ceiling for the current design is around 500 channels.** Going above
-that needs the poll's per-channel Postgres write batched or moved out of the
-poll loop, and probably a gentler reconciler ramp (create in budget-sized
-waves) — both candidates for their own spec alongside 005.
+This result predates feature 006's batched metadata and online-state phases.
+It remains the reason a later ramp needs feature 006 acceptance evidence; it
+is not evidence that the deployed thresholds should change with the code.
+Subscription-create policy and the external 429 budget remain unchanged.
+
+### Feature 006 deployment and evidence gate
+
+Deploy the batched poller as a code-only change at the existing production
+values:
+
+```text
+JOIN_THRESHOLD=150
+LEAVE_THRESHOLD=300
+CLIPPING_DISABLED_FETCH_BUFFER=120
+```
+
+Recreate only the existing service so Docker resolves the replaced bind-mounted
+file:
+
+```bash
+docker compose up -d --force-recreate stream-monitoring
+```
+
+Do not combine this deployment with a channel-count ramp. Before considering a
+later ramp, collect the separate production-equivalent evidence in
+`specs/006-batch-poller-io/quickstart.md` against explicitly isolated Redis,
+Postgres, and Twitch state. That evidence includes the real-Postgres rollback
+case, 50/500/900 dispatch counts, four calibrated duration profiles, separate
+30-minute steady-state runs, and the isolated 900-channel cold-backoff run.
+
+At 150/300/120, retain:
+
+- `stream_poll_duration_seconds{outcome}` and
+  `stream_poll_phase_duration_seconds{phase,outcome}`;
+- `stream_metadata_consecutive_failures`;
+- poll overlap/misfire events and direct reconciler pass-completion gaps;
+- EventSub subscription count and connection occupancy;
+- Kafka/Flink lag and datastore round-trip measurements.
+
+Every invocation emits one `Poll finished` log with a bounded `outcome`, phase
+durations, ranked/desired/entered/left counts, and metadata batch context.
+`metadata_failed` means intent work continued but metadata is stale; any other
+failure outcome is not a successful poll.
+
+Only after that evidence is reviewed should a later threshold ramp be approved
+as its own operational change. Feature 006 does not alter the reconciler
+cadence, EventSub capacity, create concurrency, retry/backoff policy, online
+TTL, poll interval, schema, dependencies, Kafka/Flink behavior, or feature 005.
+
+To roll back the code deployment, revert only the feature 006 revision and run:
+
+```bash
+docker compose up -d --force-recreate stream-monitoring
+```
+
+No schema, dependency, Redis layout, threshold, EventSub-policy, or Flink
+reversal is required. If a later ramp has happened, decide its threshold
+rollback separately rather than coupling it to the code rollback.
 
 ### Rolling back a step
 
@@ -410,7 +464,7 @@ docker logs streamscout-stream-monitoring --tail 20
 docker compose restart stream-monitoring
 docker logs -f streamscout-stream-monitoring
 ```
-Expect to see: `Stream Monitoring Service started`, `Reconciler started`, `Adopted existing subscriptions`, `Polling for top streams`, `Poll complete`. Press `Ctrl+C` to stop following.
+Expect to see: `Stream Monitoring Service started`, `Reconciler started`, `Adopted existing subscriptions`, `Polling for top streams`, `Poll finished`. Press `Ctrl+C` to stop following.
 
 To pick up a **code change**, use `docker compose up -d --force-recreate stream-monitoring` instead of `restart` — see "Note on image rebuilds".
 

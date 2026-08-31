@@ -352,3 +352,15 @@ other queued commands are applied, then raised as the first error when
 application and acknowledgement loss after application. This prevents tests
 from incorrectly treating every failed non-transactional pipeline as an
 all-or-nothing operation.
+
+## Stage 4 Evidence Disposition
+
+The repository implementation, opt-in tests, fixtures, proxies, and command
+surfaces satisfy the local evidence contract only after the local pytest and
+offline CLI gates pass. They do not substitute for remote acceptance evidence.
+
+Tasks T026, T076-T079, and T090-T091 remain unsatisfied until their commands
+are run on the separate production-equivalent machine against explicitly
+isolated state and the resulting Postgres, JSONL, timing, scheduler, Twitch,
+deployment, and rollback evidence is retained. A deferred task is not a
+passing result and does not weaken any field or threshold in this contract.
