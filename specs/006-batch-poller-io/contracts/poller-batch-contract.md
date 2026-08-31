@@ -133,7 +133,7 @@ All decisions use only the pre-refresh snapshot.
 
 | Current/Departed | Snapshot | Rank / ID | Output after refresh success |
 |---|---|---|---|
-| Current | absent | first rank `<= JOIN_THRESHOLD` | one `online` event |
+| Current | absent | first/best rank `<= JOIN_THRESHOLD`; ID from that occurrence | one `online` event |
 | Current | absent | first rank `> JOIN_THRESHOLD` | no event; state was still refreshed |
 | Current | present | any | no event |
 | Departed | absent | valid prior ID | one `offline` event with prior ID |
@@ -141,8 +141,10 @@ All decisions use only the pre-refresh snapshot.
 | Departed | absent | missing/invalid prior ID | data-integrity error; no event |
 
 Repeated identical current logins produce at most one online event, using the
-best/first rank. Different normalized logins remain distinct even when an
-upstream defect assigns them the same broadcaster ID.
+best/first rank and the broadcaster ID from that same occurrence. Their
+ranking-order refreshes may still leave the final occurrence's ID in the Redis
+key. Different normalized logins remain distinct even when an upstream defect
+assigns them the same broadcaster ID.
 
 Kafka topic (`stream-lifecycle`), payload fields, broadcaster-ID key,
 per-event production, and delivery callback do not change.

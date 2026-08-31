@@ -27,7 +27,9 @@ An ephemeral normalized record collected from the eligible Twitch ranking.
 - Repeated identical `login`: desired behavior remains login-keyed. The online
   snapshot contains that key once, the refresh pipeline may repeat it in
   ranking order, and lifecycle presence is evaluated once at its first/best
-  rank.
+  rank. An `online` event uses the broadcaster ID from that first/best-ranked
+  occurrence, while the final refreshed key value still follows ranking-order
+  last-write behavior.
 - Different logins for one ID remain different desired/online keys; only their
   metadata row is deduplicated.
 
@@ -173,7 +175,7 @@ only after refresh success.
 | Field | Type | Online | Offline |
 |---|---|---|---|
 | `event_type` | enum | `online` | `offline` |
-| `broadcaster_id` | positive integer | current ranked ID | previous desired ID |
+| `broadcaster_id` | positive integer | ID from the first/best-ranked occurrence of the current login | previous desired ID |
 | `broadcaster_login` | normalized string | current login | departed login |
 | `rank` | integer | first/best current rank | existing sentinel `0` |
 | `timestamp` | epoch seconds | publication time | publication time |

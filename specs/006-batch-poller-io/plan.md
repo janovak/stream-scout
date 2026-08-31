@@ -100,6 +100,7 @@ services/stream-monitoring/
 ├── desired_set_store.py             # unchanged bounded read and atomic publication
 ├── reconciler.py                    # unchanged policy; existing callback used by validation
 ├── test_support.py                  # extend fake Redis/pipeline batch behavior
+├── test_desired_set_store.py        # desired-store and shared Redis adapter-contract tests
 ├── test_stream_monitoring.py        # lifecycle, failure, count, metrics, real-Postgres coverage
 └── phase5/
     ├── feature006_driver.py         # validation-only scale and schedulability driver
