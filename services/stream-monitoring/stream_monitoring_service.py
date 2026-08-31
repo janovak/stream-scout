@@ -309,6 +309,7 @@ class StreamMonitoringService:
         self._metadata_consecutive_failures = 0
         stream_metadata_consecutive_failures.set(0)
         self._poll_observer = None
+        self.last_poll_result = None
 
     async def _on_token_refresh(self, access_token: str, refresh_token: str):
         """Callback invoked when tokens are refreshed by pyTwitchAPI."""
@@ -1101,6 +1102,18 @@ class StreamMonitoringService:
             return outcome
         finally:
             total_duration = time.perf_counter() - poll_started
+            self.last_poll_result = MappingProxyType(
+                {
+                    "outcome": outcome,
+                    "ranked": ranked_count,
+                    "desired": desired_count,
+                    "entered": entered_count,
+                    "left": left_count,
+                    "join_threshold": JOIN_THRESHOLD,
+                    "leave_threshold": LEAVE_THRESHOLD,
+                    "fetch_buffer": CLIPPING_DISABLED_FETCH_BUFFER,
+                }
+            )
             self._record_poll_outcome(outcome, total_duration)
             final_failed_phase = (
                 "metadata_persistence"

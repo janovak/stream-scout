@@ -95,6 +95,7 @@ REQUIRED_EVIDENCE_FIELDS = {
         {
             "scale",
             "profile",
+            "observed_eligible_records",
             "test_join_threshold",
             "test_leave_threshold",
             "test_fetch_buffer",
@@ -343,6 +344,16 @@ def validate_evidence_record(kind: str, fields: Mapping[str, Any]) -> Mapping[st
     elif kind == "poll-profile":
         if fields["profile"] not in {"stable", "complete_turnover"}:
             raise ValueError("profile must be stable or complete_turnover")
+        observed_counts = fields["observed_eligible_records"]
+        if (
+            not isinstance(observed_counts, Sequence)
+            or len(observed_counts) != 20
+            or any(count != fields["scale"] for count in observed_counts)
+        ):
+            raise ValueError(
+                "poll-profile observed eligible counts must equal scale "
+                "for all twenty measured polls"
+            )
         durations = fields["measured_durations_ms"]
         if not isinstance(durations, Sequence) or len(durations) != 20:
             raise ValueError("poll-profile requires exactly 20 completed polls")
@@ -425,6 +436,23 @@ def validate_evidence_record(kind: str, fields: Mapping[str, Any]) -> Mapping[st
         expected_max = max(calculated, default=0.0)
         if fields["maximum_gap_ms"] != expected_max:
             raise ValueError("maximum gap is inconsistent")
+        scheduler_events = fields["scheduler_events"]
+        if not isinstance(scheduler_events, Sequence):
+            raise ValueError("scheduler_events must be a sequence")
+        expected_poll_executions = math.floor(
+            fields["run_duration_seconds"] / 120.0
+        )
+        completed_poll_events = [
+            event
+            for event in scheduler_events
+            if event.get("job_id") == "poll_streams"
+            and event.get("kind") == "executed"
+        ]
+        if len(completed_poll_events) < expected_poll_executions:
+            raise ValueError(
+                "steady-state evidence is missing completed poll_streams "
+                "scheduler events"
+            )
     else:
         if fields["target"] != 900 or fields["initial_subscription_count"] != 0:
             raise ValueError("cold-start requires target 900 and zero initial subscriptions")
@@ -635,6 +663,34 @@ def _normalized_profile(profile: str) -> str:
     return normalized
 
 
+def _profile_observation(
+    result: Mapping[str, Any], scale: int
+) -> tuple[int, int, int, int]:
+    fields = (
+        "observed_eligible_records",
+        "effective_join_threshold",
+        "effective_leave_threshold",
+        "effective_fetch_buffer",
+    )
+    missing = [field for field in fields if field not in result]
+    if missing:
+        raise ValueError(
+            f"completed poll missing observed scale fields: {missing}"
+        )
+    observation = tuple(int(result[field]) for field in fields)
+    observed, join, leave, fetch_buffer = observation
+    if observed != scale:
+        raise ValueError(
+            f"observed eligible records must equal {scale}, got {observed}"
+        )
+    if join != scale or leave != scale or fetch_buffer < 0:
+        raise ValueError(
+            "effective profile thresholds must equal scale and fetch buffer "
+            "must be non-negative"
+        )
+    return observation
+
+
 def run_profile_measurements(
     scale: int,
     profile: str,
@@ -661,12 +717,14 @@ def run_profile_measurements(
         return "A" if attempt_index % 2 == 0 else "B"
 
     warmup_duration = 0.0
+    effective_configuration = None
     for _ in range(warmups):
         selected = "A"
         prepare_state(selected)
         result = run_poll(selected)
         if result.get("excluded"):
             raise ValueError("warmup poll failed and cannot establish warm state")
+        effective_configuration = _profile_observation(result, scale)
         warmup_duration = float(result["duration_ms"])
     # Warmup establishes process/connection state but is not part of the
     # measured A/B sequence. Complete turnover starts from fixture A.
@@ -677,6 +735,7 @@ def run_profile_measurements(
     dispatches: dict[str, list[int]] = {}
     excluded = 0
     overlap = 0
+    observed_eligible_records = []
     while len(completed) < measured_polls:
         selected = fixture_id()
         prepare_state(selected)
@@ -686,6 +745,12 @@ def run_profile_measurements(
         if result.get("excluded"):
             excluded += 1
             continue
+        observation = _profile_observation(result, scale)
+        if observation != effective_configuration:
+            raise ValueError(
+                "effective profile configuration changed during measurement"
+            )
+        observed_eligible_records.append(observation[0])
         completed.append(float(result["duration_ms"]))
         for phase, duration in result.get("phase_durations_ms", {}).items():
             phases.setdefault(phase, []).append(float(duration))
@@ -695,6 +760,10 @@ def run_profile_measurements(
     return {
         "scale": scale,
         "profile": normalized,
+        "observed_eligible_records": observed_eligible_records,
+        "effective_join_threshold": effective_configuration[1],
+        "effective_leave_threshold": effective_configuration[2],
+        "effective_fetch_buffer": effective_configuration[3],
         "warmup_duration_ms": warmup_duration,
         "measured_durations_ms": completed,
         "nearest_rank_p95_ms": nearest_rank_p95(completed),
@@ -727,11 +796,13 @@ async def run_profile_measurements_async(
     warmup = await _invoke(run_poll, "A")
     if warmup.get("excluded"):
         raise ValueError("warmup poll failed and cannot establish warm state")
+    effective_configuration = _profile_observation(warmup, scale)
 
     completed: list[float] = []
     phases: dict[str, list[float]] = {}
     dispatches: dict[str, list[int]] = {}
     excluded = overlap = attempt = 0
+    observed_eligible_records = []
     while len(completed) < measured_polls:
         selected = "A" if normalized == "stable" or attempt % 2 == 0 else "B"
         await _invoke(prepare_state, selected)
@@ -741,6 +812,12 @@ async def run_profile_measurements_async(
         if result.get("excluded"):
             excluded += 1
             continue
+        observation = _profile_observation(result, scale)
+        if observation != effective_configuration:
+            raise ValueError(
+                "effective profile configuration changed during measurement"
+            )
+        observed_eligible_records.append(observation[0])
         completed.append(float(result["duration_ms"]))
         for phase, duration in result.get("phase_durations_ms", {}).items():
             phases.setdefault(phase, []).append(float(duration))
@@ -749,6 +826,10 @@ async def run_profile_measurements_async(
     return {
         "scale": scale,
         "profile": normalized,
+        "observed_eligible_records": observed_eligible_records,
+        "effective_join_threshold": effective_configuration[1],
+        "effective_leave_threshold": effective_configuration[2],
+        "effective_fetch_buffer": effective_configuration[3],
         "warmup_duration_ms": float(warmup["duration_ms"]),
         "measured_durations_ms": completed,
         "nearest_rank_p95_ms": nearest_rank_p95(completed),
@@ -872,6 +953,10 @@ def build_poll_profile_record(
     scale: int,
     profile: str,
     fixture: RankingFixture,
+    observed_eligible_records: Sequence[int],
+    effective_join_threshold: int,
+    effective_leave_threshold: int,
+    effective_fetch_buffer: int,
     warmup_duration_ms: float,
     measured_durations_ms: Sequence[float],
     overlap_skip_count: int,
@@ -883,12 +968,21 @@ def build_poll_profile_record(
 
     if fixture.scale != scale:
         raise ValueError("profile fixture scale does not match record scale")
+    if (
+        effective_join_threshold != fixture.test_join_threshold
+        or effective_leave_threshold != fixture.test_leave_threshold
+        or effective_fetch_buffer != fixture.test_fetch_buffer
+    ):
+        raise ValueError(
+            "observed profile configuration does not match the fixture"
+        )
     record = {
         "scale": scale,
         "profile": _normalized_profile(profile),
-        "test_join_threshold": fixture.test_join_threshold,
-        "test_leave_threshold": fixture.test_leave_threshold,
-        "test_fetch_buffer": fixture.test_fetch_buffer,
+        "observed_eligible_records": list(observed_eligible_records),
+        "test_join_threshold": effective_join_threshold,
+        "test_leave_threshold": effective_leave_threshold,
+        "test_fetch_buffer": effective_fetch_buffer,
         "warmup_duration_ms": float(warmup_duration_ms),
         "measured_durations_ms": [float(value) for value in measured_durations_ms],
         "nearest_rank_p95_ms": nearest_rank_p95(measured_durations_ms),
@@ -1221,7 +1315,14 @@ class RedisDispatchProxy:
 
 
 def build_operation_count_record(
-    *, case: str, scale: int | None, counts: Mapping[str, int]
+    *,
+    case: str,
+    scale: int | None,
+    counts: Mapping[str, int],
+    observed_eligible_records: int,
+    effective_join_threshold: int,
+    effective_leave_threshold: int,
+    effective_fetch_buffer: int,
 ) -> dict[str, Any]:
     allowed = {"stable", "complete_turnover", "empty-empty", "departures-only"}
     if case not in allowed:
@@ -1231,7 +1332,25 @@ def build_operation_count_record(
     if any(not isinstance(value, int) or value < 0 for value in counts.values()):
         raise ValueError("operation counts must be non-negative integers")
     expected = dict(NON_EMPTY_DISPATCH_COUNTS)
+    if case in {"stable", "complete_turnover"}:
+        if observed_eligible_records != scale:
+            raise ValueError(
+                "observed eligible records must equal the requested scale"
+            )
+        if (
+            effective_join_threshold != scale
+            or effective_leave_threshold != scale
+            or effective_fetch_buffer != 0
+        ):
+            raise ValueError(
+                "effective operation-count thresholds must equal scale "
+                "with a zero fixture fetch buffer"
+            )
     if case in {"empty-empty", "departures-only"}:
+        if observed_eligible_records != 0:
+            raise ValueError(
+                "empty operation-count cases must observe zero eligible records"
+            )
         expected = dict(EMPTY_DISPATCH_COUNTS)
         if case == "departures-only":
             expected["online_snapshot_mget"] = 1
@@ -1244,9 +1363,22 @@ def build_operation_count_record(
             )
     if normalized.get("metadata_rollback", 0) != 0:
         raise ValueError("metadata_rollback must be 0 for successful evidence")
+    unexpected = {
+        boundary: count
+        for boundary, count in normalized.items()
+        if boundary not in expected and count != 0
+    }
+    if unexpected:
+        raise ValueError(
+            f"unexpected datastore dispatches were recorded: {unexpected}"
+        )
     return {
         "case": case,
         "scale": scale,
+        "observed_eligible_records": observed_eligible_records,
+        "effective_join_threshold": effective_join_threshold,
+        "effective_leave_threshold": effective_leave_threshold,
+        "effective_fetch_buffer": effective_fetch_buffer,
         "dispatch_counts": normalized,
         "acceptance_valid": True,
     }
@@ -1373,12 +1505,37 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
                     fixture=fixture,
                     counter=counter,
                 )
-                if counts is None:
-                    counts = counter.report()
+                if not isinstance(counts, Mapping):
+                    raise ValueError(
+                        "run_operation_count must return observed scale metadata"
+                    )
+                actual_counts = counter.report()
+                reported_counts = counts.get("dispatch_counts")
+                if (
+                    reported_counts is not None
+                    and dict(reported_counts) != actual_counts
+                ):
+                    raise ValueError(
+                        "runtime dispatch counts disagree with the supplied counter"
+                    )
                 writer.write(
                     "operation-counts",
                     build_operation_count_record(
-                        case=evidence_case, scale=scale, counts=counts
+                        case=evidence_case,
+                        scale=scale,
+                        counts=actual_counts,
+                        observed_eligible_records=int(
+                            counts["observed_eligible_records"]
+                        ),
+                        effective_join_threshold=int(
+                            counts["effective_join_threshold"]
+                        ),
+                        effective_leave_threshold=int(
+                            counts["effective_leave_threshold"]
+                        ),
+                        effective_fetch_buffer=int(
+                            counts["effective_fetch_buffer"]
+                        ),
                     ),
                 )
     elif args.command == "calibrate":
@@ -1462,6 +1619,18 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
             scale=args.scale,
             profile=profile,
             fixture=fixtures["A"],
+            observed_eligible_records=record[
+                "observed_eligible_records"
+            ],
+            effective_join_threshold=record[
+                "effective_join_threshold"
+            ],
+            effective_leave_threshold=record[
+                "effective_leave_threshold"
+            ],
+            effective_fetch_buffer=record[
+                "effective_fetch_buffer"
+            ],
             warmup_duration_ms=record["warmup_duration_ms"],
             measured_durations_ms=record["measured_durations_ms"],
             overlap_skip_count=record["overlap_skip_count"],
@@ -1516,9 +1685,23 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
             pass_completion_monotonic_ns=pass_recorder.completions,
             scheduler_events=scheduler.events,
         )
+        completed_poll_events = [
+            event
+            for event in scheduler.events
+            if event.get("job_id") == "poll_streams"
+            and event.get("kind") == "executed"
+        ]
+        record["scheduled_poll_executions"] = len(
+            completed_poll_events
+        )
+        record["expected_minimum_poll_executions"] = math.floor(
+            record["run_duration_seconds"] / 120.0
+        )
         record["gap_gate_ms"] = 15000.0 if args.scale == 500 else 20000.0
         record["acceptance_valid"] = (
             record["maximum_gap_ms"] <= record["gap_gate_ms"]
+            and record["scheduled_poll_executions"]
+            >= record["expected_minimum_poll_executions"]
             and not any(e["kind"] in {"error", "missed", "max_instances"} for e in scheduler.events)
         )
         writer.write("reconciler-gap", record)

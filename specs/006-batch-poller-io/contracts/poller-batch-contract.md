@@ -195,6 +195,13 @@ Required omission cases:
 | Current empty, previous empty | 0 | 0 | 0 | 1 |
 | Current empty, departures present | 0 | 1 | 0 | 1 |
 
+Every operation-count evidence record also carries the actual post-filter
+eligible count and effective in-process entry threshold, retention threshold,
+and fetch buffer. Non-empty evidence is rejected unless the observed count and
+effective thresholds equal the requested scale. The supplied dispatch counter
+is authoritative: a runtime-reported count map must agree with it, and any
+unexpected nonzero Redis or SQL boundary invalidates the record.
+
 ## Completion and Telemetry Contract
 
 Exactly one final outcome is emitted per invocation:
@@ -271,6 +278,7 @@ Required fields:
 ```text
 scale
 profile (stable | complete_turnover)
+observed_eligible_records (exactly 20 values, each equal to scale)
 test_join_threshold
 test_leave_threshold
 test_fetch_buffer
@@ -298,7 +306,9 @@ scheduler_events
 ```
 
 Pass timestamps come from every in-process completion callback, not metrics
-scrapes.
+scrapes. `scheduler_events` must contain the completed `poll_streams`
+executions expected across the full run duration; an empty or incomplete event
+stream cannot satisfy the steady-state gate.
 
 ### Cold-start record
 

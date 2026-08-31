@@ -71,6 +71,14 @@ Callbacks may be synchronous or asynchronous. The factory must delegate the
 real production behavior unchanged; it must not shorten backoff, replace the
 poll/reconciler policy, or return synthetic success evidence.
 
+For operation counts and poll profiles, the adapter returns the actual
+post-filter ranked count and effective entry/retention/fetch values from the
+completed service invocation (the service exposes these in its immutable
+`last_poll_result`). Returning fixture intent without observing the invocation
+does not satisfy the driver. Operation-count callbacks must instrument the
+supplied counter; a separate count map is accepted only when it exactly agrees
+with that counter.
+
 ## 2. Unit and Behavioral Validation
 
 Run the targeted poller, desired-store, reconciler, metrics, and failure tests:
@@ -154,7 +162,11 @@ For equivalent non-empty polls, require identical counts:
 
 Record the existing clipping-eligibility SQL, desired read commands, and
 desired publication batch separately. They must remain bounded and equal by
-scale.
+scale. Each non-empty record must also report the actual eligible count and
+effective test-only values; 500/900 fixture labels do not substitute for
+observing 500/900 processed records. Any unexpected nonzero datastore
+boundary, including a per-channel `EXISTS`, `SETEX`, or extra SQL dispatch,
+fails the record.
 
 Also run:
 
@@ -257,6 +269,11 @@ Sort the 20 completed durations ascending and use item 19 (one-based) as
 nearest-rank p95. Replace a whole poll that encounters an excluded ranking,
 datastore, or broker failure; never subtract failed time.
 
+Every completed measured poll must report the actual post-filter eligible
+count and effective test-only entry, retention, and fetch-buffer values. The
+driver rejects the profile if any count differs from the nominal scale or if
+the effective configuration differs from the fixture.
+
 Acceptance:
 
 | Scale | Profile | p95 | Additional gate |
@@ -298,6 +315,8 @@ python phase5/feature006_driver.py steady-state \
 Acceptance:
 
 - all scheduled polls complete;
+- completed `poll_streams` scheduler events cover the full 120-second cadence
+  across the run (an empty scheduler event list is invalid);
 - no maximum-instance/overlap skip occurs;
 - every pass completion is recorded directly in process;
 - maximum adjacent completion gap is at most 15 seconds at 500;
