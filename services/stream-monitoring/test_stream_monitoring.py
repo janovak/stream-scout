@@ -1962,6 +1962,7 @@ class TestFeature006DriverFoundation:
             "postgresql://isolated-host/twitch_test",
             "--namespace",
             "feature006-test",
+            "--confirm-isolated-targets",
             "--runtime-factory",
             "unused:test_factory",
             "--run-id",
@@ -2074,6 +2075,51 @@ class TestFeature006DriverFoundation:
                 redis_url=redis_url,
                 postgres_url=postgres_url,
                 namespace=namespace,
+                isolation_acknowledged=True,
+            )
+
+    @pytest.mark.parametrize(
+        ("redis_url", "postgres_url", "namespace"),
+        [
+            (
+                "redis://production.example:6379/15",
+                "postgresql://isolated.example/twitch_test",
+                "feature006-test",
+            ),
+            (
+                "redis://isolated.example:6379/15",
+                "postgresql://production.example/contest",
+                "feature006-test",
+            ),
+            (
+                "redis://isolated.example:6379/15",
+                "postgresql://isolated.example/twitch_test",
+                "contest-prod",
+            ),
+        ],
+    )
+    def test_isolation_preflight_rejects_production_marker_bypasses(
+        self, redis_url, postgres_url, namespace
+    ):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        with pytest.raises(ValueError, match="isolated"):
+            driver.validate_isolated_targets(
+                redis_url=redis_url,
+                postgres_url=postgres_url,
+                namespace=namespace,
+                isolation_acknowledged=True,
+            )
+
+    def test_isolation_preflight_requires_explicit_acknowledgement(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        with pytest.raises(ValueError, match="acknowledgement"):
+            driver.validate_isolated_targets(
+                redis_url="redis://isolated.example:6379/15",
+                postgres_url="postgresql://isolated.example/twitch_test",
+                namespace="feature006-test",
+                isolation_acknowledged=False,
             )
 
     def test_calibration_requires_twenty_samples_and_builds_exact_budgets(self):
@@ -2403,10 +2449,12 @@ class TestFeature006DriverFoundation:
                 "run_duration_seconds": 1800,
                 "run_started_monotonic_ns": 0,
                 "run_ended_monotonic_ns": 1_800_000_000_000,
+                "converged_subscription_count": 500,
                 "pass_completion_monotonic_ns": [
                     5_000_000_000,
                     1_795_000_000_000,
                 ],
+                "pass_completion_subscription_counts": [500, 500],
                 "adjacent_gaps_ms": [1_790_000.0],
                 "boundary_gaps_ms": [5_000.0, 5_000.0],
                 "maximum_gap_ms": 1_790_000.0,
@@ -2430,6 +2478,13 @@ class TestFeature006DriverFoundation:
                 "poll_start_end_monotonic_ns": [[1, 2]],
                 "poll_durations_ms": [0.000001],
                 "overlap_skip_count": 0,
+                "scheduler_events": [
+                    {
+                        "kind": "executed",
+                        "monotonic_ns": 2,
+                        "job_id": "poll_streams",
+                    }
+                ],
                 "final_subscription_count": 2,
             },
         }
@@ -2454,6 +2509,22 @@ class TestFeature006DriverFoundation:
         with pytest.raises(ValueError, match="rate-limit"):
             driver.validate_evidence_record("cold-start", no_backoff)
 
+        missed_poll = dict(valid_records["cold-start"])
+        missed_poll["scheduler_events"] = [
+            {
+                "kind": "missed",
+                "monotonic_ns": 2,
+                "job_id": "poll_streams",
+            }
+        ]
+        with pytest.raises(ValueError, match="scheduler failure"):
+            driver.validate_evidence_record("cold-start", missed_poll)
+
+        wrong_scale = dict(valid_records["reconciler-gap"])
+        wrong_scale["converged_subscription_count"] = 300
+        with pytest.raises(ValueError, match="subscription count"):
+            driver.validate_evidence_record("reconciler-gap", wrong_scale)
+
     def test_steady_state_boundary_gap_detects_a_reconciler_that_stops_early(self):
         driver = importlib.import_module("phase5.feature006_driver")
         scheduler_events = [
@@ -2471,10 +2542,12 @@ class TestFeature006DriverFoundation:
             run_duration_seconds=1800,
             run_started_monotonic_ns=0,
             run_ended_monotonic_ns=1_800_000_000_000,
+            converged_subscription_count=500,
             pass_completion_monotonic_ns=[
                 5_000_000_000,
                 10_000_000_000,
             ],
+            pass_completion_subscription_counts=[500, 500],
             scheduler_events=scheduler_events,
         )
 
@@ -2917,7 +2990,10 @@ class TestFeature006DriverFoundation:
 
             def wait_for_convergence(self, scale):
                 assert scale == 500
-                return "2026-08-31T00:00:00Z"
+                return {
+                    "started_at": "2026-08-31T00:00:00Z",
+                    "subscription_count": 500,
+                }
 
             def run_steady_state(
                 self,
@@ -3021,6 +3097,18 @@ class TestFeature006DriverFoundation:
                     coverage_after=1,
                 )
                 await poll_recorder.run(lambda: None)
+                from apscheduler.events import EVENT_JOB_EXECUTED
+
+                scheduler_callback(
+                    type(
+                        "Event",
+                        (),
+                        {
+                            "code": EVENT_JOB_EXECUTED,
+                            "job_id": "poll_streams",
+                        },
+                    )()
+                )
                 return 1
 
         asyncio.run(

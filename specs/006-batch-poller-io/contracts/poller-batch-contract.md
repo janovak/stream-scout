@@ -304,7 +304,9 @@ post_convergence_started_at
 run_duration_seconds (at least 1800)
 run_started_monotonic_ns
 run_ended_monotonic_ns
+converged_subscription_count (equal to scale)
 pass_completion_monotonic_ns
+pass_completion_subscription_counts (each equal to scale)
 adjacent_gaps_ms
 boundary_gaps_ms
 maximum_gap_ms
@@ -333,11 +335,14 @@ subscription_count_by_window
 poll_start_end_monotonic_ns
 poll_durations_ms
 overlap_skip_count
+scheduler_events
 final_subscription_count
 ```
 
 At least one backoff is required. Every accepted window must increase coverage;
-the existing policy controls whether/when final convergence occurs.
+every poll interval must have one completed `poll_streams` scheduler event,
+and missed/error/max-instance events invalidate the record. The existing policy
+controls whether/when final convergence occurs.
 
 ## Compatibility Contract
 

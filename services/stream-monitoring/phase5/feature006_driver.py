@@ -15,6 +15,7 @@ import inspect
 import json
 import math
 import os
+import re
 import statistics
 import time
 from collections import Counter
@@ -117,7 +118,9 @@ REQUIRED_EVIDENCE_FIELDS = {
             "run_duration_seconds",
             "run_started_monotonic_ns",
             "run_ended_monotonic_ns",
+            "converged_subscription_count",
             "pass_completion_monotonic_ns",
+            "pass_completion_subscription_counts",
             "adjacent_gaps_ms",
             "boundary_gaps_ms",
             "maximum_gap_ms",
@@ -136,6 +139,7 @@ REQUIRED_EVIDENCE_FIELDS = {
             "poll_start_end_monotonic_ns",
             "poll_durations_ms",
             "overlap_skip_count",
+            "scheduler_events",
             "final_subscription_count",
         }
     ),
@@ -201,10 +205,18 @@ def fixture_summary(fixture: RankingFixture) -> dict[str, Any]:
 
 
 def validate_isolated_targets(
-    *, redis_url: str | None, postgres_url: str | None, namespace: str | None
+    *,
+    redis_url: str | None,
+    postgres_url: str | None,
+    namespace: str | None,
+    isolation_acknowledged: bool,
 ) -> None:
     """Reject missing, default, or production-like validation targets."""
 
+    if not isolation_acknowledged:
+        raise ValueError(
+            "explicit isolation acknowledgement is required"
+        )
     isolated_error = ValueError(
         "explicit isolated Redis, Postgres, and namespace targets are required"
     )
@@ -225,17 +237,28 @@ def validate_isolated_targets(
     if postgres.scheme not in {"postgres", "postgresql"} or not postgres.hostname:
         raise isolated_error
     database = unquote(postgres.path.strip("/")).lower()
-    safe_database_markers = ("test", "testing", "isolated", "feature006", "feature_006")
-    if not database or not any(marker in database for marker in safe_database_markers):
+    target_values = (
+        redis.hostname.lower(),
+        postgres.hostname.lower(),
+        database,
+        namespace.strip().lower(),
+    )
+    unsafe_tokens = {"prod", "production", "live", "default", "main"}
+    if any(
+        "production" in value
+        or unsafe_tokens.intersection(re.findall(r"[a-z0-9]+", value))
+        for value in target_values
+    ):
+        raise isolated_error
+
+    safe_tokens = {"test", "testing", "isolated", "feature006"}
+    database_tokens = set(re.findall(r"[a-z0-9]+", database))
+    if not database or not safe_tokens.intersection(database_tokens):
         raise isolated_error
 
     lowered_namespace = namespace.strip().lower()
-    unsafe_namespaces = {"production", "prod", "live", "default", "main"}
-    safe_namespace_markers = ("test", "isolated", "feature006", "feature-006")
-    if (
-        lowered_namespace in unsafe_namespaces
-        or not any(marker in lowered_namespace for marker in safe_namespace_markers)
-    ):
+    namespace_tokens = set(re.findall(r"[a-z0-9]+", lowered_namespace))
+    if not safe_tokens.intersection(namespace_tokens):
         raise isolated_error
 
 
@@ -467,6 +490,16 @@ def validate_evidence_record(kind: str, fields: Mapping[str, Any]) -> Mapping[st
                 "run duration does not match monotonic run boundaries"
             )
         completions = fields["pass_completion_monotonic_ns"]
+        pass_counts = fields["pass_completion_subscription_counts"]
+        if (
+            fields["converged_subscription_count"] != fields["scale"]
+            or not isinstance(pass_counts, Sequence)
+            or len(pass_counts) != len(completions)
+            or any(count != fields["scale"] for count in pass_counts)
+        ):
+            raise ValueError(
+                "steady-state subscription count must remain at the requested scale"
+            )
         if completions[0] < run_started or completions[-1] > run_ended:
             raise ValueError(
                 "pass completions must fall inside the run boundaries"
@@ -534,6 +567,37 @@ def validate_evidence_record(kind: str, fields: Mapping[str, Any]) -> Mapping[st
             raise ValueError("cold-start polls must remain under 10 seconds")
         if fields["overlap_skip_count"] != 0:
             raise ValueError("cold-start overlap_skip_count must be zero")
+        scheduler_events = fields["scheduler_events"]
+        if not isinstance(scheduler_events, Sequence):
+            raise ValueError("cold-start scheduler_events must be a sequence")
+        poll_events = [
+            event
+            for event in scheduler_events
+            if event.get("job_id") == "poll_streams"
+        ]
+        if any(
+            event.get("kind") in {"error", "missed", "max_instances"}
+            for event in poll_events
+        ):
+            raise ValueError(
+                "cold-start contains a poll scheduler failure"
+            )
+        completed_events = [
+            event for event in poll_events if event.get("kind") == "executed"
+        ]
+        if len(completed_events) != len(
+            fields["poll_start_end_monotonic_ns"]
+        ):
+            raise ValueError(
+                "cold-start requires one executed scheduler event per poll interval"
+            )
+        for interval, event in zip(
+            fields["poll_start_end_monotonic_ns"], completed_events
+        ):
+            if event.get("monotonic_ns", -1) < interval[1]:
+                raise ValueError(
+                    "cold-start scheduler completion precedes its poll interval"
+                )
         counts = fields["subscription_count_by_window"]
         if (
             not isinstance(counts, Sequence)
@@ -996,7 +1060,9 @@ def build_reconciler_gap_record(
     run_duration_seconds: float,
     run_started_monotonic_ns: int,
     run_ended_monotonic_ns: int,
+    converged_subscription_count: int,
     pass_completion_monotonic_ns: Sequence[int],
+    pass_completion_subscription_counts: Sequence[int],
     scheduler_events: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     gaps = adjacent_gaps_ms(pass_completion_monotonic_ns)
@@ -1020,7 +1086,11 @@ def build_reconciler_gap_record(
         "run_duration_seconds": run_duration_seconds,
         "run_started_monotonic_ns": run_started_monotonic_ns,
         "run_ended_monotonic_ns": run_ended_monotonic_ns,
+        "converged_subscription_count": converged_subscription_count,
         "pass_completion_monotonic_ns": list(pass_completion_monotonic_ns),
+        "pass_completion_subscription_counts": list(
+            pass_completion_subscription_counts
+        ),
         "adjacent_gaps_ms": gaps,
         "boundary_gaps_ms": boundary_gaps,
         "maximum_gap_ms": max(gaps + boundary_gaps),
@@ -1203,7 +1273,9 @@ def build_cold_start_record(
         (end - start) / 1_000_000.0 for start, end in intervals
     ]
     overlap = sum(
-        event.get("kind") == "max_instances" for event in scheduler_events
+        event.get("job_id") == "poll_streams"
+        and event.get("kind") == "max_instances"
+        for event in scheduler_events
     )
     if overlap:
         raise ValueError("cold-start scheduled polls must have zero overlap skips")
@@ -1220,6 +1292,9 @@ def build_cold_start_record(
         "poll_start_end_monotonic_ns": intervals,
         "poll_durations_ms": durations,
         "overlap_skip_count": overlap,
+        "scheduler_events": [
+            dict(event) for event in scheduler_events
+        ],
         "final_subscription_count": final_subscription_count,
     }
     validate_evidence_record("cold-start", record)
@@ -1228,6 +1303,15 @@ def build_cold_start_record(
         and bool(transport.backoff_events)
         and bool(transport.accepted_create_windows)
         and overlap == 0
+        and len(
+            [
+                event
+                for event in scheduler_events
+                if event.get("job_id") == "poll_streams"
+                and event.get("kind") == "executed"
+            ]
+        )
+        == len(intervals)
         and all(duration < 10_000.0 for duration in durations)
     )
     return record
@@ -1482,6 +1566,11 @@ def _target_arguments(parser: argparse.ArgumentParser) -> None:
         "--namespace", default=os.environ.get("FEATURE006_NAMESPACE")
     )
     parser.add_argument(
+        "--confirm-isolated-targets",
+        action="store_true",
+        help="affirm that all supplied validation targets are isolated",
+    )
+    parser.add_argument(
         "--runtime-factory",
         default=os.environ.get("FEATURE006_RUNTIME_FACTORY"),
         help="operator integration callable as module:attribute",
@@ -1600,11 +1689,29 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
                     raise ValueError(
                         "run_operation_count must return observed scale metadata"
                     )
+                required_observation_fields = {
+                    "outcome",
+                    "observed_eligible_records",
+                    "effective_join_threshold",
+                    "effective_leave_threshold",
+                    "effective_fetch_buffer",
+                }
+                missing_observation_fields = (
+                    required_observation_fields - set(counts)
+                )
+                if missing_observation_fields:
+                    raise ValueError(
+                        "run_operation_count missing observed fields: "
+                        f"{sorted(missing_observation_fields)}"
+                    )
                 actual_counts = counter.report()
                 reported_counts = counts.get("dispatch_counts")
                 if (
                     reported_counts is not None
-                    and dict(reported_counts) != actual_counts
+                    and (
+                        not isinstance(reported_counts, Mapping)
+                        or dict(reported_counts) != actual_counts
+                    )
                 ):
                     raise ValueError(
                         "runtime dispatch counts disagree with the supplied counter"
@@ -1747,9 +1854,24 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
         if args.minutes < 30:
             raise ValueError("steady-state acceptance requires at least 30 minutes")
         scheduler = SchedulerEventRecorder()
-        started_at = await _invoke(runtime.wait_for_convergence, args.scale)
-        if started_at is None:
-            started_at = utc_now()
+        convergence = await _invoke(
+            runtime.wait_for_convergence, args.scale
+        )
+        if not isinstance(convergence, Mapping):
+            raise ValueError(
+                "wait_for_convergence must report started_at and subscription_count"
+            )
+        started_at = convergence.get("started_at")
+        converged_subscription_count = convergence.get(
+            "subscription_count"
+        )
+        if (
+            converged_subscription_count != args.scale
+            or not _valid_timestamp(started_at)
+        ):
+            raise ValueError(
+                "steady-state run must begin after convergence at the requested scale"
+            )
         production_callback = getattr(
             runtime, "production_pass_callback", None
         )
@@ -1781,7 +1903,9 @@ async def _run_command(args: argparse.Namespace, runtime: Any, writer: JsonlWrit
             run_duration_seconds=run_duration_seconds,
             run_started_monotonic_ns=run_started_ns,
             run_ended_monotonic_ns=run_ended_ns,
+            converged_subscription_count=converged_subscription_count,
             pass_completion_monotonic_ns=pass_recorder.completions,
+            pass_completion_subscription_counts=pass_recorder.counts,
             scheduler_events=scheduler.events,
         )
         completed_poll_events = [
@@ -1856,6 +1980,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             redis_url=args.redis_url,
             postgres_url=args.postgres_url,
             namespace=args.namespace,
+            isolation_acknowledged=args.confirm_isolated_targets,
         )
         if args.command == "operation-counts":
             if any(scale not in {50, 500, 900} for scale in args.scales):

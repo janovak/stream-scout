@@ -51,6 +51,10 @@ export FEATURE006_RUN_ID='feature006-operator-run-id'
 export FEATURE006_RUNTIME_FACTORY='feature006_environment:build_runtime'
 ```
 
+Every driver invocation must also include `--confirm-isolated-targets`. The
+flag is an explicit operator acknowledgement; it does not weaken the driver's
+tokenized rejection of production-like host, database, or namespace names.
+
 The runtime factory is the deployment adapter on the separate validation
 machine. It receives the parsed command arguments and supplies the real
 initialized process/client callbacks requested by that command. The tracked
@@ -149,6 +153,7 @@ Run the validation driver against isolated Redis/Postgres namespaces:
 
 ```bash
 python phase5/feature006_driver.py operation-counts \
+  --confirm-isolated-targets \
   --scales 50 500 900 \
   --output /tmp/feature006-operation-counts.jsonl
 ```
@@ -174,6 +179,7 @@ Also run:
 
 ```bash
 python phase5/feature006_driver.py operation-counts \
+  --confirm-isolated-targets \
   --case empty-empty \
   --case departures-only \
   --output /tmp/feature006-empty-counts.jsonl
@@ -195,6 +201,7 @@ endpoints used for the performance profiles:
 
 ```bash
 python phase5/feature006_driver.py calibrate \
+  --confirm-isolated-targets \
   --minimum-page-samples 20 \
   --output /tmp/feature006-calibration.jsonl
 ```
@@ -252,6 +259,7 @@ Run:
 for scale in 500 900; do
   for profile in stable complete-turnover; do
     python phase5/feature006_driver.py poll-profile \
+      --confirm-isolated-targets \
       --scale "$scale" \
       --profile "$profile" \
       --warmups 1 \
@@ -308,10 +316,12 @@ Run separately:
 
 ```bash
 python phase5/feature006_driver.py steady-state \
+  --confirm-isolated-targets \
   --scale 500 --minutes 30 \
   --output /tmp/feature006-steady-500.jsonl
 
 python phase5/feature006_driver.py steady-state \
+  --confirm-isolated-targets \
   --scale 900 --minutes 30 \
   --output /tmp/feature006-steady-900.jsonl
 ```
@@ -323,6 +333,8 @@ Acceptance:
   across the run (an empty scheduler event list is invalid);
 - no maximum-instance/overlap skip occurs;
 - every pass completion is recorded directly in process;
+- convergence and every pass callback report the requested 500/900
+  subscription count;
 - leading and trailing run-boundary gaps are included with adjacent pass gaps;
 - maximum adjacent completion gap is at most 15 seconds at 500;
 - maximum adjacent completion gap is at most 20 seconds at 900.
@@ -348,6 +360,7 @@ Run:
 
 ```bash
 python phase5/feature006_driver.py cold-start \
+  --confirm-isolated-targets \
   --scale 900 \
   --require-rate-limit-backoff \
   --output /tmp/feature006-cold-900.jsonl
@@ -368,6 +381,8 @@ Acceptance:
 
 - at least one subscription-create backoff occurs;
 - every scheduled poll starts without overlap skip;
+- every recorded poll interval has one completed `poll_streams` scheduler
+  event, with no missed/error event;
 - every non-failing poll completes under 10 seconds;
 - subscription coverage increases after every retry window in which Twitch
   accepts creates;
