@@ -172,10 +172,20 @@ def compute_desired_set(ranked_logins, previous_desired, join_threshold, leave_t
 # (e.g. kaicenat, ishowspeed) have clipping disabled, so without padding
 # they'd permanently shrink the real candidate pool below LEAVE_THRESHOLD.
 #
-# The default of 20 was sized against LEAVE_THRESHOLD=30. It is a flat pad, so
-# it thins out as the threshold grows; scale it with the threshold if the
-# "Fewer than LEAVE_THRESHOLD clip-allowed streams" warning starts firing.
-CLIPPING_DISABLED_FETCH_BUFFER = int(os.getenv("CLIPPING_DISABLED_FETCH_BUFFER", "20"))
+# The pad is a fraction of LEAVE_THRESHOLD, not a flat count: a flat pad thins
+# out as the threshold grows and eventually stops covering the discarded
+# channels ("Fewer than LEAVE_THRESHOLD clip-allowed streams" warning). Measured
+# disabled rate near the top of the ranking is ~22% (~84 of the top 380); it
+# thins with depth because the disabled whales concentrate at the top, so 0.30
+# keeps margin at every threshold. Raise it if the warning starts firing.
+CLIPPING_DISABLED_FETCH_PAD_FRACTION = float(
+    os.getenv("CLIPPING_DISABLED_FETCH_PAD_FRACTION", "0.30")
+)
+
+
+def clipping_disabled_fetch_pad(leave_threshold):
+    """Return the extra stream count to fetch on top of ``leave_threshold``."""
+    return math.ceil(leave_threshold * CLIPPING_DISABLED_FETCH_PAD_FRACTION)
 
 REDIS_STREAMER_TTL = 180  # 3 minutes TTL for streamer online status
 POLL_INTERVAL_SECONDS = 120  # Poll every 2 minutes
@@ -779,7 +789,9 @@ class StreamMonitoringService:
 
             ranking_started = time.perf_counter()
             try:
-                fetch_count = LEAVE_THRESHOLD + CLIPPING_DISABLED_FETCH_BUFFER
+                fetch_count = LEAVE_THRESHOLD + clipping_disabled_fetch_pad(
+                    LEAVE_THRESHOLD
+                )
 
                 async def _fetch_top_streams():
                     collected = []
@@ -1111,7 +1123,7 @@ class StreamMonitoringService:
                     "left": left_count,
                     "join_threshold": JOIN_THRESHOLD,
                     "leave_threshold": LEAVE_THRESHOLD,
-                    "fetch_buffer": CLIPPING_DISABLED_FETCH_BUFFER,
+                    "fetch_buffer": clipping_disabled_fetch_pad(LEAVE_THRESHOLD),
                 }
             )
             self._record_poll_outcome(outcome, total_duration)

@@ -107,17 +107,24 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_|reconcile_|subscrip
 ## Ramping the monitored channel count
 
 Spec 004 removed the ingestion ceiling. Production now runs at `JOIN_THRESHOLD`
-150 / `LEAVE_THRESHOLD` 300, raised from 15 / 30 by the 2026-08-30 ramp below.
-Raise the count in steps, not in one jump. Each step adds real message volume
-and real Flink load.
+800 / `LEAVE_THRESHOLD` 900, raised in steps from 15 / 30 by the ramps below
+(15 / 30 → 150 / 300 on 2026-08-30, then 150 / 300 → 800 / 900 on 2026-08-31
+after feature 006 batched the poller). Raise the count in steps, not in one
+jump. Each step adds real message volume and real Flink load.
+
+`LEAVE_THRESHOLD` 900 sits at the transport's hard cap (3 connections × 300 =
+900 subscriptions). The desired set runs below it in practice — the top 900 by
+rank minus the ~20% with clipping disabled is ~720–800 — but there is no room
+left for a higher `LEAVE_THRESHOLD` on this transport. Past 900, move to
+EventSub webhooks.
 
 ### What `JOIN_THRESHOLD` and `LEAVE_THRESHOLD` actually do
 
 `LEAVE_THRESHOLD` sets the monitored count, not `JOIN_THRESHOLD`. A channel
 enters the set on reaching the top `JOIN_THRESHOLD` by viewer rank and stays
-until it drops out of the top `LEAVE_THRESHOLD`. So 150 / 300 monitors roughly
-300 channels (minus the ~20% of the top 300 with clipping disabled), with a
-150-deep entry gate that keeps a channel near the boundary from flapping in and
+until it drops out of the top `LEAVE_THRESHOLD`. So 800 / 900 monitors roughly
+720–800 channels (the top 900 minus the ~20% with clipping disabled), with an
+800-deep entry gate that keeps a channel near the boundary from flapping in and
 out. To run near a round number of channels, set `LEAVE_THRESHOLD` to it and
 `JOIN_THRESHOLD` to something below.
 
@@ -136,10 +143,11 @@ than `JOIN_THRESHOLD`, or the service refuses to start.
    set costs a longer cold start (about 2 minutes to ~480 channels), not a
    failed one.
 
-Raise `CLIPPING_DISABLED_FETCH_BUFFER` with the threshold if the log line
-`Fewer than LEAVE_THRESHOLD clip-allowed streams found even after padding
-fetch` appears. It is a flat pad, so it thins out as the threshold grows;
-`LEAVE_THRESHOLD` 300 needs a pad near 120.
+`CLIPPING_DISABLED_FETCH_PAD_FRACTION` (default 0.30) pads the Helix fetch so
+the ~20% of top channels with clipping disabled do not shrink the candidate
+pool below `LEAVE_THRESHOLD`. It is a fraction of `LEAVE_THRESHOLD`, so it
+scales with the threshold on its own. Raise it if the log line `Fewer than
+LEAVE_THRESHOLD clip-allowed streams found even after padding fetch` appears.
 
 ### The step ladder
 
@@ -147,12 +155,18 @@ fetch` appears. It is a flat pad, so it thins out as the threshold grows;
 |---|---|---|---|
 | 0 | 15 / 30 | ~20 | baseline |
 | 1 | 50 / 100 | ~55 | clean |
-| 2 | 150 / 300 | ~290 | clean — **current production** |
+| 2 | 150 / 300 | ~290 | clean |
 | 3 | 300 / 500 | ~320 | clean |
 | 4 | 480 / 500 | ~485 | clean |
-| 5 | 800 / 1000 | ~800 | **did not converge, rolled back** — see below |
+| 5 | 800 / 1000 | ~800 | **did not converge, rolled back** (pre feature 006) — see below |
+| 6 | 800 / 900 | ~720–800 | clean on 2026-08-31, post feature 006 — **current production** |
 
 Soak each step for at least 30 minutes before the next.
+
+Step 6 cold start showed the expected 429 backoff burst (four rounds,
+~333 → 22 rate-limited channels, cleared in ~2 minutes) and then converged.
+Feature 006's batched poll phases keep `stream_poll_duration_seconds` near 3 s
+at 900 ranked, so the poll no longer stalls the way step 5 did.
 
 ### What to check at each step
 
@@ -233,8 +247,11 @@ values:
 ```text
 JOIN_THRESHOLD=150
 LEAVE_THRESHOLD=300
-CLIPPING_DISABLED_FETCH_BUFFER=120
+CLIPPING_DISABLED_FETCH_PAD_FRACTION=0.30
 ```
+
+(Feature 006 shipped at 150 / 300; production moved to 800 / 900 the next day —
+step 6 above — once the batched poll phases were confirmed healthy.)
 
 Recreate only the existing service so Docker resolves the replaced bind-mounted
 file:
@@ -250,7 +267,7 @@ Postgres, and Twitch state. That evidence includes the real-Postgres rollback
 case, 50/500/900 dispatch counts, four calibrated duration profiles, separate
 30-minute steady-state runs, and the isolated 900-channel cold-backoff run.
 
-At 150/300/120, retain:
+At the current operating point, retain:
 
 - `stream_poll_duration_seconds{outcome}` and
   `stream_poll_phase_duration_seconds{phase,outcome}`;
