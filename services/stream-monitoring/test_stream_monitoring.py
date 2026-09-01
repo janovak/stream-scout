@@ -6,9 +6,12 @@ Tests token management, message processing, and service components.
 """
 
 import asyncio
+import importlib
 import json
 import logging
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -17,8 +20,17 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from psycopg2.extensions import adapt
+from psycopg2.extras import execute_values
+from redis.exceptions import ResponseError
 
-from desired_set_store import DESIRED_IDS_KEY, DesiredSet, RedisDesiredSetStore
+from desired_set_store import (
+    DESIRED_GENERATION_KEY,
+    DESIRED_IDS_KEY,
+    DESIRED_KEY,
+    DesiredSet,
+    RedisDesiredSetStore,
+)
 import eventsub_pool
 import reconciler as reconciler_module
 import stream_monitoring_service
@@ -57,32 +69,481 @@ def make_stream(login, user_id):
 class FakeTwitch:
     """Serves a fixed ranking through the auto-paginating get_streams API."""
 
-    def __init__(self, streams):
+    def __init__(self, streams, error=None):
         self.streams = streams
+        self.error = error
 
     def get_streams(self, first=100):
         async def pages():
+            if self.error is not None:
+                raise self.error
             for stream in self.streams:
                 yield stream
 
         return pages()
 
 
-def make_poller(logins, fake_redis, reconciler=None):
-    """A StreamMonitoringService wired for a poll, with Postgres/Kafka mocked.
+class CountingCursor:
+    """Cursor proxy compatible with the real psycopg2 execute_values helper."""
 
-    `logins` is the ranking, best first. Broadcaster ids are derived from the
-    position so a test can predict them.
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def mogrify(self, template, params=None):
+        template_bytes = (
+            template.encode(self.connection.encoding)
+            if isinstance(template, str)
+            else template
+        )
+        if params is None:
+            return template_bytes
+        quoted = tuple(adapt(value).getquoted() for value in params)
+        rendered = template_bytes % quoted
+        self.connection.mogrified_rows.append(rendered)
+        return rendered
+
+    def execute(self, query, params=None):
+        query_bytes = (
+            query.encode(self.connection.encoding)
+            if isinstance(query, str)
+            else bytes(query)
+        )
+        self.connection.execute_count += 1
+        self.connection.executed_sql.append(query_bytes)
+        self.connection.executed_params.append(params)
+        if self.connection.execute_error is not None:
+            raise self.connection.execute_error
+
+    def fetchall(self):
+        return list(self.connection.fetchall_rows)
+
+    def fetchone(self):
+        return (
+            self.connection.fetchone_rows.pop(0)
+            if self.connection.fetchone_rows
+            else None
+        )
+
+
+class CountingConnection:
+    encoding = "UTF8"
+
+    def __init__(self, *, execute_error=None, commit_error=None, rollback_error=None):
+        self.execute_error = execute_error
+        self.commit_error = commit_error
+        self.rollback_error = rollback_error
+        self.fetchall_rows = []
+        self.fetchone_rows = []
+        self.execute_count = 0
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.executed_sql = []
+        self.executed_params = []
+        self.mogrified_rows = []
+
+    def cursor(self):
+        return CountingCursor(self)
+
+    def commit(self):
+        self.commit_count += 1
+        if self.commit_error is not None:
+            raise self.commit_error
+
+    def rollback(self):
+        self.rollback_count += 1
+        if self.rollback_error is not None:
+            raise self.rollback_error
+
+    def reset_measured(self):
+        self.execute_count = 0
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.executed_sql.clear()
+        self.executed_params.clear()
+        self.mogrified_rows.clear()
+
+
+class CountingPool:
+    """One-connection pool proxy with explicit acquisition/return counts."""
+
+    def __init__(self, connection=None, *, getconn_error=None):
+        self.connection = connection or CountingConnection()
+        self.getconn_error = getconn_error
+        self.getconn_count = 0
+        self.putconn_count = 0
+        self.discard_count = 0
+        self.returned_connections = []
+
+    def getconn(self):
+        self.getconn_count += 1
+        if self.getconn_error is not None:
+            raise self.getconn_error
+        return self.connection
+
+    def putconn(self, connection, close=False):
+        self.putconn_count += 1
+        self.discard_count += int(close)
+        self.returned_connections.append((connection, close))
+
+    def reset_measured(self):
+        self.getconn_count = 0
+        self.putconn_count = 0
+        self.discard_count = 0
+        self.returned_connections.clear()
+        self.connection.reset_measured()
+
+
+class ProductionCallCountingCursor:
+    """Count production cursor calls while delegating to real Postgres."""
+
+    def __init__(self, connection, cursor):
+        self.connection = connection
+        self._cursor = cursor
+
+    def __enter__(self):
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return self._cursor.__exit__(exc_type, exc, traceback)
+
+    def mogrify(self, query, params=None):
+        return self._cursor.mogrify(query, params)
+
+    def execute(self, query, params=None):
+        self.connection.execute_count += 1
+        self.connection.executed_sql.append(query)
+        self.connection.executed_params.append(params)
+        return self._cursor.execute(query, params)
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+
+class ProductionCallCountingConnection:
+    def __init__(self, connection):
+        self._connection = connection
+        self.execute_count = 0
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.executed_sql = []
+        self.executed_params = []
+        self.mogrified_rows = []
+
+    @property
+    def encoding(self):
+        return self._connection.encoding
+
+    def cursor(self):
+        return ProductionCallCountingCursor(
+            self, self._connection.cursor()
+        )
+
+    def commit(self):
+        self.commit_count += 1
+        return self._connection.commit()
+
+    def rollback(self):
+        self.rollback_count += 1
+        return self._connection.rollback()
+
+    def reset_measured(self):
+        self.execute_count = 0
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.executed_sql.clear()
+        self.executed_params.clear()
+        self.mogrified_rows.clear()
+
+
+class PollSideEffectRecorder:
+    def __init__(self):
+        self.lifecycle_publications = []
+        self.desired_publications = []
+        self.reconciler_notifications = 0
+        self.final_outcomes = []
+        self.phase_boundaries = []
+
+    def record_lifecycle(self, event_type, broadcaster_id, login, rank):
+        self.lifecycle_publications.append(
+            (event_type, broadcaster_id, login, rank)
+        )
+
+    def record_desired(self, desired, broadcaster_ids):
+        self.desired_publications.append(
+            (dict(desired), dict(broadcaster_ids))
+        )
+
+    def record_notification(self):
+        self.reconciler_notifications += 1
+
+    def record_outcome(self, outcome):
+        self.final_outcomes.append(outcome)
+
+    def record_phase(self, phase, outcome):
+        self.phase_boundaries.append((phase, outcome))
+
+
+class RecordingDesiredStore:
+    def __init__(
+        self,
+        delegate,
+        recorder,
+        *,
+        read_error=None,
+        publish_error=None,
+        publish_error_after_apply=False,
+    ):
+        self.delegate = delegate
+        self.recorder = recorder
+        self.read_error = read_error
+        self.publish_error = publish_error
+        self.publish_error_after_apply = publish_error_after_apply
+
+    def read(self):
+        if self.read_error is not None:
+            raise self.read_error
+        return self.delegate.read()
+
+    def read_generation(self):
+        return self.delegate.read_generation()
+
+    def publish(self, desired, broadcaster_ids):
+        if self.publish_error is not None and not self.publish_error_after_apply:
+            raise self.publish_error
+        self.delegate.publish(desired, broadcaster_ids)
+        self.recorder.record_desired(desired, broadcaster_ids)
+        if self.publish_error is not None:
+            raise self.publish_error
+
+
+def make_poller(
+    logins,
+    fake_redis,
+    reconciler=None,
+    *,
+    ranked_records=None,
+    pool=None,
+    twitch_error=None,
+    desired_read_error=None,
+    desired_publish_error=None,
+    desired_publish_error_after_apply=False,
+):
+    """A StreamMonitoringService wired to recording in-memory test adapters.
+
+    `logins` remains the compatibility shorthand. `ranked_records` supplies
+    explicit ``(login, broadcaster_id)`` rows for duplicate and failure cases.
     """
+    if ranked_records is None:
+        ranked_records = [
+            (login, 1000 + index) for index, login in enumerate(logins)
+        ]
     service = StreamMonitoringService()
-    service.twitch = FakeTwitch([make_stream(login, 1000 + i) for i, login in enumerate(logins)])
+    service.twitch = FakeTwitch(
+        [make_stream(login, broadcaster_id) for login, broadcaster_id in ranked_records],
+        error=twitch_error,
+    )
     service.redis_client = fake_redis
-    service.desired_store = RedisDesiredSetStore(fake_redis)
+    recorder = PollSideEffectRecorder()
+    service.desired_store = RecordingDesiredStore(
+        RedisDesiredSetStore(fake_redis),
+        recorder,
+        read_error=desired_read_error,
+        publish_error=desired_publish_error,
+        publish_error_after_apply=desired_publish_error_after_apply,
+    )
     service.reconciler = reconciler
+    if reconciler is not None:
+        notify = reconciler.notify_desired_changed
+
+        def record_and_notify():
+            recorder.record_notification()
+            notify()
+
+        reconciler.notify_desired_changed = MagicMock(
+            side_effect=record_and_notify
+        )
+    service.db_pool = pool or CountingPool()
     service._get_clipping_disabled_ids = MagicMock(return_value=set())
-    service._upsert_streamer = MagicMock()
-    service._publish_lifecycle_event = MagicMock()
+    service._publish_lifecycle_event = MagicMock(
+        side_effect=recorder.record_lifecycle
+    )
+    service._poll_observer = recorder
+    service.test_side_effects = recorder
     return service
+
+
+class TestDispatchInstrumentation:
+    def test_cursor_proxy_observes_execute_values_internal_paging(self):
+        connection = CountingConnection()
+        rows = [(index, f"login{index}") for index in range(150)]
+        execute_values(
+            connection.cursor(),
+            "INSERT INTO streamers (streamer_id, streamer_login, last_seen_at) "
+            "VALUES %s",
+            rows,
+            template="(%s, %s, NOW())",
+        )
+
+        assert connection.execute_count == 2
+        assert len(connection.executed_sql) == 2
+        assert len(connection.mogrified_rows) == 150
+
+
+class TestStreamerMetadataBatch:
+    def test_empty_batch_omits_pool_sql_transaction_and_streak_change(self):
+        service = StreamMonitoringService()
+        service.db_pool = CountingPool()
+        service._metadata_consecutive_failures = 3
+
+        result = service._upsert_streamer_batch([])
+
+        assert result is None
+        assert service.db_pool.getconn_count == 0
+        assert service.db_pool.connection.execute_count == 0
+        assert service.db_pool.connection.commit_count == 0
+        assert service.db_pool.connection.rollback_count == 0
+        assert service._metadata_consecutive_failures == 3
+
+    def test_duplicate_id_last_occurrence_uses_one_unpaged_statement(self):
+        service = StreamMonitoringService()
+        service.db_pool = CountingPool()
+        records = [
+            (streamer_id, f"login-{streamer_id}")
+            for streamer_id in range(1, 151)
+        ]
+        records.extend([(7, "replacement"), (7, "final-login")])
+
+        assert service._upsert_streamer_batch(records) is True
+
+        connection = service.db_pool.connection
+        assert connection.execute_count == 1
+        assert len(connection.mogrified_rows) == 150
+        assert b"(7, 'final-login', NOW())" in connection.executed_sql[0]
+        assert b"(7, 'replacement', NOW())" not in connection.executed_sql[0]
+
+    def test_success_uses_database_clock_one_commit_and_clean_pool_return(self):
+        service = StreamMonitoringService()
+        service.db_pool = CountingPool()
+
+        assert service._upsert_streamer_batch([(101, "first"), (202, "second")]) is True
+
+        connection = service.db_pool.connection
+        sql = connection.executed_sql[0]
+        assert connection.execute_count == 1
+        assert connection.commit_count == 1
+        assert connection.rollback_count == 0
+        assert service.db_pool.putconn_count == 1
+        assert service.db_pool.returned_connections == [(connection, False)]
+        assert b"VALUES " in sql
+        assert b"NOW()" in sql
+        assert b"last_seen_at = EXCLUDED.last_seen_at" in sql
+        assert b"first_seen_at" not in sql
+        assert b"allows_clipping" not in sql
+        assert b"eventsub_refused_at" not in sql
+        assert b"clipping_disabled_at" not in sql
+
+    def test_statement_failure_rolls_back_once_and_logs_bounded_batch_context(
+        self, caplog
+    ):
+        service = StreamMonitoringService()
+        connection = CountingConnection(execute_error=ValueError("poison row"))
+        service.db_pool = CountingPool(connection)
+
+        with caplog.at_level(logging.ERROR):
+            result = service._upsert_streamer_batch(
+                [(1, "first"), (1, "replacement"), (2, "second")]
+            )
+
+        assert result is False
+        assert connection.execute_count == 1
+        assert connection.commit_count == 0
+        assert connection.rollback_count == 1
+        assert service.db_pool.putconn_count == 1
+        assert service.db_pool.discard_count == 0
+        assert service._metadata_consecutive_failures == 1
+        record = next(
+            record
+            for record in caplog.records
+            if record.message == "Streamer metadata batch failed"
+        )
+        assert record.input_batch_size == 3
+        assert record.unique_batch_size == 2
+        assert record.metadata_failure_streak == 1
+        assert record.error_type == "ValueError"
+
+    def test_malformed_input_is_visible_without_a_per_row_fallback(self, caplog):
+        service = StreamMonitoringService()
+        service.db_pool = CountingPool()
+
+        with caplog.at_level(logging.ERROR):
+            result = service._upsert_streamer_batch(
+                [(1, "valid"), ("malformed-record",)]
+            )
+
+        assert result is False
+        assert service.db_pool.getconn_count == 0
+        assert service._metadata_consecutive_failures == 1
+        record = next(
+            record
+            for record in caplog.records
+            if record.message == "Streamer metadata batch failed"
+        )
+        assert record.input_batch_size == 2
+        assert record.unique_batch_size == 1
+        assert record.error_type == "ValueError"
+
+    def test_successful_non_empty_batch_resets_streak_but_empty_does_not(self):
+        service = StreamMonitoringService()
+        service.db_pool = CountingPool(
+            CountingConnection(execute_error=ValueError("transient"))
+        )
+
+        assert service._upsert_streamer_batch([(1, "first")]) is False
+        assert service._metadata_consecutive_failures == 1
+
+        service.db_pool.connection.execute_error = None
+        assert service._upsert_streamer_batch([]) is None
+        assert service._metadata_consecutive_failures == 1
+        assert service._upsert_streamer_batch([(1, "first")]) is True
+        assert service._metadata_consecutive_failures == 0
+        assert (
+            stream_monitoring_service.stream_metadata_consecutive_failures
+            ._value.get()
+            == 0
+        )
+
+    @pytest.mark.parametrize("rollback_fails", [False, True])
+    def test_commit_unknown_never_reports_success_and_discards_if_rollback_fails(
+        self, rollback_fails
+    ):
+        service = StreamMonitoringService()
+        connection = CountingConnection(
+            commit_error=ConnectionError("commit acknowledgement lost"),
+            rollback_error=(
+                ConnectionError("rollback failed") if rollback_fails else None
+            ),
+        )
+        service.db_pool = CountingPool(connection)
+
+        result = service._upsert_streamer_batch([(1, "first")])
+
+        assert result is False
+        assert connection.execute_count == 1
+        assert connection.commit_count == 1
+        assert connection.rollback_count == 1
+        assert service.db_pool.putconn_count == 1
+        assert service.db_pool.discard_count == int(rollback_fails)
+        assert service._metadata_consecutive_failures == 1
 
 
 def broadcaster_id_for(logins, login):
@@ -874,8 +1335,10 @@ class TestPollWritesIntentOnly:
             "the poll did more work when more changed -- something in it "
             "still scales with the change, not the set"
         )
-        assert full_change_calls.count("pipeline.execute") == 1
-        assert no_change_calls.count("pipeline.execute") == 1
+        assert full_change_calls.count("mget") == 1
+        assert no_change_calls.count("mget") == 1
+        assert full_change_calls.count("pipeline.execute") == 2
+        assert no_change_calls.count("pipeline.execute") == 2
         assert full_change_seconds < no_change_seconds * 5 + 0.5, (
             f"500-change poll took {full_change_seconds:.4f}s against "
             f"{no_change_seconds:.4f}s for a 0-change poll"
@@ -940,6 +1403,2110 @@ class TestPollWritesIntentOnly:
         asyncio.run(make_poller(logins[1:], fake_redis).poll_top_streams())
 
         assert "s1" not in RedisDesiredSetStore(fake_redis).read().logins
+
+
+class TestBatchedPollOrchestration:
+    @staticmethod
+    def run_poll(service, *, join=2, leave=3):
+        with patch.object(stream_monitoring_service, "JOIN_THRESHOLD", join), \
+             patch.object(stream_monitoring_service, "LEAVE_THRESHOLD", leave), \
+             patch.object(
+                 stream_monitoring_service,
+                 "CLIPPING_DISABLED_FETCH_BUFFER",
+                 0,
+             ):
+            return asyncio.run(service.poll_top_streams())
+
+    @staticmethod
+    def clear_dispatches(fake_redis):
+        fake_redis.calls.clear()
+        fake_redis.dispatches.clear()
+        fake_redis.mget_requests.clear()
+        fake_redis.pipeline_executions.clear()
+
+    def test_normalizes_once_and_preserves_partial_stable_turnover_semantics(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("retained", 10), ("departed", 20)])
+        fake_redis.strings["streamer:online:retained"] = "10"
+        fake_redis.strings["streamer:online:departed"] = "20"
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[
+                ("NEW", 30),
+                ("Retained", 10),
+                ("outside", 40),
+            ],
+        )
+        self.clear_dispatches(fake_redis)
+
+        self.run_poll(service, join=1, leave=3)
+
+        assert service.desired_store.read() == DesiredSet(
+            logins=["new", "retained"],
+            ids={"new": 30, "retained": 10},
+            generation=2,
+        )
+        assert service.test_side_effects.lifecycle_publications == [
+            ("online", 30, "new", 1)
+        ]
+        assert service.last_poll_result == {
+            "outcome": "success",
+            "ranked": 3,
+            "desired": 2,
+            "entered": 1,
+            "left": 1,
+            "join_threshold": 1,
+            "leave_threshold": 3,
+            "fetch_buffer": 0,
+        }
+
+    def test_duplicate_id_only_deduplicates_metadata_not_login_membership(self):
+        fake_redis = FakeRedis()
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[("first-login", 7), ("second-login", 7)],
+        )
+
+        self.run_poll(service, join=2, leave=2)
+
+        assert service.desired_store.read() == DesiredSet(
+            logins=["first-login", "second-login"],
+            ids={"first-login": 7, "second-login": 7},
+            generation=1,
+        )
+        assert service.db_pool.connection.execute_count == 1
+        assert len(service.db_pool.connection.mogrified_rows) == 1
+        assert (
+            b"(7, 'second-login', NOW())"
+            in service.db_pool.connection.executed_sql[0]
+        )
+        assert fake_redis.strings["streamer:online:first-login"] == "7"
+        assert fake_redis.strings["streamer:online:second-login"] == "7"
+
+    def test_membership_and_departures_precede_first_online_dispatch(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("departed", 99)])
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[("current", 1)],
+        )
+        self.clear_dispatches(fake_redis)
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert fake_redis.mget_requests == [[
+            "streamer:online:current",
+            "streamer:online:departed",
+        ]]
+        assert service.test_side_effects.phase_boundaries.index(
+            ("metadata_persistence", "success")
+        ) < service.test_side_effects.phase_boundaries.index(
+            ("online_snapshot", "success")
+        )
+
+    def test_snapshot_is_one_ordered_unique_current_plus_departed_mget(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("gone", 90), ("duplicate", 80)])
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[
+                ("Duplicate", 1),
+                ("current", 2),
+                ("duplicate", 3),
+            ],
+        )
+        self.clear_dispatches(fake_redis)
+
+        self.run_poll(service, join=3, leave=3)
+
+        assert fake_redis.mget_requests == [[
+            "streamer:online:duplicate",
+            "streamer:online:current",
+            "streamer:online:gone",
+        ]]
+        assert [
+            dispatch
+            for dispatch in fake_redis.dispatches
+            if dispatch["phase"] == "online_snapshot"
+        ] == [
+            {
+                "phase": "online_snapshot",
+                "kind": "command",
+                "operation": "mget",
+            }
+        ]
+
+    @pytest.mark.parametrize("response", [[], [None, None, None]])
+    def test_snapshot_length_mismatch_is_a_protocol_failure(self, response):
+        fake_redis = FakeRedis()
+        service = make_poller(["one", "two"], fake_redis)
+        fake_redis.mget_response_override = response
+
+        self.run_poll(service, join=2, leave=2)
+
+        assert service.test_side_effects.final_outcomes == [
+            "online_snapshot_failed"
+        ]
+        assert not [
+            execution
+            for execution in fake_redis.pipeline_executions
+            if execution["phase"] == "online_refresh"
+        ]
+        assert service.test_side_effects.lifecycle_publications == []
+        assert service.test_side_effects.desired_publications == []
+        assert service.test_side_effects.reconciler_notifications == 0
+
+    def test_refresh_uses_one_non_transactional_ranking_order_pipeline(self):
+        fake_redis = FakeRedis()
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[("first", 101), ("second", 202)],
+        )
+
+        self.run_poll(service, join=2, leave=2)
+
+        refresh = next(
+            execution
+            for execution in fake_redis.pipeline_executions
+            if execution["phase"] == "online_refresh"
+        )
+        assert refresh["transaction"] is False
+        assert refresh["raise_on_error"] is True
+        assert refresh["commands"] == [
+            (
+                "setex",
+                ("streamer:online:first", 180, 101),
+                {},
+            ),
+            (
+                "setex",
+                ("streamer:online:second", 180, 202),
+                {},
+            ),
+        ]
+
+    def test_repeated_login_uses_first_event_identity_and_last_refresh_value(self):
+        fake_redis = FakeRedis()
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[
+                ("Duplicate", 101),
+                ("other", 202),
+                ("duplicate", 303),
+            ],
+        )
+
+        self.run_poll(service, join=3, leave=3)
+
+        assert fake_redis.mget_requests == [[
+            "streamer:online:duplicate",
+            "streamer:online:other",
+        ]]
+        assert fake_redis.strings["streamer:online:duplicate"] == "303"
+        assert [
+            event
+            for event in service.test_side_effects.lifecycle_publications
+            if event[2] == "duplicate"
+        ] == [("online", 101, "duplicate", 1)]
+
+    def test_entry_outside_band_and_stable_channels_use_pre_refresh_snapshot(self):
+        fake_redis = FakeRedis()
+        fake_redis.strings["streamer:online:stable"] = "303"
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[
+                ("inside", 101),
+                ("outside", 202),
+                ("stable", 303),
+            ],
+        )
+
+        self.run_poll(service, join=1, leave=3)
+
+        assert service.test_side_effects.lifecycle_publications == [
+            ("online", 101, "inside", 1)
+        ]
+        assert fake_redis.strings["streamer:online:outside"] == "202"
+        assert fake_redis.strings["streamer:online:stable"] == "303"
+
+    def test_departed_present_is_silent_and_departed_absent_uses_previous_id(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("present", 101), ("expired", 202)])
+        fake_redis.strings["streamer:online:present"] = "101"
+        service = make_poller([], fake_redis)
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert service.test_side_effects.lifecycle_publications == [
+            ("offline", 202, "expired", 0)
+        ]
+
+    def test_invalid_departed_ids_suppress_only_corrupt_offline_events(
+        self, caplog
+    ):
+        fake_redis = FakeRedis()
+        fake_redis.zsets[DESIRED_KEY] = {
+            "missing": 1.0,
+            "nonnumeric": 2.0,
+            "zero": 3.0,
+            "negative": 4.0,
+            "valid": 5.0,
+        }
+        fake_redis.hashes[DESIRED_IDS_KEY] = {
+            "nonnumeric": "bad",
+            "zero": "0",
+            "negative": "-1",
+            "valid": "505",
+        }
+        fake_redis.strings[DESIRED_GENERATION_KEY] = "7"
+        service = make_poller([], fake_redis)
+
+        with caplog.at_level(logging.ERROR):
+            self.run_poll(service, join=1, leave=5)
+
+        assert service.test_side_effects.lifecycle_publications == [
+            ("offline", 505, "valid", 0)
+        ]
+        integrity_records = [
+            record
+            for record in caplog.records
+            if record.message == "Offline lifecycle event suppressed: invalid previous id"
+        ]
+        assert {record.broadcaster_login for record in integrity_records} == {
+            "missing",
+            "nonnumeric",
+            "zero",
+            "negative",
+        }
+        assert all(
+            event[1] > 0
+            for event in service.test_side_effects.lifecycle_publications
+        )
+
+    @pytest.mark.parametrize(
+        ("error", "expected_counter_label"),
+        [
+            (asyncio.TimeoutError(), "get_streams_timeout"),
+            (RuntimeError("ranking failed"), "poll_streams"),
+        ],
+    )
+    def test_ranking_failure_stops_all_downstream_work(
+        self, error, expected_counter_label
+    ):
+        fake_redis = FakeRedis()
+        service = make_poller([], fake_redis, twitch_error=error)
+        counter = stream_monitoring_service.twitch_api_errors_total.labels(
+            error_type=expected_counter_label
+        )
+        before = counter._value.get()
+
+        self.run_poll(service)
+
+        assert service.test_side_effects.final_outcomes == ["ranking_failed"]
+        assert service.db_pool.getconn_count == 0
+        assert fake_redis.dispatches == []
+        assert service.test_side_effects.lifecycle_publications == []
+        assert service.test_side_effects.desired_publications == []
+        assert service.test_side_effects.reconciler_notifications == 0
+        assert counter._value.get() - before == 1
+
+    def test_desired_read_failure_stops_metadata_and_state_work(self):
+        fake_redis = FakeRedis()
+        service = make_poller(
+            ["one"],
+            fake_redis,
+            desired_read_error=ConnectionError("desired read failed"),
+        )
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert service.test_side_effects.final_outcomes == [
+            "desired_read_failed"
+        ]
+        assert service.db_pool.getconn_count == 0
+        assert fake_redis.dispatches == []
+        assert service.test_side_effects.desired_publications == []
+
+    def test_snapshot_transport_failure_keeps_metadata_but_suppresses_downstream(self):
+        fake_redis = FakeRedis()
+        service = make_poller(["one"], fake_redis)
+        fake_redis.fail_on = {"mget"}
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert service.db_pool.connection.commit_count == 1
+        assert service.test_side_effects.final_outcomes == [
+            "online_snapshot_failed"
+        ]
+        assert service.test_side_effects.lifecycle_publications == []
+        assert service.test_side_effects.desired_publications == []
+
+    def test_refresh_failure_before_application_suppresses_all_downstream(self):
+        fake_redis = FakeRedis()
+        fake_redis.inject_pipeline_failure("online_refresh", when="before")
+        service = make_poller(["one"], fake_redis)
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert "streamer:online:one" not in fake_redis.strings
+        assert service.test_side_effects.final_outcomes == [
+            "online_refresh_failed"
+        ]
+        assert service.test_side_effects.lifecycle_publications == []
+        assert service.test_side_effects.desired_publications == []
+        assert service.test_side_effects.reconciler_notifications == 0
+
+    def test_refresh_ack_loss_can_leave_keys_but_suppresses_downstream(self):
+        fake_redis = FakeRedis()
+        fake_redis.inject_pipeline_failure("online_refresh", when="after")
+        service = make_poller(["one"], fake_redis)
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert fake_redis.strings["streamer:online:one"] == "1000"
+        assert service.test_side_effects.final_outcomes == [
+            "online_refresh_failed"
+        ]
+        assert service.test_side_effects.lifecycle_publications == []
+        assert service.test_side_effects.desired_publications == []
+        assert service.test_side_effects.reconciler_notifications == 0
+
+    def test_acknowledged_element_error_can_apply_other_refreshes_but_fails_phase(self):
+        fake_redis = FakeRedis()
+        fake_redis.inject_pipeline_response_error(
+            "online_refresh", 1, ResponseError("bad second key")
+        )
+        service = make_poller(["one", "two", "three"], fake_redis)
+
+        self.run_poll(service, join=3, leave=3)
+
+        assert fake_redis.strings["streamer:online:one"] == "1000"
+        assert "streamer:online:two" not in fake_redis.strings
+        assert fake_redis.strings["streamer:online:three"] == "1002"
+        assert service.test_side_effects.final_outcomes == [
+            "online_refresh_failed"
+        ]
+        assert service.test_side_effects.lifecycle_publications == []
+        assert service.test_side_effects.desired_publications == []
+
+    @pytest.mark.parametrize("after_apply", [False, True])
+    def test_desired_publish_failure_keeps_lifecycle_and_re_reads_visible_intent(
+        self, after_apply
+    ):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("old", 90)])
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[("new", 101)],
+            desired_publish_error=ConnectionError("desired publish failed"),
+            desired_publish_error_after_apply=after_apply,
+        )
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert service.test_side_effects.lifecycle_publications == [
+            ("online", 101, "new", 1),
+            ("offline", 90, "old", 0),
+        ]
+        assert service.test_side_effects.final_outcomes == [
+            "desired_publish_failed"
+        ]
+        assert service.test_side_effects.reconciler_notifications == 0
+        visible = RedisDesiredSetStore(fake_redis).read()
+        assert visible.logins == (["new"] if after_apply else ["old"])
+
+        service.desired_store.publish_error = None
+        self.run_poll(service, join=1, leave=1)
+
+        assert service.test_side_effects.final_outcomes[-1] == "success"
+        assert RedisDesiredSetStore(fake_redis).read().logins == ["new"]
+
+    def test_recovery_after_failed_interval_uses_only_current_visible_state(self):
+        fake_redis = FakeRedis()
+        fake_redis.inject_pipeline_failure("online_refresh", when="after")
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[("inside", 101), ("outside", 202)],
+        )
+
+        self.run_poll(service, join=1, leave=2)
+        fake_redis.delete(
+            "streamer:online:inside",
+            "streamer:online:outside",
+        )
+        service.test_side_effects.lifecycle_publications.clear()
+        self.run_poll(service, join=1, leave=2)
+
+        assert service.test_side_effects.final_outcomes == [
+            "online_refresh_failed",
+            "success",
+        ]
+        assert service.test_side_effects.lifecycle_publications == [
+            ("online", 101, "inside", 1)
+        ]
+        assert fake_redis.strings["streamer:online:outside"] == "202"
+
+    def test_empty_empty_omits_metadata_snapshot_refresh_but_publishes_empty_intent(self):
+        fake_redis = FakeRedis()
+        service = make_poller([], fake_redis)
+        self.clear_dispatches(fake_redis)
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert service.db_pool.getconn_count == 0
+        assert fake_redis.mget_requests == []
+        assert not [
+            execution
+            for execution in fake_redis.pipeline_executions
+            if execution["phase"] == "online_refresh"
+        ]
+        assert len(service.test_side_effects.desired_publications) == 1
+        assert service.test_side_effects.desired_publications[0][0] == {}
+
+    def test_departures_only_uses_one_snapshot_no_metadata_or_refresh(self):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("gone", 99)])
+        service = make_poller([], fake_redis)
+        self.clear_dispatches(fake_redis)
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert service.db_pool.getconn_count == 0
+        assert fake_redis.mget_requests == [["streamer:online:gone"]]
+        assert not [
+            execution
+            for execution in fake_redis.pipeline_executions
+            if execution["phase"] == "online_refresh"
+        ]
+        assert service.test_side_effects.lifecycle_publications == [
+            ("offline", 99, "gone", 0)
+        ]
+        assert len(service.test_side_effects.desired_publications) == 1
+
+    def test_metadata_failure_continues_healthy_state_intent_and_notification(self):
+        fake_redis = FakeRedis()
+        reconciler = MagicMock()
+        connection = CountingConnection(
+            execute_error=ValueError("poison metadata")
+        )
+        service = make_poller(
+            ["one"],
+            fake_redis,
+            reconciler=reconciler,
+            pool=CountingPool(connection),
+        )
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert connection.rollback_count == 1
+        assert fake_redis.strings["streamer:online:one"] == "1000"
+        assert service.test_side_effects.lifecycle_publications == [
+            ("online", 1000, "one", 1)
+        ]
+        assert len(service.test_side_effects.desired_publications) == 1
+        assert service.test_side_effects.reconciler_notifications == 1
+        assert service.test_side_effects.final_outcomes == ["metadata_failed"]
+
+    @pytest.mark.parametrize(
+        ("fatal_phase", "expected_outcome"),
+        [
+            ("snapshot", "online_snapshot_failed"),
+            ("desired_publish", "desired_publish_failed"),
+        ],
+    )
+    def test_fatal_phase_outcome_takes_precedence_over_metadata_failure(
+        self, fatal_phase, expected_outcome
+    ):
+        fake_redis = FakeRedis()
+        if fatal_phase == "snapshot":
+            fake_redis.fail_on = {"mget"}
+        service = make_poller(
+            ["one"],
+            fake_redis,
+            pool=CountingPool(
+                CountingConnection(
+                    execute_error=ValueError("metadata poison")
+                )
+            ),
+            desired_publish_error=(
+                ConnectionError("desired publish failed")
+                if fatal_phase == "desired_publish"
+                else None
+            ),
+        )
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert service.test_side_effects.final_outcomes == [expected_outcome]
+        assert service._metadata_consecutive_failures == 1
+        assert service.test_side_effects.reconciler_notifications == 0
+
+
+class TestFeature006DriverFoundation:
+    @staticmethod
+    def driver_args(driver, command, output, *extra):
+        return driver.build_parser().parse_args([
+            command,
+            "--redis-url",
+            "redis://isolated-host:6379/15",
+            "--postgres-url",
+            "postgresql://isolated-host/twitch_test",
+            "--namespace",
+            "feature006-test",
+            "--confirm-isolated-targets",
+            "--runtime-factory",
+            "unused:test_factory",
+            "--run-id",
+            "offline-command-test",
+            "--output",
+            str(output),
+            *extra,
+        ])
+
+    def test_fixture_modules_import_and_build_repeatable_disjoint_rankings(self):
+        fixtures = importlib.import_module("phase5.feature006_fixtures")
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        first_a = fixtures.build_ranking_fixture(
+            500,
+            "A",
+            disabled_proportion=0.2,
+            page_delay_ms=75.0,
+        )
+        second_a = fixtures.build_ranking_fixture(
+            500,
+            "A",
+            disabled_proportion=0.2,
+            page_delay_ms=75.0,
+        )
+        fixture_b = fixtures.build_ranking_fixture(
+            500,
+            "B",
+            disabled_proportion=0.2,
+            page_delay_ms=75.0,
+        )
+
+        assert first_a == second_a
+        assert len(first_a.eligible_records) == 500
+        assert first_a.page_size == 100
+        assert all(len(page) <= 100 for page in first_a.pages)
+        assert first_a.disabled_records > 0
+        assert first_a.test_join_threshold == 500
+        assert first_a.test_leave_threshold == 500
+        assert first_a.test_fetch_buffer == first_a.disabled_records
+        assert {
+            record.streamer_id for record in first_a.records
+        }.isdisjoint({
+            record.streamer_id for record in fixture_b.records
+        })
+        assert {
+            record.login for record in first_a.records
+        }.isdisjoint({
+            record.login for record in fixture_b.records
+        })
+        assert driver.fixture_summary(first_a)["eligible_records"] == 500
+
+    def test_driver_supports_direct_help_and_package_import(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        script = (
+            Path(__file__).parent
+            / "phase5"
+            / "feature006_driver.py"
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert "operation-counts" in result.stdout
+        assert {
+            action.dest
+            for action in driver.build_parser()._actions
+        } >= {"help", "command"}
+
+    def test_jsonl_envelope_percentile_and_bounded_record_kinds(self, tmp_path):
+        driver = importlib.import_module("phase5.feature006_driver")
+        output = tmp_path / "evidence.jsonl"
+        writer = driver.JsonlWriter(output, run_id="test-run")
+
+        row = writer.write(
+            "operation-counts",
+            {"case": "stable", "scale": 50},
+        )
+
+        assert driver.nearest_rank_p95(list(range(20, 0, -1))) == 19
+        assert row["schema"] == "stream-scout.feature006.v1"
+        assert row["run_id"] == "test-run"
+        assert row["kind"] == "operation-counts"
+        assert datetime.fromisoformat(row["timestamp"]).tzinfo is not None
+        assert json.loads(output.read_text()) == row
+        with pytest.raises(ValueError, match="record kind"):
+            writer.write("login-name-as-kind", {})
+
+    @pytest.mark.parametrize(
+        ("redis_url", "postgres_url", "namespace"),
+        [
+            (None, "postgresql://host/twitch_test", "feature006-run"),
+            ("redis://host:6379/0", "postgresql://host/twitch_test", "feature006-run"),
+            ("redis://host:6379/15", "postgresql://host/twitch", "feature006-run"),
+            ("redis://host:6379/15", "postgresql://host/twitch_test", "production"),
+        ],
+    )
+    def test_isolated_target_preflight_rejects_missing_or_unsafe_targets(
+        self, redis_url, postgres_url, namespace
+    ):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        with pytest.raises(ValueError, match="isolated"):
+            driver.validate_isolated_targets(
+                redis_url=redis_url,
+                postgres_url=postgres_url,
+                namespace=namespace,
+                isolation_acknowledged=True,
+            )
+
+    @pytest.mark.parametrize(
+        ("redis_url", "postgres_url", "namespace"),
+        [
+            (
+                "redis://production.example:6379/15",
+                "postgresql://isolated.example/twitch_test",
+                "feature006-test",
+            ),
+            (
+                "redis://isolated.example:6379/15",
+                "postgresql://production.example/contest",
+                "feature006-test",
+            ),
+            (
+                "redis://isolated.example:6379/15",
+                "postgresql://isolated.example/twitch_test",
+                "contest-prod",
+            ),
+        ],
+    )
+    def test_isolation_preflight_rejects_production_marker_bypasses(
+        self, redis_url, postgres_url, namespace
+    ):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        with pytest.raises(ValueError, match="isolated"):
+            driver.validate_isolated_targets(
+                redis_url=redis_url,
+                postgres_url=postgres_url,
+                namespace=namespace,
+                isolation_acknowledged=True,
+            )
+
+    def test_isolation_preflight_requires_explicit_acknowledgement(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        with pytest.raises(ValueError, match="acknowledgement"):
+            driver.validate_isolated_targets(
+                redis_url="redis://isolated.example:6379/15",
+                postgres_url="postgresql://isolated.example/twitch_test",
+                namespace="feature006-test",
+                isolation_acknowledged=False,
+            )
+
+    def test_calibration_requires_twenty_samples_and_builds_exact_budgets(self):
+        fixtures = importlib.import_module("phase5.feature006_fixtures")
+        driver = importlib.import_module("phase5.feature006_driver")
+        fixture = fixtures.build_ranking_fixture(
+            500,
+            "A",
+            disabled_proportion=0.2,
+            page_delay_ms=20.0,
+        )
+
+        record = driver.build_calibration_record(
+            scale=500,
+            live_page_samples_ms=list(range(1, 21)),
+            fixture=fixture,
+            redis_rtt_samples_ms=[50.0] * 20,
+            postgres_rtt_samples_ms=[75.0] * 20,
+        )
+
+        assert record["live_page_p95_ms"] == 19
+        assert record["fixture_page_delay_ms"] == 20.0
+        assert record["eligible_records"] == 500
+        assert record["raw_records"] == len(fixture.records)
+        assert record["disabled_records"] == fixture.disabled_records
+        assert record["page_size"] == 100
+        assert record["page_count"] == len(fixture.pages)
+        assert record["ranking_budget_ms"] == len(fixture.pages) * 20.0
+        assert record["non_ranking_budget_ms"] == (
+            5000 - record["ranking_budget_ms"]
+        )
+        assert record["redis_median_ms"] == 50.0
+        assert record["postgres_median_ms"] == 75.0
+        assert record["acceptance_valid"] is True
+
+        with pytest.raises(ValueError, match="20"):
+            driver.build_calibration_record(
+                scale=500,
+                live_page_samples_ms=[1.0] * 19,
+                fixture=fixture,
+                redis_rtt_samples_ms=[50.0] * 20,
+                postgres_rtt_samples_ms=[75.0] * 20,
+            )
+
+    def test_profile_measurements_replace_excluded_whole_polls(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        attempts = [
+            {
+                "duration_ms": 100.0,
+                "excluded": False,
+                "outcome": "success",
+                "observed_eligible_records": 500,
+                "effective_join_threshold": 500,
+                "effective_leave_threshold": 500,
+                "effective_fetch_buffer": 125,
+                "phase_durations_ms": {"ranking_fetch": 10.0},
+                "dispatch_counts": {"metadata_execute": 1},
+                "overlap_skip_count": 0,
+            },
+            {
+                "duration_ms": 999.0,
+                "excluded": True,
+                "phase_durations_ms": {},
+                "dispatch_counts": {},
+                "overlap_skip_count": 0,
+            },
+        ] + [
+            {
+                "duration_ms": float(index),
+                "excluded": False,
+                "outcome": "success",
+                "observed_eligible_records": 500,
+                "effective_join_threshold": 500,
+                "effective_leave_threshold": 500,
+                "effective_fetch_buffer": 125,
+                "phase_durations_ms": {"ranking_fetch": float(index) / 2},
+                "dispatch_counts": {"metadata_execute": 1},
+                "overlap_skip_count": 0,
+            }
+            for index in range(1, 21)
+        ]
+        prepared = []
+
+        record = driver.run_profile_measurements(
+            scale=500,
+            profile="stable",
+            warmups=1,
+            measured_polls=20,
+            prepare_state=prepared.append,
+            run_poll=lambda fixture_id: attempts.pop(0),
+        )
+
+        assert record["warmup_duration_ms"] == 100.0
+        assert record["measured_durations_ms"] == [
+            float(index) for index in range(1, 21)
+        ]
+        assert record["nearest_rank_p95_ms"] == 19.0
+        assert record["excluded_poll_count"] == 1
+        assert record["overlap_skip_count"] == 0
+        assert set(prepared) == {"A"}
+        assert attempts == []
+
+    def test_turnover_profile_alternates_disjoint_fixture_ids(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        prepared = []
+
+        record = driver.run_profile_measurements(
+            scale=900,
+            profile="complete_turnover",
+            warmups=1,
+            measured_polls=20,
+            prepare_state=prepared.append,
+            run_poll=lambda fixture_id: {
+                "duration_ms": 10.0,
+                "excluded": False,
+                "outcome": "success",
+                "observed_eligible_records": 900,
+                "effective_join_threshold": 900,
+                "effective_leave_threshold": 900,
+                "effective_fetch_buffer": 225,
+                "phase_durations_ms": {"ranking_fetch": 1.0},
+                "dispatch_counts": {"metadata_execute": 1},
+                "overlap_skip_count": 0,
+            },
+        )
+
+        assert record["profile"] == "complete_turnover"
+        assert prepared[1:5] == ["A", "B", "A", "B"]
+        assert len(record["measured_durations_ms"]) == 20
+
+    def test_profile_rejects_a_runtime_that_processed_the_wrong_scale(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        with pytest.raises(ValueError, match="observed eligible"):
+            driver.run_profile_measurements(
+                scale=500,
+                profile="stable",
+                warmups=1,
+                measured_polls=20,
+                prepare_state=lambda _fixture_id: None,
+                run_poll=lambda _fixture_id: {
+                    "duration_ms": 1.0,
+                    "excluded": False,
+                    "outcome": "success",
+                    "observed_eligible_records": 300,
+                    "effective_join_threshold": 500,
+                    "effective_leave_threshold": 500,
+                    "effective_fetch_buffer": 125,
+                    "phase_durations_ms": {},
+                    "dispatch_counts": {},
+                    "overlap_skip_count": 0,
+                },
+            )
+
+    def test_profile_rejects_a_caught_failed_poll_outcome(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        with pytest.raises(ValueError, match="successful poll outcome"):
+            driver.run_profile_measurements(
+                scale=500,
+                profile="stable",
+                warmups=1,
+                measured_polls=20,
+                prepare_state=lambda _fixture_id: None,
+                run_poll=lambda _fixture_id: {
+                    "duration_ms": 1.0,
+                    "excluded": False,
+                    "outcome": "desired_publish_failed",
+                    "observed_eligible_records": 500,
+                    "effective_join_threshold": 500,
+                    "effective_leave_threshold": 500,
+                    "effective_fetch_buffer": 125,
+                    "phase_durations_ms": {},
+                    "dispatch_counts": {},
+                    "overlap_skip_count": 0,
+                },
+            )
+
+    def test_pass_callback_gap_and_scheduler_event_recording(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        production_counts = []
+        recorded_counts = []
+        callback = driver.compose_pass_callbacks(
+            production_counts.append,
+            recorded_counts.append,
+        )
+
+        callback(500)
+
+        assert production_counts == [500]
+        assert recorded_counts == [500]
+        assert driver.adjacent_gaps_ms(
+            [1_000_000_000, 2_500_000_000, 5_000_000_000]
+        ) == [1500.0, 2500.0]
+
+        from apscheduler.events import (
+            EVENT_JOB_ERROR,
+            EVENT_JOB_EXECUTED,
+            EVENT_JOB_MAX_INSTANCES,
+            EVENT_JOB_MISSED,
+        )
+
+        recorder = driver.SchedulerEventRecorder(clock_ns=lambda: 123)
+        for code in (
+            EVENT_JOB_EXECUTED,
+            EVENT_JOB_ERROR,
+            EVENT_JOB_MISSED,
+            EVENT_JOB_MAX_INSTANCES,
+        ):
+            recorder.record(type("Event", (), {"code": code})())
+
+        assert [event["kind"] for event in recorder.events] == [
+            "executed",
+            "error",
+            "missed",
+            "max_instances",
+        ]
+        assert all(event["monotonic_ns"] == 123 for event in recorder.events)
+
+    def test_recording_transport_delegates_and_records_rate_limit_and_progress(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        class Delegate:
+            def __init__(self):
+                self.create_calls = []
+                self.delete_calls = []
+                self.rate_limit_next = False
+
+            async def list(self):
+                for value in ("one", "two"):
+                    yield value
+
+            async def create(self, broadcaster_id):
+                self.create_calls.append(broadcaster_id)
+                if self.rate_limit_next:
+                    self.rate_limit_next = False
+                    raise RateLimitedError(retry_after=10.0)
+                return f"subscription-{broadcaster_id}"
+
+            async def delete(self, subscription_id):
+                self.delete_calls.append(subscription_id)
+                return True
+
+        async def exercise():
+            delegate = Delegate()
+            ticks = iter(range(100, 1000, 100))
+            proxy = driver.RecordingTransportProxy(
+                delegate, clock_ns=lambda: next(ticks)
+            )
+            assert [item async for item in proxy.list()] == ["one", "two"]
+            assert await proxy.create(1) == "subscription-1"
+            delegate.rate_limit_next = True
+            with pytest.raises(RateLimitedError):
+                await proxy.create(2)
+            assert await proxy.delete("subscription-1") is True
+            proxy.record_backoff(
+                seconds=10.0,
+                coverage_before=1,
+                coverage_after=2,
+            )
+            return delegate, proxy
+
+        delegate, proxy = asyncio.run(exercise())
+
+        assert delegate.create_calls == [1, 2]
+        assert delegate.delete_calls == ["subscription-1"]
+        assert len(proxy.accepted_creates) == 1
+        assert len(proxy.rate_limit_events) == 1
+        assert proxy.backoff_events[0]["coverage_after"] == 2
+
+    def test_strict_evidence_validation_rejects_missing_contract_fields(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        valid_records = {
+            "calibration": {
+                "scale": 500,
+                "live_page_samples_ms": [50.0] * 20,
+                "live_page_p95_ms": 50.0,
+                "fixture_page_delay_ms": 50.0,
+                "raw_records": 625,
+                "disabled_records": 125,
+                "disabled_proportion": 0.2,
+                "eligible_records": 500,
+                "page_size": 100,
+                "page_count": 7,
+                "ranking_budget_ms": 350.0,
+                "non_ranking_budget_ms": 4650.0,
+                "redis_rtt_samples_ms": [50.0] * 20,
+                "redis_median_ms": 50.0,
+                "postgres_rtt_samples_ms": [75.0] * 20,
+                "postgres_median_ms": 75.0,
+            },
+            "poll-profile": {
+                "scale": 500,
+                "profile": "stable",
+                "warmup_outcome": "success",
+                "poll_outcomes": ["success"] * 20,
+                "observed_eligible_records": [500] * 20,
+                "test_join_threshold": 500,
+                "test_leave_threshold": 500,
+                "test_fetch_buffer": 125,
+                "warmup_duration_ms": 100.0,
+                "measured_durations_ms": [100.0] * 20,
+                "nearest_rank_p95_ms": 100.0,
+                "overlap_skip_count": 0,
+                "excluded_poll_count": 0,
+                "phase_durations_ms": {
+                    phase: [1.0] * 20
+                    for phase in (
+                        "ranking_fetch",
+                        "metadata_persistence",
+                        "online_snapshot",
+                        "online_refresh",
+                        "lifecycle_publication",
+                        "desired_set_publication",
+                    )
+                },
+                "dispatch_counts": {
+                    "metadata_execute": [1] * 20,
+                    "metadata_commit": [1] * 20,
+                    "online_snapshot_mget": [1] * 20,
+                    "online_refresh_execute": [1] * 20,
+                },
+            },
+            "reconciler-gap": {
+                "scale": 500,
+                "post_convergence_started_at": "2026-08-31T00:00:00+00:00",
+                "run_duration_seconds": 1800,
+                "run_started_monotonic_ns": 0,
+                "run_ended_monotonic_ns": 1_800_000_000_000,
+                "converged_subscription_count": 500,
+                "pass_completion_monotonic_ns": [
+                    5_000_000_000,
+                    1_795_000_000_000,
+                ],
+                "pass_completion_subscription_counts": [500, 500],
+                "adjacent_gaps_ms": [1_790_000.0],
+                "boundary_gaps_ms": [5_000.0, 5_000.0],
+                "maximum_gap_ms": 1_790_000.0,
+                "scheduler_events": [
+                    {
+                        "kind": "executed",
+                        "monotonic_ns": index,
+                        "job_id": "poll_streams",
+                    }
+                    for index in range(15)
+                ],
+            },
+            "cold-start": {
+                "target": 900,
+                "initialization_complete_at": "2026-08-31T00:00:00+00:00",
+                "initial_subscription_count": 0,
+                "rate_limit_events": [{"at": 1}],
+                "backoff_events": [{"coverage_before": 1, "coverage_after": 2}],
+                "accepted_create_windows": [{"before": 1, "after": 2}],
+                "subscription_count_by_window": [1, 2],
+                "poll_start_end_monotonic_ns": [[1, 2]],
+                "poll_durations_ms": [0.000001],
+                "overlap_skip_count": 0,
+                "scheduler_events": [
+                    {
+                        "kind": "executed",
+                        "monotonic_ns": 2,
+                        "job_id": "poll_streams",
+                    }
+                ],
+                "effective_reconciler_config": {
+                    "concurrency": 10,
+                    "idle_timeout_seconds": 5.0,
+                    "rate_limit_backoff_seconds": 10.0,
+                    "max_retry_rounds": 20,
+                    "readopt_interval_seconds": 300.0,
+                    "adopt_retry_seconds": 30.0,
+                },
+                "final_subscription_count": 2,
+            },
+        }
+
+        for kind, fields in valid_records.items():
+            assert driver.validate_evidence_record(kind, fields) == fields
+            incomplete = dict(fields)
+            incomplete.pop(next(iter(fields)))
+            with pytest.raises(ValueError, match="missing"):
+                driver.validate_evidence_record(kind, incomplete)
+
+        no_passes = dict(valid_records["reconciler-gap"])
+        no_passes["pass_completion_monotonic_ns"] = []
+        no_passes["adjacent_gaps_ms"] = []
+        no_passes["boundary_gaps_ms"] = []
+        no_passes["maximum_gap_ms"] = 0.0
+        with pytest.raises(ValueError, match="pass completions"):
+            driver.validate_evidence_record("reconciler-gap", no_passes)
+
+        no_backoff = dict(valid_records["cold-start"])
+        no_backoff["rate_limit_events"] = []
+        with pytest.raises(ValueError, match="rate-limit"):
+            driver.validate_evidence_record("cold-start", no_backoff)
+
+        missed_poll = dict(valid_records["cold-start"])
+        missed_poll["scheduler_events"] = [
+            {
+                "kind": "missed",
+                "monotonic_ns": 2,
+                "job_id": "poll_streams",
+            }
+        ]
+        with pytest.raises(ValueError, match="scheduler failure"):
+            driver.validate_evidence_record("cold-start", missed_poll)
+
+        modified_policy = dict(valid_records["cold-start"])
+        modified_policy["effective_reconciler_config"] = {
+            **modified_policy["effective_reconciler_config"],
+            "rate_limit_backoff_seconds": 0.0,
+        }
+        with pytest.raises(ValueError, match="production policy"):
+            driver.validate_evidence_record("cold-start", modified_policy)
+
+        wrong_scale = dict(valid_records["reconciler-gap"])
+        wrong_scale["converged_subscription_count"] = 300
+        with pytest.raises(ValueError, match="subscription count"):
+            driver.validate_evidence_record("reconciler-gap", wrong_scale)
+
+    def test_steady_state_boundary_gap_detects_a_reconciler_that_stops_early(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        scheduler_events = [
+            {
+                "kind": "executed",
+                "monotonic_ns": index,
+                "job_id": "poll_streams",
+            }
+            for index in range(15)
+        ]
+
+        record = driver.build_reconciler_gap_record(
+            scale=500,
+            post_convergence_started_at="2026-08-31T00:00:00Z",
+            run_duration_seconds=1800,
+            run_started_monotonic_ns=0,
+            run_ended_monotonic_ns=1_800_000_000_000,
+            converged_subscription_count=500,
+            pass_completion_monotonic_ns=[
+                5_000_000_000,
+                10_000_000_000,
+            ],
+            pass_completion_subscription_counts=[500, 500],
+            scheduler_events=scheduler_events,
+        )
+
+        assert record["adjacent_gaps_ms"] == [5_000.0]
+        assert record["boundary_gaps_ms"] == [
+            5_000.0,
+            1_790_000.0,
+        ]
+        assert record["maximum_gap_ms"] == 1_790_000.0
+
+    def test_operation_count_records_require_positive_exact_dispatches(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        successful = {
+            "clipping_execute": 1,
+            "redis_zrange": 1,
+            "redis_hgetall": 1,
+            "redis_get": 1,
+            "metadata_execute": 1,
+            "metadata_commit": 1,
+            "online_snapshot_mget": 1,
+            "online_refresh_execute": 1,
+            "desired_publication_execute": 1,
+        }
+
+        record = driver.build_operation_count_record(
+            case="stable",
+            scale=500,
+            counts=successful,
+            outcome="success",
+            observed_eligible_records=500,
+            effective_join_threshold=500,
+            effective_leave_threshold=500,
+            effective_fetch_buffer=0,
+        )
+
+        assert record["acceptance_valid"] is True
+        assert record["dispatch_counts"] == successful
+        for boundary in (
+            "metadata_execute",
+            "metadata_commit",
+            "online_snapshot_mget",
+            "online_refresh_execute",
+        ):
+            invalid = dict(successful)
+            invalid[boundary] = 0
+            with pytest.raises(ValueError, match=boundary):
+                driver.build_operation_count_record(
+                    case="stable",
+                    scale=500,
+                    counts=invalid,
+                    outcome="success",
+                    observed_eligible_records=500,
+                    effective_join_threshold=500,
+                    effective_leave_threshold=500,
+                    effective_fetch_buffer=0,
+                )
+        unexpected = dict(successful)
+        unexpected["redis_exists"] = 500
+        with pytest.raises(ValueError, match="unexpected"):
+            driver.build_operation_count_record(
+                case="stable",
+                scale=500,
+                counts=unexpected,
+                outcome="success",
+                observed_eligible_records=500,
+                effective_join_threshold=500,
+                effective_leave_threshold=500,
+                effective_fetch_buffer=0,
+            )
+        with pytest.raises(ValueError, match="observed"):
+            driver.build_operation_count_record(
+                case="stable",
+                scale=500,
+                counts=successful,
+                outcome="success",
+                observed_eligible_records=300,
+                effective_join_threshold=500,
+                effective_leave_threshold=500,
+                effective_fetch_buffer=0,
+            )
+        with pytest.raises(ValueError, match="successful poll outcome"):
+            driver.build_operation_count_record(
+                case="stable",
+                scale=500,
+                counts=successful,
+                outcome="desired_publish_failed",
+                observed_eligible_records=500,
+                effective_join_threshold=500,
+                effective_leave_threshold=500,
+                effective_fetch_buffer=0,
+            )
+
+    def test_driver_proxies_count_actual_dispatch_boundaries(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        counter = driver.OperationCounter()
+        redis_proxy = driver.RedisDispatchProxy(FakeRedis(), counter)
+
+        redis_proxy.zrange("chat:desired", 0, -1)
+        redis_proxy.hgetall("chat:desired:ids")
+        redis_proxy.get("chat:desired:generation")
+        redis_proxy.mget(["streamer:online:first"])
+        refresh = redis_proxy.pipeline(transaction=False)
+        refresh.setex("streamer:online:first", 180, 1)
+        refresh.setex("streamer:online:second", 180, 2)
+        refresh.execute()
+        desired = redis_proxy.pipeline()
+        desired.delete("chat:desired")
+        desired.incr("chat:desired:generation")
+        desired.execute()
+
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor_proxy = driver.CursorDispatchProxy(cursor, counter)
+        cursor_proxy.execute(
+            "SELECT streamer_id FROM streamers "
+            "WHERE allows_clipping = FALSE"
+        )
+        cursor_proxy.execute(
+            "INSERT INTO streamers (streamer_id) VALUES (1) "
+            "ON CONFLICT (streamer_id) DO UPDATE SET streamer_id = EXCLUDED.streamer_id"
+        )
+        connection = MagicMock()
+        connection_proxy = driver.ConnectionDispatchProxy(
+            connection, counter
+        )
+        connection_proxy.commit()
+
+        assert counter.report() == dict(
+            driver.NON_EMPTY_DISPATCH_COUNTS
+        )
+
+    @pytest.mark.parametrize(
+        ("case", "snapshot_count"),
+        [("empty-empty", 0), ("departures-only", 1)],
+    )
+    def test_empty_operation_count_records_enforce_required_omissions(
+        self, case, snapshot_count
+    ):
+        driver = importlib.import_module("phase5.feature006_driver")
+
+        record = driver.build_operation_count_record(
+            case=case,
+            scale=None,
+            counts={
+                "redis_zrange": 1,
+                "redis_hgetall": 1,
+                "redis_get": 1,
+                "online_snapshot_mget": snapshot_count,
+                "desired_publication_execute": 1,
+            },
+            outcome="success",
+            observed_eligible_records=0,
+            effective_join_threshold=1,
+            effective_leave_threshold=1,
+            effective_fetch_buffer=0,
+        )
+
+        assert record["dispatch_counts"]["metadata_execute"] == 0
+        assert record["dispatch_counts"]["online_snapshot_mget"] == snapshot_count
+        assert record["dispatch_counts"]["online_refresh_execute"] == 0
+        assert record["dispatch_counts"]["desired_publication_execute"] == 1
+        assert record["acceptance_valid"] is True
+
+    def test_operation_counts_command_orchestrates_every_scale_and_empty_case(
+        self, tmp_path
+    ):
+        driver = importlib.import_module("phase5.feature006_driver")
+        output = tmp_path / "operation-counts.jsonl"
+        args = self.driver_args(
+            driver,
+            "operation-counts",
+            output,
+            "--scales",
+            "50",
+            "500",
+            "900",
+            "--case",
+            "stable",
+            "--case",
+            "complete-turnover",
+            "--case",
+            "empty-empty",
+            "--case",
+            "departures-only",
+        )
+
+        class Runtime:
+            async def run_operation_count(
+                self, *, case, scale, fixture, counter
+            ):
+                if case in {"stable", "complete_turnover"}:
+                    assert fixture.scale == scale
+                    expected = dict(driver.NON_EMPTY_DISPATCH_COUNTS)
+                    observed = scale
+                    join = leave = scale
+                    buffer = 0
+                else:
+                    expected = dict(driver.EMPTY_DISPATCH_COUNTS)
+                    if case == "departures_only":
+                        expected["online_snapshot_mget"] = 1
+                    observed = 0
+                    join = leave = 1
+                    buffer = 0
+                for boundary, count in expected.items():
+                    for _ in range(count):
+                        counter.increment(boundary)
+                return {
+                    "outcome": "success",
+                    "observed_eligible_records": observed,
+                    "effective_join_threshold": join,
+                    "effective_leave_threshold": leave,
+                    "effective_fetch_buffer": buffer,
+                }
+
+        asyncio.run(
+            driver._run_command(
+                args,
+                Runtime(),
+                driver.JsonlWriter(output, run_id=args.run_id),
+            )
+        )
+
+        records = [
+            json.loads(line) for line in output.read_text().splitlines()
+        ]
+        assert len(records) == 8
+        assert {record["kind"] for record in records} == {
+            "operation-counts"
+        }
+        assert all(record["acceptance_valid"] for record in records)
+
+    def test_operation_count_command_rejects_runtime_counter_disagreement(
+        self, tmp_path
+    ):
+        driver = importlib.import_module("phase5.feature006_driver")
+        output = tmp_path / "operation-counts.jsonl"
+        args = self.driver_args(
+            driver,
+            "operation-counts",
+            output,
+            "--scales",
+            "50",
+            "--case",
+            "stable",
+        )
+
+        class Runtime:
+            def run_operation_count(
+                self, *, case, scale, fixture, counter
+            ):
+                for boundary, count in (
+                    driver.NON_EMPTY_DISPATCH_COUNTS.items()
+                ):
+                    for _ in range(count):
+                        counter.increment(boundary)
+                return {
+                    "dispatch_counts": {},
+                    "outcome": "success",
+                    "observed_eligible_records": scale,
+                    "effective_join_threshold": scale,
+                    "effective_leave_threshold": scale,
+                    "effective_fetch_buffer": 0,
+                }
+
+        with pytest.raises(ValueError, match="disagree"):
+            asyncio.run(
+                driver._run_command(
+                    args,
+                    Runtime(),
+                    driver.JsonlWriter(output, run_id=args.run_id),
+                )
+            )
+
+    def test_calibrate_command_collects_live_and_datastore_samples(self, tmp_path):
+        driver = importlib.import_module("phase5.feature006_driver")
+        output = tmp_path / "calibration.jsonl"
+        args = self.driver_args(
+            driver,
+            "calibrate",
+            output,
+            "--minimum-page-samples",
+            "20",
+        )
+
+        class Runtime:
+            def __init__(self):
+                self.pages = 0
+                self.redis_calls = 0
+                self.postgres_calls = 0
+
+            async def fetch_live_page(self, *, first, cursor):
+                assert first == 100
+                self.pages += 1
+                return {"cursor": self.pages}
+
+            def redis_round_trip(self):
+                self.redis_calls += 1
+
+            def postgres_round_trip(self):
+                self.postgres_calls += 1
+
+            def observed_disabled_proportion(self):
+                return 0.2
+
+        runtime = Runtime()
+        asyncio.run(
+            driver._run_command(
+                args,
+                runtime,
+                driver.JsonlWriter(output, run_id=args.run_id),
+            )
+        )
+
+        records = [
+            json.loads(line) for line in output.read_text().splitlines()
+        ]
+        assert runtime.pages == 20
+        assert runtime.redis_calls == 20
+        assert runtime.postgres_calls == 20
+        assert [record["scale"] for record in records] == [500, 900]
+        assert all(record["eligible_records"] == record["scale"] for record in records)
+
+    def test_poll_profile_command_runs_warmup_and_twenty_complete_polls(
+        self, tmp_path
+    ):
+        fixtures = importlib.import_module("phase5.feature006_fixtures")
+        driver = importlib.import_module("phase5.feature006_driver")
+        calibration_path = tmp_path / "calibration.jsonl"
+        fixture = fixtures.build_ranking_fixture(
+            500,
+            "A",
+            disabled_proportion=0.2,
+            page_delay_ms=50.0,
+        )
+        calibration = driver.build_calibration_record(
+            500,
+            [50.0] * 20,
+            fixture,
+            [50.0] * 20,
+            [75.0] * 20,
+        )
+        driver.JsonlWriter(
+            calibration_path, run_id="calibration"
+        ).write("calibration", calibration)
+        output = tmp_path / "profile.jsonl"
+        args = self.driver_args(
+            driver,
+            "poll-profile",
+            output,
+            "--scale",
+            "500",
+            "--profile",
+            "stable",
+            "--warmups",
+            "1",
+            "--measured-polls",
+            "20",
+            "--calibration",
+            str(calibration_path),
+        )
+
+        class Runtime:
+            def __init__(self):
+                self.prepared = []
+                self.polls = 0
+
+            def prepare_profile_state(
+                self, *, profile, fixture, opposite_fixture
+            ):
+                assert profile == "stable"
+                assert fixture.fixture_id == "A"
+                assert opposite_fixture.fixture_id == "B"
+                self.prepared.append(fixture.fixture_id)
+
+            def run_profile_poll(self, fixture):
+                self.polls += 1
+                return {
+                    "excluded": False,
+                    "outcome": "success",
+                    "observed_eligible_records": 500,
+                    "effective_join_threshold": 500,
+                    "effective_leave_threshold": 500,
+                    "effective_fetch_buffer": fixture.test_fetch_buffer,
+                    "overlap_skip_count": 0,
+                    "phase_durations_ms": {
+                        phase: 1.0 for phase in driver.PROFILE_PHASES
+                    },
+                    "dispatch_counts": {
+                        "metadata_execute": 1,
+                        "metadata_commit": 1,
+                        "online_snapshot_mget": 1,
+                        "online_refresh_execute": 1,
+                    },
+                }
+
+        runtime = Runtime()
+        asyncio.run(
+            driver._run_command(
+                args,
+                runtime,
+                driver.JsonlWriter(output, run_id=args.run_id),
+            )
+        )
+
+        record = json.loads(output.read_text())
+        assert runtime.polls == 21
+        assert runtime.prepared == ["A"] * 21
+        assert len(record["measured_durations_ms"]) == 20
+        assert record["acceptance_valid"] is True
+
+    def test_steady_state_command_composes_callbacks_and_uses_direct_gaps(
+        self, tmp_path
+    ):
+        driver = importlib.import_module("phase5.feature006_driver")
+        output = tmp_path / "steady.jsonl"
+        args = self.driver_args(
+            driver,
+            "steady-state",
+            output,
+            "--scale",
+            "500",
+            "--minutes",
+            "30",
+        )
+
+        class Runtime:
+            def __init__(self):
+                self.production_counts = []
+                self.completion_times = [
+                    seconds * 1_000_000_000
+                    for seconds in range(10, 1800, 10)
+                ]
+                self._clocks = iter(
+                    [0, *self.completion_times, 1_800_000_000_000]
+                )
+                self.production_pass_callback = self.production_counts.append
+
+            def monotonic_ns(self):
+                return next(self._clocks)
+
+            def wait_for_convergence(self, scale):
+                assert scale == 500
+                return {
+                    "started_at": "2026-08-31T00:00:00Z",
+                    "subscription_count": 500,
+                }
+
+            def run_steady_state(
+                self,
+                *,
+                scale,
+                duration_seconds,
+                pass_callback,
+                scheduler_callback,
+            ):
+                assert scale == 500
+                assert duration_seconds == 1800
+                for _ in self.completion_times:
+                    pass_callback(500)
+                from apscheduler.events import EVENT_JOB_EXECUTED
+
+                for _ in range(15):
+                    scheduler_callback(
+                        type(
+                            "Event",
+                            (),
+                            {
+                                "code": EVENT_JOB_EXECUTED,
+                                "job_id": "poll_streams",
+                            },
+                        )()
+                    )
+
+        runtime = Runtime()
+        asyncio.run(
+            driver._run_command(
+                args,
+                runtime,
+                driver.JsonlWriter(output, run_id=args.run_id),
+            )
+        )
+
+        record = json.loads(output.read_text())
+        assert runtime.production_counts == [500] * len(
+            runtime.completion_times
+        )
+        assert record["run_started_monotonic_ns"] == 0
+        assert record["run_ended_monotonic_ns"] == 1_800_000_000_000
+        assert len(record["pass_completion_monotonic_ns"]) == len(
+            runtime.completion_times
+        )
+        assert record["run_duration_seconds"] == 1800
+        assert record["maximum_gap_ms"] == 10_000.0
+        assert record["acceptance_valid"] is True
+
+    def test_cold_start_command_enforces_initialized_zero_state_and_progress(
+        self, tmp_path
+    ):
+        driver = importlib.import_module("phase5.feature006_driver")
+        output = tmp_path / "cold.jsonl"
+        args = self.driver_args(
+            driver,
+            "cold-start",
+            output,
+            "--scale",
+            "900",
+            "--require-rate-limit-backoff",
+        )
+
+        class Delegate:
+            async def list(self):
+                if False:
+                    yield None
+
+            async def create(self, broadcaster_id):
+                return broadcaster_id
+
+            async def delete(self, subscription_id):
+                return subscription_id
+
+        class Runtime:
+            def initialize_cold_start(self, *, target):
+                assert target == 900
+                return {
+                    "process_initialized": True,
+                    "pools_warm": True,
+                    "transport_started": True,
+                    "subscription_count": 0,
+                    "desired_count": 900,
+                    "initialization_complete_at": "2026-08-31T00:00:00Z",
+                    "transport": Delegate(),
+                    "reconciler_config": dict(
+                        driver.PRODUCTION_RECONCILER_CONFIG
+                    ),
+                }
+
+            async def run_cold_start(
+                self,
+                *,
+                target,
+                transport,
+                poll_recorder,
+                scheduler_callback,
+            ):
+                assert target == 900
+                transport.rate_limit_events.append({"monotonic_ns": 1})
+                transport.record_backoff(
+                    seconds=10.0,
+                    coverage_before=0,
+                    coverage_after=1,
+                )
+                await poll_recorder.run(lambda: None)
+                from apscheduler.events import EVENT_JOB_EXECUTED
+
+                scheduler_callback(
+                    type(
+                        "Event",
+                        (),
+                        {
+                            "code": EVENT_JOB_EXECUTED,
+                            "job_id": "poll_streams",
+                        },
+                    )()
+                )
+                return 1
+
+        asyncio.run(
+            driver._run_command(
+                args,
+                Runtime(),
+                driver.JsonlWriter(output, run_id=args.run_id),
+            )
+        )
+
+        record = json.loads(output.read_text())
+        assert record["initial_subscription_count"] == 0
+        assert record["overlap_skip_count"] == 0
+        assert record["final_subscription_count"] == 1
+        assert record["effective_reconciler_config"] == dict(
+            driver.PRODUCTION_RECONCILER_CONFIG
+        )
+        assert record["acceptance_valid"] is True
+
+    def test_driver_cold_start_policy_matches_production_defaults(self):
+        driver = importlib.import_module("phase5.feature006_driver")
+        config = reconciler_module.resolve_reconciler_config({})
+
+        assert driver.PRODUCTION_RECONCILER_CONFIG == {
+            "concurrency": config.concurrency,
+            "idle_timeout_seconds": config.idle_timeout_seconds,
+            "rate_limit_backoff_seconds": config.rate_limit_backoff_seconds,
+            "max_retry_rounds": config.max_retry_rounds,
+            "readopt_interval_seconds": config.readopt_interval_seconds,
+            "adopt_retry_seconds": config.adopt_retry_seconds,
+        }
+
+
+class TestPollDispatchCounts:
+    @staticmethod
+    def run_at_scale(service, scale):
+        with patch.object(stream_monitoring_service, "JOIN_THRESHOLD", scale), \
+             patch.object(stream_monitoring_service, "LEAVE_THRESHOLD", scale), \
+             patch.object(
+                 stream_monitoring_service,
+                 "CLIPPING_DISABLED_FETCH_BUFFER",
+                 0,
+             ):
+            asyncio.run(service.poll_top_streams())
+
+    @staticmethod
+    def assert_non_empty_fixed_counts(service, fake_redis):
+        assert service.db_pool.connection.execute_count == 1
+        assert service.db_pool.connection.commit_count == 1
+        assert sum(
+            dispatch["phase"] == "online_snapshot"
+            for dispatch in fake_redis.dispatches
+        ) == 1
+        assert sum(
+            execution["phase"] == "online_refresh"
+            for execution in fake_redis.pipeline_executions
+        ) == 1
+        assert sum(
+            execution["phase"] == "desired_set_publication"
+            for execution in fake_redis.pipeline_executions
+        ) == 1
+
+    @pytest.mark.parametrize("scale", [50, 500, 900])
+    def test_stable_profiles_have_positive_constant_dispatch_counts(self, scale):
+        logins = [f"stable-{index}" for index in range(scale)]
+        fake_redis = FakeRedis()
+        seed_desired(
+            fake_redis,
+            [
+                (login, 1000 + index)
+                for index, login in enumerate(logins)
+            ],
+        )
+        fake_redis.strings.update(
+            {
+                f"streamer:online:{login}": str(1000 + index)
+                for index, login in enumerate(logins)
+            }
+        )
+        service = make_poller(logins, fake_redis)
+        fake_redis.calls.clear()
+        fake_redis.dispatches.clear()
+        fake_redis.mget_requests.clear()
+        fake_redis.pipeline_executions.clear()
+        service.db_pool.reset_measured()
+
+        self.run_at_scale(service, scale)
+
+        self.assert_non_empty_fixed_counts(service, fake_redis)
+        assert len(fake_redis.mget_requests[0]) == scale
+
+    @pytest.mark.parametrize("scale", [50, 500, 900])
+    def test_complete_turnover_exposes_no_hidden_sql_or_redis_paging(self, scale):
+        current = [f"current-{index}" for index in range(scale)]
+        previous = [
+            (f"departed-{index}", 100_000 + index)
+            for index in range(scale)
+        ]
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, previous)
+        service = make_poller(current, fake_redis)
+        fake_redis.calls.clear()
+        fake_redis.dispatches.clear()
+        fake_redis.mget_requests.clear()
+        fake_redis.pipeline_executions.clear()
+        service.db_pool.reset_measured()
+
+        self.run_at_scale(service, scale)
+
+        self.assert_non_empty_fixed_counts(service, fake_redis)
+        assert len(fake_redis.mget_requests[0]) == scale * 2
+        assert len(service.db_pool.connection.mogrified_rows) == scale
+
+    @pytest.mark.parametrize(
+        ("previous", "expected"),
+        [
+            ([], (0, 0, 0, 1)),
+            ([("departed", 99)], (0, 1, 0, 1)),
+        ],
+    )
+    def test_empty_dispatch_omissions_still_publish_desired_intent(
+        self, previous, expected
+    ):
+        fake_redis = FakeRedis()
+        if previous:
+            seed_desired(fake_redis, previous)
+        service = make_poller([], fake_redis)
+        fake_redis.calls.clear()
+        fake_redis.dispatches.clear()
+        fake_redis.mget_requests.clear()
+        fake_redis.pipeline_executions.clear()
+        service.db_pool.reset_measured()
+
+        self.run_at_scale(service, 1)
+
+        actual = (
+            service.db_pool.connection.execute_count,
+            len(fake_redis.mget_requests),
+            sum(
+                execution["phase"] == "online_refresh"
+                for execution in fake_redis.pipeline_executions
+            ),
+            sum(
+                execution["phase"] == "desired_set_publication"
+                for execution in fake_redis.pipeline_executions
+            ),
+        )
+        assert actual == expected
+
+
+class TestPollObservabilityAndBoundaries:
+    @staticmethod
+    def run_poll(service):
+        with patch.object(stream_monitoring_service, "JOIN_THRESHOLD", 1), \
+             patch.object(stream_monitoring_service, "LEAVE_THRESHOLD", 1), \
+             patch.object(
+                 stream_monitoring_service,
+                 "CLIPPING_DISABLED_FETCH_BUFFER",
+                 0,
+             ):
+            return asyncio.run(service.poll_top_streams())
+
+    @staticmethod
+    def histogram_count(metric, **labels):
+        sample_name = f"{metric._name}_count"
+        for family in metric.collect():
+            for sample in family.samples:
+                if sample.name == sample_name and sample.labels == labels:
+                    return sample.value
+        return 0
+
+    def assert_one_total_outcome(self, service, expected, run):
+        metric = stream_monitoring_service.stream_poll_duration_seconds
+        before = {
+            outcome: self.histogram_count(metric, outcome=outcome)
+            for outcome in stream_monitoring_service.POLL_OUTCOMES
+        }
+
+        run()
+
+        deltas = {
+            outcome: (
+                self.histogram_count(metric, outcome=outcome)
+                - before[outcome]
+            )
+            for outcome in stream_monitoring_service.POLL_OUTCOMES
+        }
+        assert deltas[expected] == 1
+        assert sum(deltas.values()) == 1
+        assert service.test_side_effects.final_outcomes == [expected]
+
+    def test_every_completion_path_emits_exactly_one_bounded_total_outcome(self):
+        scenarios = []
+
+        fake_redis = FakeRedis()
+        scenarios.append(("success", make_poller(["one"], fake_redis), None))
+
+        fake_redis = FakeRedis()
+        scenarios.append((
+            "metadata_failed",
+            make_poller(
+                ["one"],
+                fake_redis,
+                pool=CountingPool(
+                    CountingConnection(execute_error=ValueError("poison"))
+                ),
+            ),
+            None,
+        ))
+
+        fake_redis = FakeRedis()
+        scenarios.append((
+            "ranking_failed",
+            make_poller(
+                [],
+                fake_redis,
+                twitch_error=RuntimeError("ranking"),
+            ),
+            None,
+        ))
+
+        fake_redis = FakeRedis()
+        scenarios.append((
+            "desired_read_failed",
+            make_poller(
+                ["one"],
+                fake_redis,
+                desired_read_error=ConnectionError("desired"),
+            ),
+            None,
+        ))
+
+        fake_redis = FakeRedis()
+        fake_redis.fail_on = {"mget"}
+        scenarios.append((
+            "online_snapshot_failed",
+            make_poller(["one"], fake_redis),
+            None,
+        ))
+
+        fake_redis = FakeRedis()
+        fake_redis.inject_pipeline_failure("online_refresh", when="before")
+        scenarios.append((
+            "online_refresh_failed",
+            make_poller(["one"], fake_redis),
+            None,
+        ))
+
+        fake_redis = FakeRedis()
+        scenarios.append((
+            "desired_publish_failed",
+            make_poller(
+                ["one"],
+                fake_redis,
+                desired_publish_error=ConnectionError("publish"),
+            ),
+            None,
+        ))
+
+        fake_redis = FakeRedis()
+        scenarios.append((
+            "unexpected_failure",
+            make_poller(["one"], fake_redis),
+            patch.object(
+                stream_monitoring_service,
+                "compute_desired_set",
+                side_effect=RuntimeError("unexpected"),
+            ),
+        ))
+
+        for expected, service, context in scenarios:
+            if context is None:
+                run = lambda service=service: self.run_poll(service)
+                self.assert_one_total_outcome(service, expected, run)
+            else:
+                with context:
+                    self.assert_one_total_outcome(
+                        service,
+                        expected,
+                        lambda service=service: self.run_poll(service),
+                    )
+
+    def test_phase_metric_uses_only_bounded_phase_and_outcome_labels(self):
+        fake_redis = FakeRedis()
+        service = make_poller(["one"], fake_redis)
+        self.run_poll(service)
+
+        metric = stream_monitoring_service.stream_poll_phase_duration_seconds
+        observed = {
+            (
+                sample.labels["phase"],
+                sample.labels["outcome"],
+                frozenset(sample.labels),
+            )
+            for family in metric.collect()
+            for sample in family.samples
+            if sample.name.endswith("_count")
+        }
+        assert {
+            phase for phase, _, _ in observed
+        } == set(stream_monitoring_service.POLL_PHASES)
+        assert {
+            outcome for _, outcome, _ in observed
+        } <= set(stream_monitoring_service.PHASE_OUTCOMES)
+        assert all(labels == {"phase", "outcome"} for _, _, labels in observed)
+
+        empty = make_poller([], FakeRedis())
+        self.run_poll(empty)
+        assert {
+            ("metadata_persistence", "empty"),
+            ("online_snapshot", "empty"),
+            ("online_refresh", "empty"),
+            ("lifecycle_publication", "empty"),
+        } <= set(empty.test_side_effects.phase_boundaries)
+
+    def test_final_structured_log_carries_bounded_context(self, caplog):
+        fake_redis = FakeRedis()
+        service = make_poller(
+            ["one"],
+            fake_redis,
+            pool=CountingPool(
+                CountingConnection(execute_error=ValueError("poison"))
+            ),
+        )
+
+        with caplog.at_level(logging.INFO):
+            self.run_poll(service)
+
+        final_records = [
+            record
+            for record in caplog.records
+            if record.message == "Poll finished"
+        ]
+        assert len(final_records) == 1
+        record = final_records[0]
+        assert record.outcome == "metadata_failed"
+        assert record.failed_phase == "metadata_persistence"
+        assert set(record.phase_durations_seconds) == set(
+            stream_monitoring_service.POLL_PHASES
+        )
+        assert record.ranked == 1
+        assert record.desired == 1
+        assert record.entered == 1
+        assert record.left == 0
+        assert record.metadata_input_count == 1
+        assert record.metadata_unique_count == 1
+        assert record.metadata_failure_streak == 1
+
+    def test_production_compose_thresholds_remain_frozen(self):
+        repository_root = Path(__file__).resolve().parents[2]
+        compose = (repository_root / "docker-compose.yml").read_text()
+        stream_monitoring = compose.split("\n  stream-monitoring:", 1)[1]
+        stream_monitoring = stream_monitoring.split("\n  api-frontend:", 1)[0]
+
+        assert stream_monitoring.count("- JOIN_THRESHOLD=150") == 1
+        assert stream_monitoring.count("- LEAVE_THRESHOLD=300") == 1
+        assert (
+            stream_monitoring.count(
+                "- CLIPPING_DISABLED_FETCH_BUFFER=120"
+            )
+            == 1
+        )
+
+    def test_validation_modules_are_not_in_production_copy_or_bind_mounts(self):
+        repository_root = Path(__file__).resolve().parents[2]
+        dockerfile = (
+            repository_root
+            / "services"
+            / "stream-monitoring"
+            / "Dockerfile"
+        ).read_text()
+        compose = (repository_root / "docker-compose.yml").read_text()
+
+        for filename in (
+            "feature006_driver.py",
+            "feature006_fixtures.py",
+        ):
+            assert filename not in dockerfile
+            assert filename not in compose
 
 
 class TestReconcilerDiff:
@@ -3940,6 +6507,155 @@ def add_streamer(conn, streamer_id, *, allows_clipping=True, refused_days_ago=No
             ),
         )
     conn.commit()
+
+
+@pytest.mark.skipif(
+    "TEST_POSTGRES_URL" not in os.environ,
+    reason="set TEST_POSTGRES_URL explicitly for isolated feature 006 evidence",
+)
+class TestStreamerMetadataBatchAgainstPostgres:
+    def test_900_inputs_use_one_statement_and_preserve_non_batch_columns(
+        self, streamers_table
+    ):
+        with streamers_table.cursor() as cursor:
+            cursor.execute("TRUNCATE streamers")
+            cursor.execute(
+                """
+                INSERT INTO streamers (
+                    streamer_id,
+                    streamer_login,
+                    allows_clipping,
+                    first_seen_at,
+                    last_seen_at,
+                    eventsub_refused_at,
+                    clipping_disabled_at
+                )
+                VALUES (
+                    1,
+                    'old-login',
+                    FALSE,
+                    NOW() - INTERVAL '30 days',
+                    NOW() - INTERVAL '1 day',
+                    NOW() - INTERVAL '2 days',
+                    NOW() - INTERVAL '3 days'
+                )
+                RETURNING first_seen_at, last_seen_at, eventsub_refused_at,
+                          clipping_disabled_at
+                """
+            )
+            before = cursor.fetchone()
+        streamers_table.commit()
+
+        counted = ProductionCallCountingConnection(streamers_table)
+        pool = CountingPool(counted)
+        service = StreamMonitoringService()
+        service.db_pool = pool
+        records = [
+            (streamer_id, f"login-{streamer_id}")
+            for streamer_id in range(1, 900)
+        ]
+        records.append((7, "final-seven"))
+        pool.reset_measured()
+
+        assert service._upsert_streamer_batch(records) is True
+
+        assert counted.execute_count == 1
+        assert counted.commit_count == 1
+        assert counted.rollback_count == 0
+        with streamers_table.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT last_seen_at) FROM streamers"
+            )
+            assert cursor.fetchone() == (899, 1)
+            cursor.execute(
+                """
+                SELECT streamer_login, first_seen_at, last_seen_at,
+                       allows_clipping, eventsub_refused_at,
+                       clipping_disabled_at
+                FROM streamers
+                WHERE streamer_id = 1
+                """
+            )
+            row_one = cursor.fetchone()
+            cursor.execute(
+                "SELECT streamer_login FROM streamers WHERE streamer_id = 7"
+            )
+            row_seven = cursor.fetchone()
+
+        assert row_one[0] == "login-1"
+        assert row_one[1] == before[0]
+        assert row_one[2] > before[1]
+        assert row_one[3] is False
+        assert row_one[4] == before[2]
+        assert row_one[5] == before[3]
+        assert row_seven == ("final-seven",)
+
+    def test_poison_batch_rolls_back_and_connection_is_reusable(
+        self, streamers_table
+    ):
+        with streamers_table.cursor() as cursor:
+            cursor.execute("TRUNCATE streamers")
+        streamers_table.commit()
+
+        counted = ProductionCallCountingConnection(streamers_table)
+        pool = CountingPool(counted)
+        service = StreamMonitoringService()
+        service.db_pool = pool
+        pool.reset_measured()
+
+        assert service._upsert_streamer_batch(
+            [(1, "valid"), (2, "x" * 256)]
+        ) is False
+
+        assert counted.execute_count == 1
+        assert counted.commit_count == 0
+        assert counted.rollback_count == 1
+        assert pool.discard_count == 0
+        with streamers_table.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM streamers")
+            assert cursor.fetchone() == (0,)
+            cursor.execute("SELECT 1")
+            assert cursor.fetchone() == (1,)
+
+    def test_next_poll_reconstructs_and_retries_the_whole_batch(
+        self, streamers_table
+    ):
+        with streamers_table.cursor() as cursor:
+            cursor.execute("TRUNCATE streamers")
+        streamers_table.commit()
+
+        counted = ProductionCallCountingConnection(streamers_table)
+        pool = CountingPool(counted)
+        fake_redis = FakeRedis()
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[("valid", 1), ("x" * 256, 2)],
+            pool=pool,
+        )
+
+        with patch.object(stream_monitoring_service, "JOIN_THRESHOLD", 2), \
+             patch.object(stream_monitoring_service, "LEAVE_THRESHOLD", 2):
+            asyncio.run(service.poll_top_streams())
+            assert service.test_side_effects.final_outcomes == [
+                "metadata_failed"
+            ]
+            with streamers_table.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM streamers")
+                assert cursor.fetchone() == (0,)
+
+            service.twitch = FakeTwitch(
+                [make_stream("valid", 1), make_stream("corrected", 2)]
+            )
+            asyncio.run(service.poll_top_streams())
+
+        with streamers_table.cursor() as cursor:
+            cursor.execute(
+                "SELECT streamer_id, streamer_login FROM streamers "
+                "ORDER BY streamer_id"
+            )
+            assert cursor.fetchall() == [(1, "valid"), (2, "corrected")]
+        assert service.test_side_effects.final_outcomes[-1] == "success"
 
 
 class TestRefusalStoreAgainstPostgres:

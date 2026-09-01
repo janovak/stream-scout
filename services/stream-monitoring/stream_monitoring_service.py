@@ -20,6 +20,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Dict, List, Optional, Set
 
 import psycopg2
@@ -27,7 +28,8 @@ import psycopg2.pool
 import redis
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from confluent_kafka import Producer
-from prometheus_client import Counter, Gauge, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from psycopg2.extras import execute_values
 from pythonjsonlogger import jsonlogger
 from twitchAPI.twitch import Twitch
 from twitchAPI.type import InvalidTokenException, MissingScopeException
@@ -226,10 +228,44 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # Prometheus metrics
+POLL_OUTCOMES = (
+    "success",
+    "metadata_failed",
+    "ranking_failed",
+    "desired_read_failed",
+    "online_snapshot_failed",
+    "online_refresh_failed",
+    "desired_publish_failed",
+    "unexpected_failure",
+)
+POLL_PHASES = (
+    "ranking_fetch",
+    "metadata_persistence",
+    "online_snapshot",
+    "online_refresh",
+    "lifecycle_publication",
+    "desired_set_publication",
+)
+PHASE_OUTCOMES = ("success", "failure", "empty")
+
 active_stream_count = Gauge("active_stream_count", "Number of currently monitored streams")
 chat_messages_total = Counter("chat_messages_total", "Total chat messages processed", ["broadcaster_id"])
 twitch_api_errors_total = Counter("twitch_api_errors_total", "Total Twitch API errors", ["error_type"])
 kafka_messages_produced = Counter("kafka_messages_produced", "Total Kafka messages produced", ["topic"])
+stream_poll_duration_seconds = Histogram(
+    "stream_poll_duration_seconds",
+    "Stream poll wall-clock duration by final bounded outcome",
+    ["outcome"],
+)
+stream_poll_phase_duration_seconds = Histogram(
+    "stream_poll_phase_duration_seconds",
+    "Stream poll phase duration by bounded phase and outcome",
+    ["phase", "outcome"],
+)
+stream_metadata_consecutive_failures = Gauge(
+    "stream_metadata_consecutive_failures",
+    "Consecutive failed non-empty streamer metadata batches",
+)
 
 
 class StreamMonitoringService:
@@ -270,6 +306,10 @@ class StreamMonitoringService:
         self.has_user_auth = False
         self.has_chat_scope = False
         self._reconciler_task: Optional[asyncio.Task] = None
+        self._metadata_consecutive_failures = 0
+        stream_metadata_consecutive_failures.set(0)
+        self._poll_observer = None
+        self.last_poll_result = None
 
     async def _on_token_refresh(self, access_token: str, refresh_token: str):
         """Callback invoked when tokens are refreshed by pyTwitchAPI."""
@@ -718,48 +758,99 @@ class StreamMonitoringService:
 
     async def poll_top_streams(self):
         """Poll Twitch API for top streams and write the desired set to Redis."""
+        poll_started = time.perf_counter()
+        phase_durations = {}
+        outcome = "unexpected_failure"
+        failed_phase = None
+        ranked_count = 0
+        desired_count = 0
+        entered_count = 0
+        left_count = 0
+        metadata_input_count = 0
+        metadata_unique_count = 0
+
+        def finish_phase(phase, started, phase_outcome):
+            duration = time.perf_counter() - started
+            phase_durations[phase] = duration
+            self._record_poll_phase(phase, phase_outcome, duration)
+
         try:
             logger.info("Polling for top streams")
 
-            # Fetch more than LEAVE_THRESHOLD raw streams (by viewer rank) and filter
-            # out streamers with clipping disabled *before* assigning rank -- so a
-            # disabled streamer near the top can't eat a rank slot it can never use.
-            # See CLIPPING_DISABLED_FETCH_BUFFER above for why padding is needed.
-            fetch_count = LEAVE_THRESHOLD + CLIPPING_DISABLED_FETCH_BUFFER
-
-            async def _fetch_top_streams():
-                collected = []
-                # first= is the PAGE size, capped by Helix at 100. The
-                # generator pages on its own, so the loop below -- not first=
-                # -- is what bounds the total.
-                async for stream in self.twitch.get_streams(first=HELIX_MAX_PAGE_SIZE):
-                    collected.append(stream)
-                    if len(collected) >= fetch_count:
-                        break
-                return collected
-
-            pages, fetch_timeout = fetch_budget(fetch_count)
-
+            ranking_started = time.perf_counter()
             try:
-                raw_streams = await asyncio.wait_for(_fetch_top_streams(), timeout=fetch_timeout)
-            except asyncio.TimeoutError:
-                logger.error("Timed out fetching top streams from Twitch API", extra={
-                    "timeout_seconds": fetch_timeout,
-                    "pages": pages,
-                    "fetch_count": fetch_count
-                })
+                fetch_count = LEAVE_THRESHOLD + CLIPPING_DISABLED_FETCH_BUFFER
+
+                async def _fetch_top_streams():
+                    collected = []
+                    async for stream in self.twitch.get_streams(
+                        first=HELIX_MAX_PAGE_SIZE
+                    ):
+                        collected.append(stream)
+                        if len(collected) >= fetch_count:
+                            break
+                    return collected
+
+                pages, fetch_timeout = fetch_budget(fetch_count)
+                raw_streams = await asyncio.wait_for(
+                    _fetch_top_streams(), timeout=fetch_timeout
+                )
+                disabled_ids = self._get_clipping_disabled_ids(
+                    [int(stream.user_id) for stream in raw_streams]
+                )
+                disabled_logins = {
+                    stream.user_login.lower()
+                    for stream in raw_streams
+                    if int(stream.user_id) in disabled_ids
+                }
+                streams = [
+                    stream
+                    for stream in raw_streams
+                    if int(stream.user_id) not in disabled_ids
+                ][:LEAVE_THRESHOLD]
+                normalized = [
+                    (
+                        rank,
+                        int(stream.user_id),
+                        stream.user_login.lower(),
+                    )
+                    for rank, stream in enumerate(streams, 1)
+                ]
+            except asyncio.TimeoutError as error:
+                finish_phase("ranking_fetch", ranking_started, "failure")
+                failed_phase = "ranking_fetch"
+                outcome = "ranking_failed"
+                logger.error(
+                    "Timed out fetching top streams from Twitch API",
+                    extra={
+                        "timeout_seconds": fetch_timeout,
+                        "pages": pages,
+                        "fetch_count": fetch_count,
+                        "error": str(error),
+                        "error_type": type(error).__name__,
+                    },
+                )
                 twitch_api_errors_total.labels(error_type="get_streams_timeout").inc()
-                return
-
-            # Broadcasters we've already learned don't allow clip creation (via a
-            # 403 from the clip-detector job) -- no point spending a chat
-            # connection on a streamer we can never successfully clip.
-            disabled_ids = self._get_clipping_disabled_ids([int(s.user_id) for s in raw_streams])
-            disabled_logins = {s.user_login.lower() for s in raw_streams if int(s.user_id) in disabled_ids}
-
-            # Rank only among clip-eligible streams, so JOIN_THRESHOLD/LEAVE_THRESHOLD
-            # reflect real candidates rather than raw Twitch viewer position.
-            streams = [s for s in raw_streams if int(s.user_id) not in disabled_ids][:LEAVE_THRESHOLD]
+                return outcome
+            except Exception as error:
+                finish_phase("ranking_fetch", ranking_started, "failure")
+                failed_phase = "ranking_fetch"
+                outcome = "ranking_failed"
+                logger.error(
+                    "Failed to fetch or normalize top streams",
+                    extra={
+                        "error": str(error),
+                        "error_type": type(error).__name__,
+                    },
+                )
+                twitch_api_errors_total.labels(error_type="poll_streams").inc()
+                return outcome
+            else:
+                finish_phase(
+                    "ranking_fetch",
+                    ranking_started,
+                    "empty" if not normalized else "success",
+                )
 
             if len(streams) < LEAVE_THRESHOLD:
                 logger.warning(
@@ -772,11 +863,21 @@ class StreamMonitoringService:
                     }
                 )
 
-            # The membership of the last desired set IS the hysteresis state.
-            # It is read back from Redis rather than held in memory, so a
-            # restart keeps the retained band instead of collapsing coverage
-            # to the top JOIN_THRESHOLD.
-            previous = self.desired_store.read()
+            try:
+                previous = self.desired_store.read()
+            except Exception as error:
+                failed_phase = "desired_read"
+                outcome = "desired_read_failed"
+                logger.error(
+                    "Failed to read previous desired set",
+                    extra={
+                        "phase": failed_phase,
+                        "error": str(error),
+                        "error_type": type(error).__name__,
+                    },
+                )
+                return outcome
+
             previous_desired = set(previous.logins)
             previous_ids = previous.ids
 
@@ -786,76 +887,282 @@ class StreamMonitoringService:
                         "broadcaster_login": login
                     })
 
-            ranked_logins = []
+            ranked_logins = [login for _, _, login in normalized]
             broadcaster_ids = {}
-
-            for rank, stream in enumerate(streams, 1):
-                broadcaster_login = stream.user_login.lower()
-                broadcaster_id = int(stream.user_id)
-                ranked_logins.append(broadcaster_login)
+            metadata_records = []
+            for _, broadcaster_id, broadcaster_login in normalized:
                 broadcaster_ids[broadcaster_login] = broadcaster_id
-
-                # Update Redis with TTL
-                redis_key = f"streamer:online:{broadcaster_login}"
-                is_new = not self.redis_client.exists(redis_key)
-                self.redis_client.setex(redis_key, REDIS_STREAMER_TTL, broadcaster_id)
-
-                # Update Postgres
-                self._upsert_streamer(broadcaster_id, broadcaster_login)
-
-                # Publish lifecycle event if new (only for top JOIN_THRESHOLD)
-                if is_new and rank <= JOIN_THRESHOLD:
-                    self._publish_lifecycle_event("online", broadcaster_id, broadcaster_login, rank)
-                    logger.info("Streamer online", extra={
-                        "broadcaster_login": broadcaster_login,
-                        "broadcaster_id": broadcaster_id,
-                        "rank": rank
-                    })
+                metadata_records.append((broadcaster_id, broadcaster_login))
+            metadata_input_count = len(metadata_records)
+            metadata_unique_count = len(
+                {broadcaster_id for broadcaster_id, _ in metadata_records}
+            )
 
             desired = compute_desired_set(
                 ranked_logins, previous_desired, JOIN_THRESHOLD, LEAVE_THRESHOLD
             )
+            departed = [
+                login for login in previous.logins if login not in desired
+            ]
 
-            # Streamers that went offline. A login leaves `desired` only when
-            # it drops out of the top LEAVE_THRESHOLD, so it is no longer in
-            # this poll's ranking and `broadcaster_ids` never has an id for it
-            # -- fall back to the map the last poll wrote, which does.
-            for login in previous_desired:
-                if login not in desired:
-                    redis_key = f"streamer:online:{login}"
-                    if not self.redis_client.exists(redis_key):
-                        broadcaster_id = broadcaster_ids.get(
-                            login, previous_ids.get(login, 0)
+            ranked_count = len(ranked_logins)
+            desired_count = len(desired)
+            entered_count = len(set(desired) - previous_desired)
+            left_count = len(departed)
+
+            metadata_started = time.perf_counter()
+            metadata_result = self._upsert_streamer_batch(metadata_records)
+            finish_phase(
+                "metadata_persistence",
+                metadata_started,
+                (
+                    "empty"
+                    if metadata_result is None
+                    else "success" if metadata_result else "failure"
+                ),
+            )
+            metadata_failed = metadata_result is False
+
+            snapshot_logins = list(
+                dict.fromkeys(ranked_logins + departed)
+            )
+            snapshot_keys = [
+                f"streamer:online:{login}" for login in snapshot_logins
+            ]
+            snapshot_started = time.perf_counter()
+            if snapshot_keys:
+                try:
+                    raw_snapshot = self.redis_client.mget(snapshot_keys)
+                    if len(raw_snapshot) != len(snapshot_keys):
+                        raise ValueError(
+                            "online snapshot response length "
+                            f"{len(raw_snapshot)} did not match "
+                            f"request length {len(snapshot_keys)}"
                         )
-                        self._publish_lifecycle_event("offline", broadcaster_id, login, 0)
-                        logger.info("Streamer offline", extra={
-                            "broadcaster_login": login,
-                            "broadcaster_id": broadcaster_id
-                        })
+                except Exception as error:
+                    finish_phase(
+                        "online_snapshot", snapshot_started, "failure"
+                    )
+                    failed_phase = "online_snapshot"
+                    outcome = "online_snapshot_failed"
+                    logger.error(
+                        "Online-state snapshot failed",
+                        extra={
+                            "phase": failed_phase,
+                            "requested_key_count": len(snapshot_keys),
+                            "error": str(error),
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                    return outcome
+                snapshot = MappingProxyType(
+                    {
+                        login: value is not None
+                        for login, value in zip(
+                            snapshot_logins, raw_snapshot
+                        )
+                    }
+                )
+                finish_phase("online_snapshot", snapshot_started, "success")
+            else:
+                snapshot = MappingProxyType({})
+                finish_phase("online_snapshot", snapshot_started, "empty")
 
-            # Hand the intent to the reconciler and return. No joins, no
-            # subscribes, no waiting on a rate-limited bucket. This is the
-            # whole point of the split: the poll must always finish well
-            # inside POLL_INTERVAL_SECONDS, because APScheduler runs it with
-            # max_instances=1 and a skipped poll stops refreshing the online
-            # keys that expire at REDIS_STREAMER_TTL.
-            self.desired_store.publish(desired, broadcaster_ids)
+            first_current = {}
+            for rank, broadcaster_id, login in normalized:
+                first_current.setdefault(
+                    login, (rank, broadcaster_id)
+                )
 
-            # The reconciler shares this event loop, so this is the fast path.
-            # Its idle timeout is the backstop if the signal is ever missed.
+            lifecycle_candidates = []
+            invalid_departures = []
+            for login, (rank, broadcaster_id) in first_current.items():
+                if not snapshot[login] and rank <= JOIN_THRESHOLD:
+                    lifecycle_candidates.append(
+                        ("online", broadcaster_id, login, rank)
+                    )
+            for login in departed:
+                if snapshot[login]:
+                    continue
+                previous_id = previous_ids.get(login)
+                try:
+                    previous_id = int(previous_id)
+                except (TypeError, ValueError):
+                    previous_id = None
+                if previous_id is None or previous_id <= 0:
+                    invalid_departures.append(login)
+                    continue
+                lifecycle_candidates.append(
+                    ("offline", previous_id, login, 0)
+                )
+
+            refresh_started = time.perf_counter()
+            if normalized:
+                try:
+                    pipeline = self.redis_client.pipeline(
+                        transaction=False
+                    )
+                    for _, broadcaster_id, login in normalized:
+                        pipeline.setex(
+                            f"streamer:online:{login}",
+                            REDIS_STREAMER_TTL,
+                            broadcaster_id,
+                        )
+                    pipeline.execute(raise_on_error=True)
+                except Exception as error:
+                    finish_phase(
+                        "online_refresh", refresh_started, "failure"
+                    )
+                    failed_phase = "online_refresh"
+                    outcome = "online_refresh_failed"
+                    logger.error(
+                        "Online-state refresh failed",
+                        extra={
+                            "phase": failed_phase,
+                            "refresh_count": len(normalized),
+                            "error": str(error),
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                    return outcome
+                finish_phase("online_refresh", refresh_started, "success")
+            else:
+                finish_phase("online_refresh", refresh_started, "empty")
+
+            lifecycle_started = time.perf_counter()
+            for login in invalid_departures:
+                logger.error(
+                    "Offline lifecycle event suppressed: invalid previous id",
+                    extra={
+                        "broadcaster_login": login,
+                        "previous_generation": previous.generation,
+                    },
+                )
+            for event_type, broadcaster_id, login, rank in lifecycle_candidates:
+                self._publish_lifecycle_event(
+                    event_type, broadcaster_id, login, rank
+                )
+                logger.info(
+                    f"Streamer {event_type}",
+                    extra={
+                        "broadcaster_login": login,
+                        "broadcaster_id": broadcaster_id,
+                        "rank": rank,
+                    },
+                )
+            finish_phase(
+                "lifecycle_publication",
+                lifecycle_started,
+                "success" if lifecycle_candidates else "empty",
+            )
+
+            desired_publish_started = time.perf_counter()
+            try:
+                self.desired_store.publish(desired, broadcaster_ids)
+            except Exception as error:
+                finish_phase(
+                    "desired_set_publication",
+                    desired_publish_started,
+                    "failure",
+                )
+                failed_phase = "desired_publish"
+                outcome = "desired_publish_failed"
+                logger.error(
+                    "Desired-set publication failed",
+                    extra={
+                        "phase": failed_phase,
+                        "desired_count": len(desired),
+                        "error": str(error),
+                        "error_type": type(error).__name__,
+                    },
+                )
+                return outcome
+
             if self.reconciler is not None:
                 self.reconciler.notify_desired_changed()
-
-            logger.info("Poll complete", extra={
-                "ranked": len(ranked_logins),
-                "desired": len(desired),
-                "entered": len(set(desired) - previous_desired),
-                "left": len(previous_desired - set(desired)),
-            })
-
-        except Exception as e:
-            logger.error("Error polling streams", extra={"error": str(e)})
+            finish_phase(
+                "desired_set_publication",
+                desired_publish_started,
+                "success",
+            )
+            outcome = "metadata_failed" if metadata_failed else "success"
+            return outcome
+        except Exception as error:
+            failed_phase = failed_phase or "unexpected"
+            outcome = "unexpected_failure"
+            logger.error(
+                "Unexpected poll failure",
+                extra={
+                    "phase": failed_phase,
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                },
+            )
             twitch_api_errors_total.labels(error_type="poll_streams").inc()
+            return outcome
+        finally:
+            total_duration = time.perf_counter() - poll_started
+            self.last_poll_result = MappingProxyType(
+                {
+                    "outcome": outcome,
+                    "ranked": ranked_count,
+                    "desired": desired_count,
+                    "entered": entered_count,
+                    "left": left_count,
+                    "join_threshold": JOIN_THRESHOLD,
+                    "leave_threshold": LEAVE_THRESHOLD,
+                    "fetch_buffer": CLIPPING_DISABLED_FETCH_BUFFER,
+                }
+            )
+            self._record_poll_outcome(outcome, total_duration)
+            final_failed_phase = (
+                "metadata_persistence"
+                if outcome == "metadata_failed"
+                else failed_phase
+            )
+            log = (
+                logger.info
+                if outcome in {"success", "metadata_failed"}
+                else logger.error
+            )
+            log(
+                "Poll finished",
+                extra={
+                    "outcome": outcome,
+                    "failed_phase": final_failed_phase,
+                    "duration_seconds": total_duration,
+                    "phase_durations_seconds": phase_durations,
+                    "ranked": ranked_count,
+                    "desired": desired_count,
+                    "entered": entered_count,
+                    "left": left_count,
+                    "metadata_input_count": metadata_input_count,
+                    "metadata_unique_count": metadata_unique_count,
+                    "metadata_failure_streak": (
+                        self._metadata_consecutive_failures
+                    ),
+                },
+            )
+
+    def _record_poll_phase(self, phase, outcome, duration):
+        if phase not in POLL_PHASES:
+            raise ValueError(f"unbounded poll phase label: {phase}")
+        if outcome not in PHASE_OUTCOMES:
+            raise ValueError(f"unbounded poll phase outcome label: {outcome}")
+        stream_poll_phase_duration_seconds.labels(
+            phase=phase, outcome=outcome
+        ).observe(duration)
+        observer = self._poll_observer
+        if observer is not None:
+            observer.record_phase(phase, outcome)
+
+    def _record_poll_outcome(self, outcome, duration):
+        if outcome not in POLL_OUTCOMES:
+            raise ValueError(f"unbounded poll outcome label: {outcome}")
+        stream_poll_duration_seconds.labels(outcome=outcome).observe(duration)
+        observer = self._poll_observer
+        if observer is not None:
+            observer.record_outcome(outcome)
 
     def _publish_chat_message(self, broadcaster_id: int, message: dict):
         """Publish chat message to Kafka."""
@@ -906,30 +1213,87 @@ class StreamMonitoringService:
                 "partition": msg.partition()
             })
 
-    def _upsert_streamer(self, streamer_id: int, streamer_login: str):
-        """Insert or update streamer in Postgres."""
+    def _upsert_streamer_batch(self, records):
+        """Persist normalized ``(streamer_id, login)`` rows atomically.
+
+        ``None`` means no non-empty batch was attempted. For attempted batches,
+        ``True`` means the one statement and commit were acknowledged and
+        ``False`` means the entire batch must be retried on the next poll.
+        """
+        ordered_records = list(records)
+        if not ordered_records:
+            return None
+
         conn = None
+        discard_connection = False
+        metadata_by_id = {}
+        rows = []
         try:
+            for record in ordered_records:
+                try:
+                    streamer_id, streamer_login = record
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "metadata records must contain streamer_id and login"
+                    ) from error
+                metadata_by_id[streamer_id] = streamer_login
+            rows = list(metadata_by_id.items())
+
             conn = self.db_pool.getconn()
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO streamers (streamer_id, streamer_login, last_seen_at)
-                    VALUES (%s, %s, NOW())
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO streamers (
+                        streamer_id,
+                        streamer_login,
+                        last_seen_at
+                    )
+                    VALUES %s
                     ON CONFLICT (streamer_id) DO UPDATE
                     SET streamer_login = EXCLUDED.streamer_login,
-                        last_seen_at = NOW()
-                """, (streamer_id, streamer_login))
-                conn.commit()
-        except Exception as e:
-            logger.error("Failed to upsert streamer", extra={
-                "streamer_id": streamer_id,
-                "error": str(e)
-            })
-            if conn:
-                conn.rollback()
+                        last_seen_at = EXCLUDED.last_seen_at
+                    """,
+                    rows,
+                    template="(%s, %s, NOW())",
+                    page_size=len(rows),
+                )
+            conn.commit()
+        except Exception as error:
+            self._metadata_consecutive_failures += 1
+            stream_metadata_consecutive_failures.set(
+                self._metadata_consecutive_failures
+            )
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception as rollback_error:
+                    discard_connection = True
+                    logger.error(
+                        "Streamer metadata batch rollback failed",
+                        extra={
+                            "error": str(rollback_error),
+                            "error_type": type(rollback_error).__name__,
+                        },
+                    )
+            logger.error(
+                "Streamer metadata batch failed",
+                extra={
+                    "input_batch_size": len(ordered_records),
+                    "unique_batch_size": len(metadata_by_id),
+                    "metadata_failure_streak": self._metadata_consecutive_failures,
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                },
+            )
+            return False
+        else:
+            self._metadata_consecutive_failures = 0
+            stream_metadata_consecutive_failures.set(0)
+            return True
         finally:
-            if conn:
-                self.db_pool.putconn(conn)
+            if conn is not None:
+                self.db_pool.putconn(conn, close=discard_connection)
 
     def _get_clipping_disabled_ids(self, streamer_ids: List[int]) -> Set[int]:
         """Return the subset of streamer_ids to drop from the ranking.
