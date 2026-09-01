@@ -1412,8 +1412,8 @@ class TestBatchedPollOrchestration:
              patch.object(stream_monitoring_service, "LEAVE_THRESHOLD", leave), \
              patch.object(
                  stream_monitoring_service,
-                 "CLIPPING_DISABLED_FETCH_BUFFER",
-                 0,
+                 "CLIPPING_DISABLED_FETCH_PAD_FRACTION",
+                 0.0,
              ):
             return asyncio.run(service.poll_top_streams())
 
@@ -3168,8 +3168,8 @@ class TestPollDispatchCounts:
              patch.object(stream_monitoring_service, "LEAVE_THRESHOLD", scale), \
              patch.object(
                  stream_monitoring_service,
-                 "CLIPPING_DISABLED_FETCH_BUFFER",
-                 0,
+                 "CLIPPING_DISABLED_FETCH_PAD_FRACTION",
+                 0.0,
              ):
             asyncio.run(service.poll_top_streams())
 
@@ -3285,8 +3285,8 @@ class TestPollObservabilityAndBoundaries:
              patch.object(stream_monitoring_service, "LEAVE_THRESHOLD", 1), \
              patch.object(
                  stream_monitoring_service,
-                 "CLIPPING_DISABLED_FETCH_BUFFER",
-                 0,
+                 "CLIPPING_DISABLED_FETCH_PAD_FRACTION",
+                 0.0,
              ):
             return asyncio.run(service.poll_top_streams())
 
@@ -3482,11 +3482,11 @@ class TestPollObservabilityAndBoundaries:
         stream_monitoring = compose.split("\n  stream-monitoring:", 1)[1]
         stream_monitoring = stream_monitoring.split("\n  api-frontend:", 1)[0]
 
-        assert stream_monitoring.count("- JOIN_THRESHOLD=150") == 1
-        assert stream_monitoring.count("- LEAVE_THRESHOLD=300") == 1
+        assert stream_monitoring.count("- JOIN_THRESHOLD=800") == 1
+        assert stream_monitoring.count("- LEAVE_THRESHOLD=900") == 1
         assert (
             stream_monitoring.count(
-                "- CLIPPING_DISABLED_FETCH_BUFFER=120"
+                "- CLIPPING_DISABLED_FETCH_PAD_FRACTION=0.30"
             )
             == 1
         )
