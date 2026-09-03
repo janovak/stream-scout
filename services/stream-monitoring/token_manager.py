@@ -74,7 +74,11 @@ class TwitchCredentials:
         """Store a new access/refresh token pair.
 
         Always reads the file first and keeps its `scopes` and `created_at`,
-        so a caller that never called `load` can't blank them out."""
+        so a caller that never called `load` can't blank them out.
+
+        Best-effort on the write (see `_write_best_effort`): pyTwitchAPI calls
+        this from inside its token-refresh callback, so a raise here would
+        abort whatever Helix request triggered the refresh."""
         with self._locked():
             existing = self._read_raw()
             record = TokenRecord(
@@ -84,16 +88,18 @@ class TwitchCredentials:
                 created_at=existing.get("created_at"),
                 updated_at=datetime.now(timezone.utc).isoformat(),
             )
-            self._write_atomic(record)
+            self._write_best_effort(record)
             return record
 
     def refresh(self, client_id: str, client_secret: str) -> TokenRecord:
-        """Refresh against Twitch's token endpoint and persist the result.
+        """Refresh against Twitch's token endpoint and return the new record.
 
         Holds the file lock for the whole read-refresh-write sequence, so a
         refresh racing from the other container waits instead of both
         rotating the refresh token and one of them ending up with a dead
-        one.
+        one. The refresh token sent is always the one read from disk inside
+        that lock, never a stale in-memory copy. Persisting the result is
+        best effort (see `_write_best_effort`).
         """
         with self._locked():
             existing = self._read_raw()
@@ -129,22 +135,7 @@ class TwitchCredentials:
                 created_at=existing.get("created_at"),
                 updated_at=datetime.now(timezone.utc).isoformat(),
             )
-            try:
-                self._write_atomic(record)
-            except OSError as exc:
-                # The refresh succeeded -- `record` holds a live access token.
-                # Failing to persist it (secrets/ not group-writable, disk
-                # full) must not turn a working refresh into a hard clip
-                # failure: hand the token back so the caller keeps going. The
-                # costs -- another process won't see this token, and a rotated
-                # refresh_token is lost on restart -- are worth an ERROR, not
-                # an exception.
-                logger.error(
-                    "Twitch token refreshed but could not be persisted to "
-                    "%s: %s -- using it in memory only",
-                    self.token_file,
-                    exc,
-                )
+            self._write_best_effort(record)
             logger.info(
                 "Token refreshed successfully",
                 extra={"expires_in": data.get("expires_in", "unknown")},
@@ -152,6 +143,29 @@ class TwitchCredentials:
             return record
 
     # -- internals --
+
+    def _write_best_effort(self, record: TokenRecord) -> None:
+        """Persist `record`, but treat a filesystem failure as non-fatal.
+
+        `record` is already a valid, freshly minted token held by the
+        caller. If secrets/ is not writable by this process (a re-seed left
+        the dir mode wrong, disk full), turning that into an exception would
+        abort a clip creation or a pyTwitchAPI request for no gain -- the
+        token in hand still works. Log it at ERROR instead; the cost is that
+        another process won't observe this token and a rotated refresh_token
+        is not on disk, so the next refresh after this token expires may fail
+        until secrets/ is fixed. Deployments keep secrets/ writable (see
+        start.sh / seed_twitch_tokens.py); this is the safety net for when
+        they don't."""
+        try:
+            self._write_atomic(record)
+        except OSError as exc:
+            logger.error(
+                "Twitch token updated but could not be written to %s: %s "
+                "-- using it in memory only; fix secrets/ permissions",
+                self.token_file,
+                exc,
+            )
 
     def _read_raw(self) -> dict:
         try:
