@@ -6,6 +6,7 @@ Tests the anomaly detection logic, command filtering, and clip creation flow.
 """
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -122,8 +123,7 @@ class TestTwitchAPIClient:
 
     @patch("token_manager.requests.post")
     def test_token_refresh_on_expiry(self, mock_post, token_file):
-        """Token should be refreshed when expired."""
-        # First call for token refresh
+        """A 401 with nothing newer on disk triggers a real refresh."""
         mock_post.return_value.status_code = 200
         mock_post.return_value.json.return_value = {
             "access_token": "new_token",
@@ -131,11 +131,75 @@ class TestTwitchAPIClient:
         }
 
         client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
-        client.access_token = None  # Force token refresh
+        # Same token we have is the one on disk -> no shortcut, refresh runs.
+        client.access_token = "test_token"
 
         client._refresh()
 
         assert client.access_token == "new_token"
+        assert mock_post.called
+
+    @patch("token_manager.requests.post")
+    def test_refresh_adopts_token_another_process_already_wrote(self, mock_post, token_file):
+        """If the shared token file already holds a newer token, adopt it
+        instead of hitting Twitch (which would rotate the refresh token and
+        race the other container)."""
+        # Another process rotated the on-disk token since we loaded ours.
+        Path(token_file).write_text(json.dumps({
+            "access_token": "token_from_other_process",
+            "refresh_token": "refresh_from_other_process",
+            "scopes": ["clips:edit"],
+        }))
+
+        client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
+        client.access_token = "stale_token"
+
+        client._refresh()
+
+        assert client.access_token == "token_from_other_process"
+        assert client.refresh_token == "refresh_from_other_process"
+        assert not mock_post.called
+
+    @patch("clip_detector_job.requests.post")
+    def test_create_clip_succeeds_when_refreshed_token_cannot_be_persisted(
+        self, mock_post, token_file
+    ):
+        """A refresh whose write to secrets/ fails (dir not group-writable,
+        disk full) must not turn into a hard clip failure -- the in-memory
+        token still works. Patching clip_detector_job.requests.post also
+        covers token_manager, which imports the same requests module."""
+        # The lock sidecar persists in a real deployment; only the atomic
+        # write of a fresh temp file is what fails when secrets/ goes
+        # read-only. Pre-create the lock, then drop dir write permission.
+        token_dir = Path(token_file).parent
+        (token_dir / (Path(token_file).name + ".lock")).touch(mode=0o666)
+        original_mode = token_dir.stat().st_mode
+
+        clip_calls = []
+
+        def route(url, *args, **kwargs):
+            if "oauth2/token" in url:
+                return MagicMock(status_code=200, json=MagicMock(return_value={
+                    "access_token": "refreshed_token", "expires_in": 3600,
+                }))
+            clip_calls.append(url)
+            if len(clip_calls) == 1:
+                return MagicMock(status_code=401, text="Invalid OAuth token")
+            return MagicMock(status_code=202, json=MagicMock(
+                return_value={"data": [{"id": "clip_after_refresh"}]}))
+
+        mock_post.side_effect = route
+        token_dir.chmod(0o500)
+        try:
+            client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
+            # Our token matches what's on disk, so _refresh() does a real
+            # (mocked) network refresh -- whose write-back is what fails.
+            client.access_token = "test_token"
+
+            assert client.create_clip(12345) == "clip_after_refresh"
+            assert client.access_token == "refreshed_token"
+        finally:
+            token_dir.chmod(original_mode)
 
 
 class TestDataClasses:

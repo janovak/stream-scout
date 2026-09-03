@@ -26,13 +26,17 @@ logger = logging.getLogger("token_manager")
 
 TWITCH_TOKEN_ENDPOINT = "https://id.twitch.tv/oauth2/token"
 
-# stream-monitoring (root) and the Flink containers (uid 9999) all write this
-# file. mkstemp() always creates its temp file at 0600, owned by whichever
-# container wrote last, which locks the other containers out the moment they
-# need to reload it. Chowning every write to a group both sides belong to
-# closes that gap without touching the flock-based refresh lock. Defaults to
-# 9999, the Flink base image's baked-in gid, so a fresh checkout works with
-# no compose change -- override via env if that ever stops matching.
+# stream-monitoring and the Flink containers all run as uid:gid 9999 and all
+# write this file. mkstemp() creates its temp file at 0600 owned by the
+# writer; chowning every write to the shared group keeps it readable to the
+# others even if the uids ever diverge again. Defaults to 9999, the Flink
+# base image's baked-in gid (and what stream-monitoring's Dockerfile now
+# matches) -- override via env if that ever stops matching.
+#
+# The temp file is created *in* secrets/, so that directory must be writable
+# by gid 9999 (drwxrwxr-x). A host re-seed run outside the group can drop the
+# group-write bit; seed_twitch_tokens.py restores it, and every refresh below
+# degrades to in-memory-only rather than failing if it is missing.
 TWITCH_TOKEN_GID = int(os.environ.get("TWITCH_TOKEN_GID", "9999"))
 
 
@@ -125,7 +129,22 @@ class TwitchCredentials:
                 created_at=existing.get("created_at"),
                 updated_at=datetime.now(timezone.utc).isoformat(),
             )
-            self._write_atomic(record)
+            try:
+                self._write_atomic(record)
+            except OSError as exc:
+                # The refresh succeeded -- `record` holds a live access token.
+                # Failing to persist it (secrets/ not group-writable, disk
+                # full) must not turn a working refresh into a hard clip
+                # failure: hand the token back so the caller keeps going. The
+                # costs -- another process won't see this token, and a rotated
+                # refresh_token is lost on restart -- are worth an ERROR, not
+                # an exception.
+                logger.error(
+                    "Twitch token refreshed but could not be persisted to "
+                    "%s: %s -- using it in memory only",
+                    self.token_file,
+                    exc,
+                )
             logger.info(
                 "Token refreshed successfully",
                 extra={"expires_in": data.get("expires_in", "unknown")},
@@ -180,11 +199,11 @@ class TwitchCredentials:
             try:
                 os.chown(tmp_path, -1, TWITCH_TOKEN_GID)
             except PermissionError:
-                # Only the containers (root, or uid 9999 already in this
-                # group) ever need this to succeed. An unprivileged local
-                # run -- e.g. the host venv this test suite normally runs
-                # under -- isn't part of any cross-container race, so it's
-                # fine for the file to keep the process's own default gid.
+                # Only the containers (uid 9999, already in this group) ever
+                # need this to succeed. An unprivileged local run -- e.g. the
+                # host venv this test suite normally runs under -- isn't part
+                # of any cross-container race, so it's fine for the file to
+                # keep the process's own default gid.
                 logger.warning(
                     "Could not chown %s to gid %d; not running with the "
                     "privilege this needs outside a container",
@@ -210,12 +229,12 @@ class TwitchCredentials:
         containers mount the same host secrets/ directory, so the sidecar
         is visible across processes the same way the token file is.
 
-        The three containers do not run as the same user (stream-monitoring
-        runs as root; the Flink containers drop to uid 9999). A plain
-        open(path, "w") applies the process umask, so whichever container
-        creates the sidecar first can leave it unreadable to the others.
-        os.open with an explicit mode plus an fchmod forces the sidecar to
-        stay 0o666 regardless of umask or which container created it.
+        The three containers now all run as uid:gid 9999, but a plain
+        open(path, "w") still applies the process umask, so the first
+        container to create the sidecar could leave it unreadable to the
+        others (or to a host re-seed). os.open with an explicit mode plus an
+        fchmod forces the sidecar to stay 0o666 regardless of umask or
+        writer -- cheap insurance against the uids diverging again.
         """
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.token_file.with_name(self.token_file.name + ".lock")

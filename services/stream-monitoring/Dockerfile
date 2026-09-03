@@ -22,6 +22,17 @@ COPY reconciler.py .
 COPY eventsub_pool.py .
 COPY token_manager.py .
 
+# Run as uid:gid 9999, matching the Flink containers (their base image's
+# `flink` user). All three share the bind-mounted secrets/ dir and read and
+# write the Twitch token file there; a single uid keeps those writes mutually
+# accessible and removes the root-vs-9999 asymmetry that let one container's
+# token write lock the others out of a refresh. TWITCH_TOKEN_GID in
+# docker-compose.yml must stay 9999 to match.
+RUN groupadd -g 9999 app \
+    && useradd -u 9999 -g 9999 --no-create-home --shell /usr/sbin/nologin app \
+    && chown -R 9999:9999 /app
+USER 9999
+
 # Expose ports
 EXPOSE 8080 9100
 

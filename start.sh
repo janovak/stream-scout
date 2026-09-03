@@ -12,6 +12,15 @@ echo "[1/2] Stopping existing containers..."
 docker compose down
 
 echo ""
+# The containers (uid:gid 9999) refresh the Twitch token by writing a temp
+# file into secrets/ and renaming it, so that directory must be group-
+# writable. A host re-seed run outside gid 9999 can drop the bit and silently
+# break every future token refresh; restore it here before starting.
+if [ -d ./secrets ]; then
+    chmod g+w ./secrets 2>/dev/null || \
+        echo "WARNING: could not make ./secrets group-writable; token refresh may fail" >&2
+fi
+
 echo "[2/2] Starting all services..."
 # --wait blocks until every service with a health check reports healthy,
 # flink-jobmanager included (see its health check in docker-compose.yml).

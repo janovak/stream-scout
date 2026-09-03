@@ -299,10 +299,23 @@ class TwitchAPIClient:
             raise TokenValidationError(f"Token validation failed with status {response.status_code}")
 
     def _refresh(self) -> None:
-        """Refresh the access token via the shared credentials module, which
-        holds a cross-process file lock across the read-refresh-write so a
-        concurrent refresh from another container can't leave either side
-        holding a dead token."""
+        """Get a working access token, preferring one another container has
+        already rotated into the shared token file over a fresh refresh.
+
+        The refresh call holds a cross-process file lock across the
+        read-refresh-write so a concurrent refresh from another container
+        can't leave either side holding a dead token."""
+        # stream-monitoring and this job share the token file. A 401 here
+        # often just means our in-memory copy went stale while the other
+        # container already refreshed -- adopt the on-disk token and skip a
+        # needless refresh that would rotate the refresh_token again.
+        on_disk = self._credentials.load()
+        if on_disk.access_token != self.access_token:
+            logger.info("Adopting Twitch token already refreshed by another process")
+            self.access_token = on_disk.access_token
+            self.refresh_token = on_disk.refresh_token
+            return
+
         record = self._credentials.refresh(self.client_id, self.client_secret)
         self.access_token = record.access_token
         self.refresh_token = record.refresh_token

@@ -32,12 +32,12 @@ TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
 TOKEN_FILE_PATH = Path(__file__).parent / "secrets" / "twitch_user_tokens.json"
 
-# stream-monitoring (root) and the Flink containers (uid 9999) share this
-# file. token_manager._write_atomic() keeps every container's write readable
-# to the others by chowning to a shared group -- see KNOWN_ISSUES.md Issue 1.
-# The seed runs on the host as an ordinary user who is usually not in that
-# group, so it cannot reproduce the chown. It must therefore not narrow the
-# mode either, or the first Flink read after a re-seed fails.
+# stream-monitoring and the Flink containers all run as uid:gid 9999 and
+# share this file. token_manager._write_atomic() keeps every container's
+# write readable to the others by chowning to that shared group. The seed
+# runs on the host as an ordinary user who is usually not in the group, so
+# it cannot reproduce the chown -- it must therefore not narrow the file
+# mode either, or the first container read after a re-seed fails.
 TWITCH_TOKEN_GID = int(os.getenv("TWITCH_TOKEN_GID", "9999"))
 
 # Required scopes.
@@ -51,6 +51,27 @@ REQUIRED_SCOPES = [AuthScope.USER_READ_CHAT, AuthScope.CLIPS_EDIT]
 def save_tokens(access_token: str, refresh_token: str, scopes: list[str]) -> None:
     """Save tokens to JSON file."""
     TOKEN_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # The containers (uid:gid 9999) refresh the token by writing a temp file
+    # *into* this directory and renaming it -- both need write on the dir, not
+    # just on the token file. A re-seed run by a host user who is not in gid
+    # 9999 can leave the directory at 0755, which silently breaks every future
+    # refresh (401 -> "[Errno 13] Permission denied: .../.tmp-tokens-*.json").
+    # Hand it to the shared group and make sure that group can write it.
+    try:
+        os.chown(TOKEN_FILE_PATH.parent, -1, TWITCH_TOKEN_GID)
+    except OSError:
+        pass  # not in the group / not permitted; the chmod below still helps
+    try:
+        current = os.stat(TOKEN_FILE_PATH.parent).st_mode & 0o777
+        os.chmod(TOKEN_FILE_PATH.parent, current | 0o070)
+    except OSError as exc:
+        print(
+            f"\nWARNING: could not make {TOKEN_FILE_PATH.parent} group-writable "
+            f"({exc}). If it is not drwxrwxr-x for gid {TWITCH_TOKEN_GID}, the "
+            "containers will not be able to refresh the token.",
+            flush=True,
+        )
 
     token_data = {
         "access_token": access_token,
