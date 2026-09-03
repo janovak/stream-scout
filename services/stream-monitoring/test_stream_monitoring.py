@@ -662,9 +662,11 @@ class TestTwitchCredentials:
         data = json.loads(token_file.read_text())
         assert data["updated_at"] == record.updated_at
 
-    def test_persist_interrupted_write_leaves_previous_file_intact(self, tmp_path):
-        """A crash between the temp-file write and the atomic replace must
-        not corrupt or lose the previous file."""
+    def test_persist_interrupted_write_leaves_previous_file_intact(self, tmp_path, caplog):
+        """A failure between the temp-file write and the atomic replace must
+        not corrupt or lose the previous file, and -- since persist() is
+        best effort (pyTwitchAPI calls it from inside a request) -- must be
+        logged at ERROR rather than raised."""
         token_file = tmp_path / "tokens.json"
         original = {
             "access_token": "old_access",
@@ -675,11 +677,12 @@ class TestTwitchCredentials:
         token_file.write_text(json.dumps(original))
 
         with patch("token_manager.os.replace", side_effect=OSError("simulated crash")):
-            with pytest.raises(OSError):
+            with caplog.at_level(logging.ERROR):
                 TwitchCredentials(token_file).persist("new_access", "new_refresh")
 
         assert json.loads(token_file.read_text()) == original
         assert list(tmp_path.glob(".tmp-tokens-*")) == []
+        assert any("could not be written" in r.message for r in caplog.records)
 
     def test_persist_sets_group_and_permissions_before_replace(self, tmp_path):
         """Issue 1 (KNOWN_ISSUES.md): mkstemp() always creates the temp file
@@ -796,6 +799,34 @@ class TestTwitchCredentials:
 
         assert record.access_token == "new_access"
         assert record.refresh_token == "old_refresh"
+
+    @patch("token_manager.requests.post")
+    def test_refresh_returns_the_new_token_even_if_it_cannot_be_written(
+        self, mock_post, tmp_path, caplog
+    ):
+        """If secrets/ is not writable, refresh() still hands back the token
+        it just minted (logged at ERROR) instead of raising -- a read-only
+        secrets/ must not turn a good refresh into a hard failure."""
+        token_file = tmp_path / "tokens.json"
+        token_file.write_text(json.dumps({
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+            "scopes": ["clips:edit"],
+        }))
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {
+            "access_token": "new_access", "refresh_token": "rotated", "expires_in": 3600,
+        }
+
+        with patch("token_manager.os.replace", side_effect=OSError("read-only fs")):
+            with caplog.at_level(logging.ERROR):
+                record = TwitchCredentials(token_file).refresh("client_id", "client_secret")
+
+        assert record.access_token == "new_access"
+        assert record.refresh_token == "rotated"
+        assert json.loads(token_file.read_text())["access_token"] == "old_access"
+        assert list(tmp_path.glob(".tmp-tokens-*")) == []
+        assert any("could not be written" in r.message for r in caplog.records)
 
     def test_concurrent_refreshes_serialize(self, tmp_path):
         """Two TwitchCredentials instances refreshing the same file at once

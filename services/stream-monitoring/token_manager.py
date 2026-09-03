@@ -26,13 +26,17 @@ logger = logging.getLogger("token_manager")
 
 TWITCH_TOKEN_ENDPOINT = "https://id.twitch.tv/oauth2/token"
 
-# stream-monitoring (root) and the Flink containers (uid 9999) all write this
-# file. mkstemp() always creates its temp file at 0600, owned by whichever
-# container wrote last, which locks the other containers out the moment they
-# need to reload it. Chowning every write to a group both sides belong to
-# closes that gap without touching the flock-based refresh lock. Defaults to
-# 9999, the Flink base image's baked-in gid, so a fresh checkout works with
-# no compose change -- override via env if that ever stops matching.
+# stream-monitoring and the Flink containers all run as uid:gid 9999 and all
+# write this file. mkstemp() creates its temp file at 0600 owned by the
+# writer; chowning every write to the shared group keeps it readable to the
+# others even if the uids ever diverge again. Defaults to 9999, the Flink
+# base image's baked-in gid (and what stream-monitoring's Dockerfile now
+# matches) -- override via env if that ever stops matching.
+#
+# The temp file is created *in* secrets/, so that directory must be writable
+# by gid 9999 (drwxrwxr-x). A host re-seed run outside the group can drop the
+# group-write bit; seed_twitch_tokens.py restores it, and every refresh below
+# degrades to in-memory-only rather than failing if it is missing.
 TWITCH_TOKEN_GID = int(os.environ.get("TWITCH_TOKEN_GID", "9999"))
 
 
@@ -70,7 +74,11 @@ class TwitchCredentials:
         """Store a new access/refresh token pair.
 
         Always reads the file first and keeps its `scopes` and `created_at`,
-        so a caller that never called `load` can't blank them out."""
+        so a caller that never called `load` can't blank them out.
+
+        Best-effort on the write (see `_write_best_effort`): pyTwitchAPI calls
+        this from inside its token-refresh callback, so a raise here would
+        abort whatever Helix request triggered the refresh."""
         with self._locked():
             existing = self._read_raw()
             record = TokenRecord(
@@ -80,16 +88,18 @@ class TwitchCredentials:
                 created_at=existing.get("created_at"),
                 updated_at=datetime.now(timezone.utc).isoformat(),
             )
-            self._write_atomic(record)
+            self._write_best_effort(record)
             return record
 
     def refresh(self, client_id: str, client_secret: str) -> TokenRecord:
-        """Refresh against Twitch's token endpoint and persist the result.
+        """Refresh against Twitch's token endpoint and return the new record.
 
         Holds the file lock for the whole read-refresh-write sequence, so a
         refresh racing from the other container waits instead of both
         rotating the refresh token and one of them ending up with a dead
-        one.
+        one. The refresh token sent is always the one read from disk inside
+        that lock, never a stale in-memory copy. Persisting the result is
+        best effort (see `_write_best_effort`).
         """
         with self._locked():
             existing = self._read_raw()
@@ -125,7 +135,7 @@ class TwitchCredentials:
                 created_at=existing.get("created_at"),
                 updated_at=datetime.now(timezone.utc).isoformat(),
             )
-            self._write_atomic(record)
+            self._write_best_effort(record)
             logger.info(
                 "Token refreshed successfully",
                 extra={"expires_in": data.get("expires_in", "unknown")},
@@ -133,6 +143,29 @@ class TwitchCredentials:
             return record
 
     # -- internals --
+
+    def _write_best_effort(self, record: TokenRecord) -> None:
+        """Persist `record`, but treat a filesystem failure as non-fatal.
+
+        `record` is already a valid, freshly minted token held by the
+        caller. If secrets/ is not writable by this process (a re-seed left
+        the dir mode wrong, disk full), turning that into an exception would
+        abort a clip creation or a pyTwitchAPI request for no gain -- the
+        token in hand still works. Log it at ERROR instead; the cost is that
+        another process won't observe this token and a rotated refresh_token
+        is not on disk, so the next refresh after this token expires may fail
+        until secrets/ is fixed. Deployments keep secrets/ writable (see
+        start.sh / seed_twitch_tokens.py); this is the safety net for when
+        they don't."""
+        try:
+            self._write_atomic(record)
+        except OSError as exc:
+            logger.error(
+                "Twitch token updated but could not be written to %s: %s "
+                "-- using it in memory only; fix secrets/ permissions",
+                self.token_file,
+                exc,
+            )
 
     def _read_raw(self) -> dict:
         try:
@@ -180,11 +213,11 @@ class TwitchCredentials:
             try:
                 os.chown(tmp_path, -1, TWITCH_TOKEN_GID)
             except PermissionError:
-                # Only the containers (root, or uid 9999 already in this
-                # group) ever need this to succeed. An unprivileged local
-                # run -- e.g. the host venv this test suite normally runs
-                # under -- isn't part of any cross-container race, so it's
-                # fine for the file to keep the process's own default gid.
+                # Only the containers (uid 9999, already in this group) ever
+                # need this to succeed. An unprivileged local run -- e.g. the
+                # host venv this test suite normally runs under -- isn't part
+                # of any cross-container race, so it's fine for the file to
+                # keep the process's own default gid.
                 logger.warning(
                     "Could not chown %s to gid %d; not running with the "
                     "privilege this needs outside a container",
@@ -210,12 +243,12 @@ class TwitchCredentials:
         containers mount the same host secrets/ directory, so the sidecar
         is visible across processes the same way the token file is.
 
-        The three containers do not run as the same user (stream-monitoring
-        runs as root; the Flink containers drop to uid 9999). A plain
-        open(path, "w") applies the process umask, so whichever container
-        creates the sidecar first can leave it unreadable to the others.
-        os.open with an explicit mode plus an fchmod forces the sidecar to
-        stay 0o666 regardless of umask or which container created it.
+        The three containers now all run as uid:gid 9999, but a plain
+        open(path, "w") still applies the process umask, so the first
+        container to create the sidecar could leave it unreadable to the
+        others (or to a host re-seed). os.open with an explicit mode plus an
+        fchmod forces the sidecar to stay 0o666 regardless of umask or
+        writer -- cheap insurance against the uids diverging again.
         """
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.token_file.with_name(self.token_file.name + ".lock")

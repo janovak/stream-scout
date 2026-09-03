@@ -299,10 +299,16 @@ class TwitchAPIClient:
             raise TokenValidationError(f"Token validation failed with status {response.status_code}")
 
     def _refresh(self) -> None:
-        """Refresh the access token via the shared credentials module, which
-        holds a cross-process file lock across the read-refresh-write so a
-        concurrent refresh from another container can't leave either side
-        holding a dead token."""
+        """Refresh the access token via the shared credentials module.
+
+        refresh() holds a cross-process file lock across the whole
+        read-refresh-write and reads the *current* refresh token from disk
+        inside that lock, so a refresh racing from stream-monitoring can't
+        leave either side spending a rotated-away refresh token. It returns
+        the freshly minted token even if it could not be written back to
+        secrets/ (logged loudly), so a read-only secrets/ degrades to
+        "works until this token expires" rather than an immediate hard
+        failure."""
         record = self._credentials.refresh(self.client_id, self.client_secret)
         self.access_token = record.access_token
         self.refresh_token = record.refresh_token

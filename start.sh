@@ -12,6 +12,25 @@ echo "[1/2] Stopping existing containers..."
 docker compose down
 
 echo ""
+# All three services run as uid:gid 9999 and refresh the Twitch token by
+# writing a temp file into secrets/ and renaming it -- so that directory must
+# be owned by (or group 9999 and group-writable). A bind source that Docker
+# or an old re-seed created as root:root, or 0755, silently breaks every
+# future token refresh. Normalise it here, from inside a throwaway container
+# so this works without host root. 2775 keeps new lock/temp files in gid 9999.
+if [ -d ./secrets ]; then
+    if ! docker run --rm -v "$(pwd)/secrets:/secrets" busybox:1.36 sh -c '
+            set -e
+            chgrp 9999 /secrets
+            chmod 2775 /secrets
+            [ -e /secrets/twitch_user_tokens.json ] &&
+                chgrp 9999 /secrets/twitch_user_tokens.json || true'; then
+        echo "WARNING: could not normalise ./secrets ownership/permissions." >&2
+        echo "         Token refresh will fail unless ./secrets is group 9999 and" >&2
+        echo "         mode 2775. Fix with: sudo chgrp -R 9999 ./secrets && sudo chmod 2775 ./secrets" >&2
+    fi
+fi
+
 echo "[2/2] Starting all services..."
 # --wait blocks until every service with a health check reports healthy,
 # flink-jobmanager included (see its health check in docker-compose.yml).

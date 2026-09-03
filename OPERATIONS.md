@@ -596,6 +596,38 @@ docker compose restart flink-jobmanager
 docker compose up -d --wait --wait-timeout 500 flink-jobmanager
 ```
 
+### Clips stop being created, but anomaly detection keeps running
+
+On the **StreamScout Overview** dashboard, "Clips Created" falls to zero and
+"Clips Failed" climbs while the anomaly line is unaffected. In
+`streamscout-flink-taskmanager` logs:
+
+```
+Create clip API response: status=401 ... "Invalid OAuth token"
+Create clip exception ...: [Errno 13] Permission denied: '/opt/flink/secrets/.tmp-tokens-....json'
+CLIP CREATION FAILED ... reason=api_error
+```
+
+The access token expired and the job cannot persist a refreshed one: the
+bind-mounted `secrets/` directory is not writable by the container user
+(uid:gid 9999). Anomaly detection needs no token, so it is unaffected. The
+job keeps serving the last token it holds and logs
+`could not be written to ... using it in memory only` at ERROR every refresh,
+so clips limp on for one token lifetime (~4 h) and then fail hard.
+
+```bash
+ls -ld ./secrets                 # want: group 9999 (twitchtoken), mode 2775
+sudo chgrp -R 9999 ./secrets && sudo chmod 2775 ./secrets
+docker compose restart flink-jobmanager flink-taskmanager
+```
+
+A re-seed (`seed_twitch_tokens.py`) run by a host user not in gid 9999, or a
+bind source Docker first created as `root:root`, is the usual cause. `start.sh`
+re-normalises `secrets/` on every startup (from a throwaway `busybox` container
+so it needs no host root); `seed_twitch_tokens.py` attempts the same on write
+and prints the exact `chgrp`/`chmod` to run if it cannot. A stale checkout that
+predates those is the likely culprit here.
+
 ### Adding a new Python module
 Two steps, not one:
 1. Add a bind-mount line for the new file, under both `flink-jobmanager` and `flink-taskmanager` in `docker-compose.yml` (`volumes:`), matching the existing four.

@@ -32,12 +32,12 @@ TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
 TOKEN_FILE_PATH = Path(__file__).parent / "secrets" / "twitch_user_tokens.json"
 
-# stream-monitoring (root) and the Flink containers (uid 9999) share this
-# file. token_manager._write_atomic() keeps every container's write readable
-# to the others by chowning to a shared group -- see KNOWN_ISSUES.md Issue 1.
-# The seed runs on the host as an ordinary user who is usually not in that
-# group, so it cannot reproduce the chown. It must therefore not narrow the
-# mode either, or the first Flink read after a re-seed fails.
+# stream-monitoring and the Flink containers all run as uid:gid 9999 and
+# share this file. token_manager._write_atomic() keeps every container's
+# write readable to the others by chowning to that shared group. The seed
+# runs on the host as an ordinary user who is usually not in the group, so
+# it cannot reproduce the chown -- it must therefore not narrow the file
+# mode either, or the first container read after a re-seed fails.
 TWITCH_TOKEN_GID = int(os.getenv("TWITCH_TOKEN_GID", "9999"))
 
 # Required scopes.
@@ -48,9 +48,49 @@ TWITCH_TOKEN_GID = int(os.getenv("TWITCH_TOKEN_GID", "9999"))
 REQUIRED_SCOPES = [AuthScope.USER_READ_CHAT, AuthScope.CLIPS_EDIT]
 
 
+def _ensure_dir_writable_by_containers(directory: Path) -> None:
+    """Make `directory` writable by gid TWITCH_TOKEN_GID (9999).
+
+    All three services run as uid:gid 9999 and refresh the token by creating a
+    temp file *in* this directory and renaming it -- that needs write on the
+    directory, not just the token file. A re-seed by a host user outside gid
+    9999 can leave it 0755 / wrong-group, which silently breaks every future
+    refresh (401 -> "[Errno 13] Permission denied: .../.tmp-tokens-*.json").
+
+    Best effort: chown/chmod only succeed for the directory's owner or root.
+    Whatever happens, re-stat and say plainly whether a container can now
+    write it, rather than assuming the chmod was enough.
+    """
+    try:
+        os.chown(directory, -1, TWITCH_TOKEN_GID)
+    except OSError:
+        pass  # not permitted; the check below reports the real outcome
+    try:
+        # setgid so new temp/lock files inherit gid 9999; + group rwx.
+        mode = os.stat(directory).st_mode & 0o7777
+        os.chmod(directory, mode | 0o2070)
+    except OSError:
+        pass
+
+    st = os.stat(directory)
+    writable = st.st_gid == TWITCH_TOKEN_GID and bool(st.st_mode & 0o020)
+    if not writable:
+        print(
+            f"\nWARNING: {directory} is not writable by the container group "
+            f"(want: group {TWITCH_TOKEN_GID}, mode g+w; have: group "
+            f"{st.st_gid}, mode {oct(st.st_mode & 0o777)}).\n"
+            f"         Token refresh will fail until you run:\n"
+            f"           sudo chgrp {TWITCH_TOKEN_GID} {directory} && "
+            f"sudo chmod 2775 {directory}",
+            flush=True,
+        )
+
+
 def save_tokens(access_token: str, refresh_token: str, scopes: list[str]) -> None:
     """Save tokens to JSON file."""
     TOKEN_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    _ensure_dir_writable_by_containers(TOKEN_FILE_PATH.parent)
 
     token_data = {
         "access_token": access_token,

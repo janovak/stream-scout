@@ -6,6 +6,8 @@ Tests the anomaly detection logic, command filtering, and clip creation flow.
 """
 
 import json
+import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -123,7 +125,6 @@ class TestTwitchAPIClient:
     @patch("token_manager.requests.post")
     def test_token_refresh_on_expiry(self, mock_post, token_file):
         """Token should be refreshed when expired."""
-        # First call for token refresh
         mock_post.return_value.status_code = 200
         mock_post.return_value.json.return_value = {
             "access_token": "new_token",
@@ -136,6 +137,76 @@ class TestTwitchAPIClient:
         client._refresh()
 
         assert client.access_token == "new_token"
+
+    @patch("token_manager.requests.post")
+    def test_refresh_uses_the_on_disk_refresh_token_not_the_stale_in_memory_one(
+        self, mock_post, token_file
+    ):
+        """refresh() reads the refresh token from disk inside its lock, so a
+        client whose in-memory copy lags a peer's rotation still refreshes
+        against the live token rather than a spent one."""
+        Path(token_file).write_text(json.dumps({
+            "access_token": "a_from_peer",
+            "refresh_token": "r_from_peer",   # peer already rotated to this
+            "scopes": ["clips:edit"],
+        }))
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {
+            "access_token": "a_new", "refresh_token": "r_new", "expires_in": 3600,
+        }
+
+        client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
+        client.access_token = "a_stale"
+        client.refresh_token = "r_stale"
+
+        client._refresh()
+
+        sent = mock_post.call_args.kwargs["data"]["refresh_token"]
+        assert sent == "r_from_peer"
+        assert client.access_token == "a_new"
+
+    @patch("clip_detector_job.requests.post")
+    def test_create_clip_succeeds_when_refreshed_token_cannot_be_persisted(
+        self, mock_post, token_file
+    ):
+        """A refresh whose write to secrets/ fails (dir not group-writable,
+        disk full) must not turn into a hard clip failure -- the in-memory
+        token still works. Patching clip_detector_job.requests.post also
+        covers token_manager, which imports the same requests module."""
+        if os.geteuid() == 0:
+            pytest.skip("root ignores directory mode bits; can't simulate EACCES")
+        # The lock sidecar persists in a real deployment; only the atomic
+        # write of a fresh temp file is what fails when secrets/ goes
+        # read-only. Pre-create the lock, then drop dir write permission.
+        token_dir = Path(token_file).parent
+        (token_dir / (Path(token_file).name + ".lock")).touch(mode=0o666)
+        original_mode = token_dir.stat().st_mode
+
+        clip_calls = []
+
+        def route(url, *args, **kwargs):
+            if "oauth2/token" in url:
+                return MagicMock(status_code=200, json=MagicMock(return_value={
+                    "access_token": "refreshed_token", "expires_in": 3600,
+                }))
+            clip_calls.append(url)
+            if len(clip_calls) == 1:
+                return MagicMock(status_code=401, text="Invalid OAuth token")
+            return MagicMock(status_code=202, json=MagicMock(
+                return_value={"data": [{"id": "clip_after_refresh"}]}))
+
+        mock_post.side_effect = route
+        token_dir.chmod(0o500)
+        try:
+            client = TwitchAPIClient("client_id", "client_secret", token_file, validate_on_init=False)
+            # Our token matches what's on disk, so _refresh() does a real
+            # (mocked) network refresh -- whose write-back is what fails.
+            client.access_token = "test_token"
+
+            assert client.create_clip(12345) == "clip_after_refresh"
+            assert client.access_token == "refreshed_token"
+        finally:
+            token_dir.chmod(original_mode)
 
 
 class TestDataClasses:
