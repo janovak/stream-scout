@@ -1,0 +1,643 @@
+# Autonomous Decision Log: Suppress Gift and Raid Chat Bursts
+
+This log records material choices considered during Feature 007. Decisions 1-4
+were directly accepted before autonomous execution was enabled. Decision 5 was
+selected autonomously after the user instructed the agent not to ask further
+questions.
+
+Decisions 17-21 were taken during a later remediation pass over the artifacts.
+Where a remediation decision replaces an earlier one, the earlier entry is
+marked **superseded** and left in place with its original text rather than being
+rewritten, so the reasoning that led to the replacement stays readable.
+
+## 1. Suppression windows
+
+**Question**: How long should gift and raid suppression last, and how should
+those durations be determined?
+
+| Option | Description |
+|--------|-------------|
+| A | Operator-configurable windows defaulting to 120 seconds for gifts and 180 seconds for raids, with no viewer-count scaling. |
+| B | Fixed windows of 120 seconds for gifts and 180 seconds for raids. |
+| C | Operator-configurable windows defaulting to 180 seconds for both gifts and raids. |
+| D | Gift windows remain fixed while raid windows vary by viewer-count tier. |
+
+**Selection**: Option A — directly accepted.
+
+**Rationale**: Separate defaults reflect the expected burst lengths while
+remaining tunable from operational evidence. Avoiding viewer scaling keeps
+behavior deterministic and prevents audience size from becoming a policy
+dependency.
+
+**Stage**: Clarification.
+
+**Impact**: Defines suppression-window requirements, overlap behavior, replay
+expectations, and future configuration work.
+
+## 2. Trigger notices and overlapping hype
+
+**Question**: Which notification types should trigger suppression, and what
+should happen when genuine hype overlaps a suppression window?
+
+| Option | Description |
+|--------|-------------|
+| A | Trigger only on `community_sub_gift`, `sub_gift`, and `raid`; exclude `unraid`, plain `sub`, and `resub`; accept overlapping genuine hype as a false negative. |
+| B | Use the same trigger set but attempt to preserve genuine hype that overlaps a suppression window. |
+| C | Also trigger suppression for plain `sub` and `resub` notifications. |
+
+**Selection**: Option A — directly accepted.
+
+**Rationale**: The narrow trigger set targets the known low-value bursts.
+Accepting overlap false negatives keeps suppression deterministic and avoids
+adding a second, competing spike-classification policy.
+
+**Stage**: Clarification.
+
+**Impact**: Fixes the supported notice set, exclusion cases, overlap acceptance
+tests, and feature scope.
+
+## 3. Missing or delayed suppression signals
+
+**Question**: How should clip detection behave when notification coverage is
+missing or lagging, or suppression delivery is delayed?
+
+| Option | Description |
+|--------|-------------|
+| A | Fail open, expose the degraded condition, and never retract an emitted clip. |
+| B | Fail closed by blocking clip emission while suppression health is uncertain. |
+| C | Wait up to 30 seconds for suppression data, then fail open. |
+
+**Selection**: Option A — directly accepted.
+
+**Rationale**: Fail-open behavior preserves existing clip availability and
+avoids turning an auxiliary signal failure into a clipping outage. Explicit
+degradation signals retain operator visibility without retroactive mutation.
+
+**Stage**: Clarification.
+
+**Impact**: Defines failure behavior, late-arrival semantics, observability,
+and degraded-path acceptance criteria.
+
+## 4. Suppressed-spike visibility
+
+**Question**: What operator visibility should a suppressed
+would-have-clipped spike produce?
+
+| Option | Description |
+|--------|-------------|
+| A | Emit both an operator-visible metric and a structured log. |
+| B | Emit an operator-visible metric only. |
+| C | Emit a structured log only. |
+| D | Emit no operator signal. |
+
+**Selection**: Option A — directly accepted.
+
+**Rationale**: A metric supports aggregate monitoring and tuning, while a
+structured log supports channel-level diagnosis. Together they make
+suppression measurable without creating a clip.
+
+**Stage**: Clarification.
+
+**Impact**: Adds per-decision observability requirements, acceptance criteria,
+and operator-facing diagnostic expectations.
+
+## 5. Monitored-set capacity
+
+**Question**: What capacity ceiling and ramp thresholds should apply after
+adding a second subscription per monitored channel?
+
+| Option | Description |
+|--------|-------------|
+| A | Set a firm 400-channel maximum with `JOIN_THRESHOLD=400` and `LEAVE_THRESHOLD=400`, retaining the existing session-capacity assumptions. |
+| B | Use `JOIN_THRESHOLD=350` and `LEAVE_THRESHOLD=400` within the same 400-channel ceiling. |
+| C | Revisit connection and session assumptions before reducing monitored-set capacity. |
+
+**Selection**: Option A — selected autonomously after the no-questions
+instruction.
+
+**Rationale**: This matches the roadmap's locked capacity decision, preserves
+100 of the existing 900 subscription slots for reconnect and adoption safety,
+and avoids expanding Feature 007 into a session-capacity redesign.
+
+**Stage**: Clarification.
+
+**Impact**: Sets the runtime ramp thresholds, capacity requirements, 401st
+channel refusal behavior, operational guidance, and capacity-focused tests.
+
+## 6. Where the two-subscriptions-per-channel model lives
+
+**Question**: Which component owns the two-subscriptions-per-channel state
+model — the EventSub pool, or the reconciler's desired/actual diff?
+
+| Option | Description |
+|--------|-------------|
+| A | The pool owns it: one slot record per (channel, coverage type), a channel-level coverage view, and a `list()` that reports a channel only when both types are enabled. The reconciler stays channel-keyed and behaviorally unchanged. |
+| B | The reconciler owns it: its desired and actual sets become keyed by (channel, type), and the transport interface becomes type-aware end to end. |
+| C | A second transport instance dedicated to notifications, with its own connections. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: The reconciler's channel-keyed diff carries rank ordering, the
+per-channel refusal cache, the retry and concurrency budget, and the
+channel-level count metric. Option B would rewrite all of that for no
+behavioral gain and would make a per-type refusal indistinguishable from a
+channel refusal. Option C would need more websocket connections than Twitch
+permits for one client-id/user-id pair. Option A confines the change to the
+component that already models sessions, slots, occupancy, and staleness.
+
+**Stage**: Planning.
+
+**Impact**: Sets the implementation boundary and the task split; keeps
+`reconciler.py` off the change list; makes coverage a pool-owned derived state
+with its own channel-counting metric alongside subscription-counting occupancy.
+
+## 7. Auxiliary subscription refused while chat is live
+
+> **Superseded by decision 17.** The original text is preserved below exactly
+> as written. Option A's clause "stop retrying that type until re-adoption or
+> restart" made the degraded state effectively permanent, which contradicts
+> FR-001's dual-coverage requirement. Decision 17 keeps everything else about
+> option A and replaces that clause with a bounded retry policy.
+
+**Question**: What should happen when Twitch refuses the
+`channel.chat.notification` subscription for one channel while that channel's
+chat subscription is live and healthy?
+
+| Option | Description |
+|--------|-------------|
+| A | Record the channel as auxiliary-refused inside the pool, keep chat, report the channel as covered-but-degraded, and stop retrying that type until re-adoption or restart. |
+| B | Propagate the refusal to the reconciler as an ordinary channel refusal. |
+| C | Retry the auxiliary subscription on every reconcile pass indefinitely. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: Option B would write the channel into the durable refusal cache
+and skip it for the seven-day recheck window, so an auxiliary-signal refusal
+would remove that channel's chat ingestion entirely — data loss caused by a
+feature that is only supposed to gate emission. Option C spends create budget
+and log volume every pass, forever, at 400 channels. Option A keeps the chat
+pipeline intact, keeps the degraded state operationally visible, and matches
+the specified fail-open behavior.
+
+**Stage**: Planning.
+
+**Impact**: Adds a degraded coverage state and its metric, changes error
+classification in the pool, and adds an explicit acceptance test that a
+notification refusal never evicts chat coverage.
+
+## 8. How suppression reaches the detector
+
+**Question**: What transport and operator shape should carry suppression from
+the monitoring service to the clip detector?
+
+| Option | Description |
+|--------|-------------|
+| A | A dedicated versioned Kafka topic keyed by broadcaster id, consumed by a second Kafka source connected to the keyed chat stream through a keyed two-input process function. |
+| B | The same dedicated topic, but broadcast to every subtask through broadcast state. |
+| C | Sentinel records embedded in the existing chat topic. |
+| D | The detector reads suppression from Postgres or Redis at decision time. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: The signal is per channel, so keying it the same way the chat
+stream is keyed gives channel isolation structurally rather than by convention.
+Broadcast state fans per-channel data to every subtask and abandons keyed
+state. Sentinel records would break the frozen chat schema contract and route a
+notice through the command filter and chat mapper. An external lookup would add
+I/O to a path that runs once per second per broadcaster and would contradict
+the requirement that services communicate over Kafka.
+
+**Stage**: Planning.
+
+**Impact**: Defines the new topic, its keying and partitioning, the contract
+file, and the conversion of the detector operator into a keyed two-input
+function with a second source.
+
+## 9. Watermarks and offsets for the suppression input
+
+**Question**: How should the suppression stream participate in event time,
+given that a two-input operator's watermark is the minimum of its inputs and
+this stream is silent for hours?
+
+| Option | Description |
+|--------|-------------|
+| A | Real event-time watermarks from the notice occurrence time, bounded out-of-orderness matching the chat stream, an idleness timeout strictly shorter than the chat stream's, latest starting offsets, and partition count equal to job parallelism. |
+| B | No watermarks on the suppression source. |
+| C | Earliest starting offsets so a restart replays recent notices. |
+| D | Process-time semantics for the suppression side only. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: Option B never advances the minimum, which freezes the operator
+watermark and stops per-second evaluation for every channel — an outage far
+worse than the false positives being removed. Option C feeds hours-old
+timestamps into the same minimum at startup and pins event time in the past
+until the backlog drains. Option D would mix two clocks in one comparison.
+Option A keeps the suppression input from ever being the binding minimum in
+steady state and keeps both sides on Twitch's clock.
+
+**Stage**: Planning.
+
+**Impact**: Fixes the source configuration, the topic partition count, a new
+idleness constant, restart behavior (state starts empty and fails open), and
+the deployed watermark-stall check that gates enabling gating in production.
+
+## 10. Where the suppression gate sits, and what it may change
+
+**Question**: Should suppression be applied inside the detector's evaluation
+arithmetic, or as a filter on its output, and may it change cooldown state?
+
+| Option | Description |
+|--------|-------------|
+| A | An output-only filter after evaluation and after every keyed state write, including the last-fire cooldown update. |
+| B | Applied inside the evaluation function, so a suppressed period never opens or closes a hold and never records a fire. |
+| C | An output-only filter, but skipping the last-fire cooldown update so the cooldown only starts on real clips. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: The specification requires that only clip emission and the two
+required operator signals differ from an ungated run, and that all
+message-derived state be identical. Option B changes hold and expiry
+trajectories and would break both that guarantee and the existing pure-module
+test suite. Option C diverges from the ungated run for the length of the
+cooldown after every suppressed decision, which makes the identical-state
+success criterion unprovable. Option A costs one thing — a suppressed decision
+starts the cooldown as if a clip had been created — and that window lies inside
+a longer suppression window where no clip could have been emitted anyway.
+
+**Stage**: Planning.
+
+**Impact**: Defines the exact gate location, keeps the pure evaluation function
+unchanged, and makes the gated-versus-ungated replay equivalence the decisive
+offline acceptance evidence.
+
+## 11. Which moment of a spike is tested against the deadline
+
+**Question**: When a decision is reported, is the suppression deadline compared
+against the peak second of the spike or the second the decision was reported?
+
+| Option | Description |
+|--------|-------------|
+| A | The peak second of the reported spike. |
+| B | The report second. |
+| C | Suppress if either falls inside the window. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: The peak is the moment chat actually burst, it is the timestamp
+recorded with the clip, and it is what "a spike inside the window" means. Under
+option B a burst that peaks inside the window but is reported after the
+peak-hold cap escapes suppression, which is the exact failure this feature
+exists to prevent. Option C additionally suppresses spikes that peaked before
+the notice occurred, which no requirement asks for.
+
+**Stage**: Planning.
+
+**Impact**: Fixes the gate predicate, makes suppression independent of
+peak-hold timing, and defines the boundary cases the detector tests must cover.
+
+## 12. Where suppression window durations are applied
+
+**Question**: Should the producer compute and publish the suppression deadline,
+or should it publish the raw notice and let the consumer apply the window?
+
+| Option | Description |
+|--------|-------------|
+| A | The producer publishes notice category and occurrence time only; the consumer applies the operator-configured window. |
+| B | The producer computes the deadline and publishes it. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: Option B bakes policy into retained records, so a window change
+would leave records on the topic that mean something the configuration no
+longer says, and it would split the window constants across two services with
+independent deploys. Option A keeps the topic a record of what happened rather
+than of what was decided, so retuning is a consumer configuration change and
+replay stays meaningful.
+
+**Stage**: Planning.
+
+**Impact**: Determines the contract's field set, places the window
+configuration on the detector service, and keeps the topic policy-free and
+replay-safe.
+
+## 13. Malformed notices at the producer
+
+**Question**: What should the producer do with a notice that lacks a
+trustworthy channel identity or occurrence time?
+
+| Option | Description |
+|--------|-------------|
+| A | Publish nothing, increment a malformed counter, and log; never substitute another clock. |
+| B | Publish with a null occurrence time and let the consumer decide. |
+| C | Substitute the ingestion clock for the missing occurrence time. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: The requirement is explicit that a malformed input must not
+create a guessed deadline and must be operationally visible. Options B and C
+both end in a fabricated deadline that would suppress real clips. This is a
+deliberate asymmetry with the chat path, which publishes a message with a null
+send time rather than dropping it: dropping chat would be data loss, whereas
+dropping one auxiliary notice degrades to the fail-open behavior the system is
+already designed to survive.
+
+**Stage**: Planning.
+
+**Impact**: Sets the producer validation rules in the contract, adds the
+malformed-input counter and log required for operational visibility, and
+documents why the two paths differ.
+
+## 14. Zero-width hysteresis band at the locked 400/400 thresholds
+
+**Question**: The locked capacity decision sets join and leave thresholds to
+the same value, which removes the hysteresis band that stops a boundary-rank
+channel from leaving and rejoining each poll. How should that be handled?
+
+| Option | Description |
+|--------|-------------|
+| A | Implement 400/400 exactly as locked, add an explicit monitored-set churn signal so the cost is measured rather than assumed, and record a narrower entry threshold inside the same ceiling as a follow-up that would require a specification change. |
+| B | Quietly implement a narrower entry threshold, for example 380/400, to restore a band. |
+| C | Special-case hysteresis in code so the band exists regardless of configuration. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: Options B and C contradict a locked, explicitly clarified
+requirement and hide policy from the configuration operators read. The churn
+cost is real but bounded — it affects only channels oscillating across the
+ceiling rank, and each affected channel simply re-warms its baseline — so
+measuring it is a better basis for any future change than pre-emptively
+deviating from the specification.
+
+**Stage**: Planning.
+
+**Impact**: Keeps the locked thresholds intact, adds a churn metric and a ramp
+observation step, and records the follow-up option without acting on it.
+
+## 15. Rollback lever for emission gating
+
+> **Partially superseded by decision 21.** The original text is preserved below
+> exactly as written. The kill switch itself stands. What does not stand is the
+> ordering clause "restores the safe ramp before unwinding auxiliary
+> subscriptions" and its rationale sentence "Unwinding capacity before
+> thresholds would leave the monitored set larger than the capacity model in
+> force" — that order is the unsafe one while two subscriptions per channel are
+> still live. Decision 21 replaces the ordering and adds the checked-in default
+> for the switch.
+
+**Question**: How should an operator disable suppression gating if it misbehaves
+in production?
+
+| Option | Description |
+|--------|-------------|
+| A | An operator-settable switch that disables gating while leaving both subscriptions and the topic in place, plus a documented rollback order that restores the safe ramp before unwinding auxiliary subscriptions. |
+| B | Revert the code revision and redeploy. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: The failure this protects against is clips silently not being
+created, and the correct first response is to stop gating within one restart of
+one container rather than to run a code rollback under pressure. Keeping the
+subscriptions and topic in place while gating is off also preserves the
+evidence needed to diagnose the problem. Unwinding capacity before thresholds
+would leave the monitored set larger than the capacity model in force, so the
+order is fixed rather than left to judgement.
+
+**Stage**: Planning.
+
+**Impact**: Adds one detector configuration switch, defines the deployment
+sequence (deploy with gating off, verify coverage and watermarks, then enable),
+and fixes the rollback ordering documented for operations.
+
+## 16. Deployment ordering of the capacity reduction
+
+**Question**: Should the monitored-set reduction to 400 and the
+two-subscriptions-per-channel transport be deployed together, or separately?
+
+| Option | Description |
+|--------|-------------|
+| A | Two steps: reduce the ramp to 400 on the current single-subscription revision, let the monitored set converge, and only then deploy the two-subscription revision. |
+| B | One step: deploy the threshold change and the transport change together. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: The desired set is stored in Redis and survives a restart. On
+deploy, the reconciler converges to the set that is already there, while the
+poller only rewrites it on its next scheduled tick up to two minutes later.
+Under option B the new transport would therefore begin creating two
+subscriptions for each of roughly eight hundred previously monitored channels,
+against a nine-hundred-subscription ceiling, before the smaller set was
+written. Option A makes that impossible: reducing the ceiling on the old code
+is always within capacity, and the new transport never observes a set larger
+than its capacity model permits.
+
+**Stage**: Planning.
+
+**Impact**: Fixes the deployed validation sequence, adds an explicit
+pre-deployment convergence step to the validation procedure, and records the
+Redis-resident desired set as the reason the two changes cannot be collapsed
+into one deployment.
+
+## 17. Recovery policy for a refused auxiliary subscription
+
+**Question**: Decision 7 kept chat and failed open when Twitch refuses the
+`channel.chat.notification` subscription for one channel, but stopped retrying
+that type "until re-adoption or restart", which makes the degraded state
+effectively permanent and quietly contradicts FR-001. What recovery policy
+should replace that clause?
+
+| Option | Description |
+|--------|-------------|
+| A | Keep the pool-local degraded state permanent, as decision 7 wrote it. |
+| B | Bounded retry: suppress repeated notification creates for `AUXILIARY_REFUSAL_RETRY_SECONDS` = 3600 s after a refusal, then make the channel repairable again; force eligibility immediately on websocket reconnect or connection retirement; clear the state on successful creation or adoption. During the hold-off the channel is reported as actual-but-degraded so the reconciler does not hot-loop; after expiry it is partial again and normal create repair resumes. |
+| C | Exponential backoff from seconds to hours, with no ceiling. |
+| D | Retry every reconcile pass, as decision 7's rejected option C. |
+
+**Selection**: Option B — selected autonomously.
+
+**Rationale**: Option A trades one coverage hole for another: a transient
+refusal — a momentary 403, a session-scoped failure, a Twitch-side blip —
+becomes a permanent hole that only a container restart repairs, and the
+artifacts would then be requiring universal dual coverage while the design
+guaranteed a class of channels never regained it. Option D is what decision 7
+correctly rejected: at 400 channels it spends create budget and log volume every
+pass forever. Option C adds state and tuning surface to solve a problem a flat
+hour already solves, and an unbounded ceiling recreates option A's failure at
+the tail. Option B keeps every property decision 7 was protecting — chat is
+never evicted, no seven-day channel refusal is written, the reconciler does not
+hot-loop — and adds only the property it was missing: the state expires. One
+hour is short enough that a transient refusal costs at most one hour of
+suppression coverage on one channel, and long enough that a genuinely permanent
+refusal costs one create attempt per hour rather than one per pass.
+
+**Stage**: Remediation.
+
+**Impact**: Amends FR-001, NFR-003, and SC-001 to state the bounded exception
+explicitly; adds `AUXILIARY_REFUSAL_RETRY_SECONDS` (default 3600) to the
+`stream-monitoring` configuration; turns `auxiliary_refused` into a
+`auxiliary_refused_until_ms` deadline in the coverage model with data-model
+invariant I17; folds the expiry, reconnect, and adoption cases into the existing
+T016 tests and T024 implementation without adding a task.
+
+## 18. Watermark cost of a sparse source becoming active again
+
+**Question**: Idleness keeps a silent suppression subtask out of the two-input
+watermark minimum, but the subtask re-enters that minimum the moment it emits a
+record. On a source that is silent for hours and then delivers one isolated
+notice, how should the resulting watermark hold be handled?
+
+| Option | Description |
+|--------|-------------|
+| A | Document and accept it, with a conservative upper bound of `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` before the subtask goes idle again and releases the minimum; test the bound offline in the replay harness's simplified model and measure it deployed as part of E3. |
+| B | Emit heartbeat or synthetic records on the topic so the source is never idle. |
+| C | Give the suppression side process-time or ingestion-time watermarks so it can never hold event time back. |
+| D | Set `SUPPRESSION_IDLENESS_SECONDS` to a very small value so the hold is negligible. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: The hold is real, bounded, and short: at most the idleness
+timeout plus the out-of-orderness bound, after which the subtask is idle again.
+That is one to two orders of magnitude smaller than the shortest suppression
+window it protects, and it delays per-second evaluation rather than stopping it.
+Option B introduces exactly the heartbeat protocol the feature's scope forbids,
+with its own failure modes, purely to avoid a delay measured in seconds.
+Option C is the two-clocks mistake decision 9 already rejected — it would make
+`peak_second * 1000 < suppress_until_ms` a comparison between different clocks.
+Option D trades the hold for flapping: a very short idleness makes the source
+oscillate between idle and active around every record, and it narrows the margin
+below the chat stream's 10 s that keeps suppression from being the binding
+minimum in the first place. Accepting a bound and proving it is a better answer
+than engineering around a cost that is smaller than the thing it protects.
+
+**Stage**: Remediation.
+
+**Impact**: Adds research §4.1.1 and risk R10, data-model invariant I16, and the
+offline simplified-model case to the existing T050; makes deployed E3 require
+**both** prolonged silence and an isolated notice after silence, so the
+re-entry case is measured rather than assumed.
+
+## 19. Release disposition for 400/400 desired-set churn
+
+**Question**: Decision 14 accepted the zero-width hysteresis band and added a
+churn signal so the cost would be measured rather than assumed, but never said
+what measurement would be unacceptable. What disposition applies?
+
+| Option | Description |
+|--------|-------------|
+| A | Keep the signal with no threshold — observe and judge case by case. |
+| B | Bound it: entries plus departures attributable to the band, averaged per poll across a 24-hour deployed observation, must not exceed 2% of the 400-channel ceiling (8 membership changes per poll). Exceeding the bound blocks enabling gating and is resolved by a specification change to a narrower join threshold inside the firm 400 ceiling — never by hidden code behaviour. |
+| C | Bound it tightly, at well under 1% per poll. |
+| D | Have the service widen the band automatically when observed churn is high. |
+
+**Selection**: Option B — selected autonomously.
+
+**Rationale**: Option A leaves the acceptance unfalsifiable; a signal nobody can
+fail is documentation, not a gate, and the entire reason decision 14 accepted
+the locked thresholds was that the cost would be *measured*. Option D is the
+hidden-policy option decision 14 already rejected, in a more sophisticated
+disguise: operators would read 400/400 in the configuration and the service
+would be enforcing something else. Option C would fail for reasons unrelated to
+this feature — boundary-rank movement in the ranking is normal, and a bound that
+trips on ordinary churn would block a good release. Two percent of the ceiling
+is a rate at which at most eight channels re-warm their baselines per poll,
+which is absorbable against 400 monitored channels and still small enough that
+crossing it indicates genuine thrash. Routing the failure to a specification
+change keeps the locked decision and the configuration honest: if the band must
+narrow, that is a product decision, made in the open.
+
+**Stage**: Remediation.
+
+**Impact**: Adds NFR-007 and SC-011 to the specification; adds the 24-hour
+observation and its bound to deployed evidence E2 and quickstart B4; extends
+T027/T028 to pin the churn accounting locally while leaving the rate itself
+explicitly deployed; adds data-model invariant I20 and research decision D14.
+
+## 20. What "lagging suppression delivery" means when the topic is legitimately silent
+
+**Question**: NFR-005 requires lagging delivery to be distinguishable from
+healthy delivery, but the suppression topic is silent for hours in normal
+operation, and silence is what both a healthy system and a stalled broker path
+look like. How is delivery health defined without adding a heartbeat?
+
+| Option | Description |
+|--------|-------------|
+| A | Treat silence as healthy. |
+| B | Treat silence as lagging. |
+| C | Define three states from received records using `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`, with `consumer_receipt_ms` captured from an injected/current consumer clock at `process_element2` receipt. Against `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` = 30, age at or below is healthy, above is lagging, and a window with no record is idle/unknown — neither healthy nor lagging. Observe the clamped value in `suppression_delivery_age_seconds`; structured-log negative raw age as clock skew and lagging records as lagging. Keep optional `received_at_ms` diagnostic-only, usable to split Twitch-to-producer from producer-to-consumer latency but never for classification. State plainly that the feature does not claim to detect a stalled delivery path during a period with no real notices. |
+| D | Publish a continuously refreshed per-channel delivery-age gauge from `on_timer` so there is always a current value. |
+
+**Selection**: Option C — selected autonomously.
+
+**Rationale**: Options A and B are both false statements about the same
+observation: A makes a stalled broker path invisible for as long as it lasts,
+and B pages on a perfectly healthy system every quiet hour, which trains
+operators to ignore the signal. Option D is the subtler version of A — it must
+publish *some* number every second for every key, and during legitimate silence
+whatever it publishes is invented, which is exactly the fabrication FR-017 and
+decision 13 refuse on the producer side. Option C is the only one that reports
+what is actually known: records that arrived, and their age from Twitch
+occurrence to actual consumer receipt. Using the consumer receipt clock ensures
+consumer-side delay is included even when producer delay was small; optional
+`received_at_ms` can explain the components but cannot change the result.
+Clamping negative raw age prevents clock skew from creating negative
+observations while retaining a structured diagnostic. Silence produces no
+samples, and "no samples" is a distinguishable, honest third state. Coverage
+status answers the separate question of whether the subscriptions exist, and the
+two are read together rather than substituted — complete coverage plus silence
+proves nothing about the broker path, and the artifacts now say so instead of
+implying otherwise. The residual limitation is stated rather than hidden: an
+undetected stall during a genuinely quiet period degrades to the pre-007
+behaviour, which is the floor this fail-open design already accepts.
+
+**Stage**: Remediation.
+
+**Impact**: Amends NFR-005 and SC-010; adds `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS`
+= 30 to both Flink blocks; replaces the delivery-age gauge with
+`suppression_records_consumed_total{lag_class}` plus the per-received-record
+`suppression_delivery_age_seconds` observation; adds data-model invariant I19,
+contract §4.1 rule 7, and research §4.6/D13; folds the work into T039, T042,
+T046, and T053.
+
+## 21. Capacity-safe rollback order and the checked-in gating value
+
+**Question**: Decision 15 fixed the rollback order as "gating off, restore the
+safe ramp, then unwind the auxiliary subscriptions". With two subscriptions per
+channel still live, raising thresholds first permits more than 800 subscriptions
+against a 900 ceiling. What order is actually safe, and what value of the gating
+switch should be checked into the repository?
+
+| Option | Description |
+|--------|-------------|
+| A | Keep decision 15's order and rely on operator judgement about which threshold value is "known good". |
+| B | Invert it, and make the invariant explicit: (a) `SUPPRESSION_GATING_ENABLED=false`; (b) while thresholds remain 400/400, revert or unwind the dual-subscription transport; (c) wait until notification subscriptions are gone, total subscription count is approximately the desired channel count (~400), and coverage/desired metrics are stable; (d) only then raise thresholds back toward the single-subscription ramp. Thresholds are **never** raised above 400 while any `channel.chat.notification` subscription remains. Separately, check `SUPPRESSION_GATING_ENABLED=false` into `docker-compose.yml` on both Flink blocks while the code-level `SuppressionConfig` default stays `true`. |
+| C | Invert the order but leave the checked-in gating value `true`, matching the code default. |
+| D | Change the code default to `false` as well. |
+
+**Selection**: Option B — selected autonomously.
+
+**Rationale**: The ordering is not a matter of taste. At two subscriptions per
+channel, any threshold above 400 authorises more than 800 subscriptions, so
+raising thresholds while notification subscriptions are still live is precisely
+the state that overruns the 900 ceiling — decision 15 had the hazard right and
+the direction backwards. Unwinding capacity first is safe at every instant,
+because 400 channels on the single-subscription revision need 400 of 900 slots,
+and the wait in step (c) is what makes "the transport is gone" an observation
+rather than an assumption. On the switch: the code default of `true` is correct
+for the module, because a detector that silently ignores its suppression input
+by default would be a worse trap than one that gates. But a deploy must not
+start gating before any deployed evidence exists, and the file operators
+actually deploy is `docker-compose.yml`. Checking `false` in there makes the
+deploy inert by construction, and enabling becomes a deliberate, reviewable edit
+taken after E1-E3 and the 24-hour churn observation. Option C leaves that gap
+open; option D hides the module's intended behaviour behind a default nobody
+reads.
+
+**Stage**: Remediation.
+
+**Impact**: Rewrites the rollback order in the plan, the quickstart rehearsal
+(B7), and the operations runbook task; adds risk R11 and amends research D11/D12;
+adds the checked-in `SUPPRESSION_GATING_ENABLED=false` to T046 and the
+enablement precondition to the rollout; clarifies that the preliminary 400/400
+ramp-down on the single-subscription revision is unconditionally capacity-safe
+and is not blocked by E1, which gates dual-coverage sign-off and enabling gating
+instead.

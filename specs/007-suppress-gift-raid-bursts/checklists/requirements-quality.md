@@ -1,0 +1,92 @@
+# Feature 007 Requirements Quality Checklist
+
+**Purpose**: Formal PR and release-review gate for the clarity, completeness,
+consistency, measurability, and scenario coverage of Feature 007 requirements
+in the roadmap and spec-kit artifacts.
+**Created**: 2026-09-04
+**Feature**: [Suppress Gift and Raid Chat Bursts](../spec.md)
+**Review audience**: Feature author and merge reviewer
+**Review timing**: Before PR approval and again before release sign-off
+
+**Evaluation rule**: `[x]` means the current written artifacts specify the
+requirement clearly and consistently. `[ ]` identifies an unresolved
+requirements-quality defect; its `Gap` note is part of the release gate.
+
+## Requirement Completeness - Capacity and Units
+
+- [x] CHK001 Is the account limit re-derived explicitly as 3 sessions x 300 enabled subscriptions = 900 subscriptions for the existing client-id/user-id pair? [Completeness, Spec §Overview, NFR-001; Research §1.1, §1.4]
+- [x] CHK002 Are monitored channels and individual subscriptions defined as different units, with two independently tracked coverage subscriptions required per monitored channel? [Clarity, Spec §FR-001, §FR-002, §FR-015; Data Model §1.1-§1.4]
+- [x] CHK003 Is the ceiling arithmetic complete and internally consistent: 400 channels x 2 subscriptions = 800 subscriptions, leaving 900 - 800 = 100 subscriptions of global reconnect/adoption headroom? [Consistency, Spec §FR-013-§FR-015, §SC-006; Research §1.4]
+- [x] CHK004 Is the per-session packing consequence specified as at most 150 co-located channel pairs per 300-subscription session, while allowing a pair to split across sessions when necessary? [Coverage, Data Model §4; Research §3 R2]
+- [x] CHK005 Are the effective 400/400 join and leave thresholds, firm 400-channel ceiling, and 401st-channel refusal outcome stated objectively? [Measurability, Spec §FR-013, §SC-006; Data Model §4]
+- [x] CHK006 Are capacity-reporting requirements explicit about connection occupancy and total occupancy using subscription units while desired-set and coverage signals use channel units? [Clarity, Spec §FR-015; Data Model §1.4, I4-I5; Plan §Design at a glance]
+- [x] CHK007 Are reconnect, adoption, reservation, and mid-ramp capacity requirements written so the 100-slot headroom cannot be treated as ordinary monitored-set capacity? [Completeness, Spec §FR-014, §NFR-001; Data Model §4; Research §3, R5]
+- [x] CHK008 Is an acceptable bound or release disposition defined for desired-set churn and channel baseline re-warming caused by the locked zero-width 400/400 hysteresis band? [Measurability, Spec §NFR-007, §SC-011; Research §6, D10, D14, R5; Tasks T027-T028, §Deferred Deployed Evidence]
+
+## Scenario Coverage - Dual-Subscription Lifecycle
+
+- [x] CHK009 Is the full channel-coverage state model defined, including `absent`, `chat_only`, `notification_only`, `complete`, and `degraded_chat_only`, without inferring either slot from its sibling? [Completeness, Spec §FR-002, §NFR-003; Data Model §1.2-§1.3]
+- [x] CHK010 Are create requirements type-aware for an absent channel and both partial states, including creating only missing types, preserving surviving subscription identity, and independently recording the session used for each create? [Coverage, Data Model §5.1, I2-I3; Tasks T010, T018]
+- [x] CHK011 Are list and ordinary adoption requirements defined as two type-filtered enumerations joined by channel, with enabled/live-session criteria and explicit reporting for both partial directions? [Clarity, Data Model §1.3, I1; Research §3; Tasks T011, T019]
+- [x] CHK012 Is enumeration failure behavior specified for either type walk so an incomplete view cannot authorize destructive reconciliation drops? [Exception Coverage, Research §3 R1; Tasks T011, T019]
+- [x] CHK013 Are 409-conflict requirements type-aware for both chat and notification, matching coverage type, broadcaster, and a live session held by the pool before adoption? [Coverage, Data Model §5.1; Research §3; Tasks T012, T020]
+- [x] CHK014 Are channel-deletion requirements complete for deleting both types independently, treating already-absent subscriptions as success, following reconnect-rotated IDs, and retaining retryable state after a one-sided failure? [Recovery Coverage, Data Model §5.2, I3; Tasks T013, T021]
+- [x] CHK015 Are revocation requirements explicit that only the identified coverage type is removed, its sibling remains, one lost subscription is reported, and the resulting partial state is repairable even after ID rotation? [Recovery Coverage, Data Model §5.4, I3; Tasks T014, T022]
+- [x] CHK016 Are reconnect and retirement requirements type-aware for independent session staleness and ID rotation, clearing every slot on a dead connection without removing a split sibling held elsewhere? [Recovery Coverage, Data Model §5.5; Tasks T015, T023]
+- [x] CHK017 Are notification-refusal requirements distinguished from chat-refusal requirements, including fail-open retention of chat, bounded retry behavior with a stated retry period and reconnect-forced re-eligibility, visible auxiliary degradation, and clearing degradation on successful re-adoption? [Exception Coverage, Spec §FR-001, §NFR-003; Autonomous Decisions §7 (superseded), §17; Data Model §1.3, §5.4.1, I17; Tasks T016, T024]
+- [x] CHK018 Is the `degraded_chat_only` exception consistent with the unconditional dual-coverage invariant and the definition of a channel that has completed convergence? [Conflict resolved, Spec §FR-001, §NFR-003, §SC-001, §Edge Cases, US3 scenario 5; Data Model §1.3, §5.4.1, I1, I17; Autonomous Decisions §17]
+
+## Requirement Clarity - Sparse Input, Event Time, and Lateness
+
+- [x] CHK019 Is the two-input event-time hazard stated explicitly — the operator watermark is the minimum of both inputs, so a sparse suppression input can stall all chat-time evaluation — **and** is the idle-to-active re-entry case covered, in which one isolated notice after a long silence returns the source to the minimum with a bounded hold of `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` before it is idle again, while sustained traffic advances normally? [Clarity, Research §4.1, §4.1.1, R3, R10; Plan §Summary; Data Model I16; Autonomous Decisions §18; Tasks T050; Quickstart §A4, §B5]
+- [x] CHK020 Are trustworthy event-time requirements defined on the same Twitch clock for chat and suppression, using `occurred_at_ms` rather than ingestion or processing time? [Consistency, Spec §FR-003, §FR-017; Contract §2.1, §5; Research §2.2, §4.3]
+- [x] CHK021 Are idleness and partition requirements quantified as a 5-second suppression idleness timeout below chat's 10 seconds, applied with real watermarks, and four partitions matching parallelism so every source subtask has a split, in a form that can be asserted without a Flink runtime? [Measurability, Research §4.1 D4, §4.7 D16; Contract §1; Plan §Structure Decision; Tasks T029, T031, T038]
+- [x] CHK022 Are startup and restart requirements explicit about latest offsets, empty suppression state, no replay of old notices, and fail-open operation until a later notice establishes state? [Recovery Coverage, Data Model §5.6; Research §4.1 D4; Contract §1]
+- [x] CHK023 Are late-notice semantics complete: no waiting, retraction, or retroactive change, with an unexpired newly established deadline affecting only decisions made after delivery? [Coverage, Spec §FR-018, User Story 1 scenario 6; Contract §4.1 rules 5-6]
+- [x] CHK024 Are the compared instant and deadline boundary unambiguous: the spike peak second is used, a peak strictly before `suppress_until` is gated, and a peak at the deadline is not? [Clarity, Data Model §3.2; Research D5; Tasks T030, T040]
+
+## Requirement Consistency - Output-Only Detector Gating
+
+- [x] CHK025 Are message-count, rolling-baseline, bucket-retention, and expired-bucket requirements defined as identical between gated and ungated processing? [Consistency, Spec §FR-008, §SC-004; Data Model §3.3 I11; Tasks T049]
+- [x] CHK026 Are peak-hold requirements explicit about identical open, extend, peak, close, and expiry trajectories even when an otherwise qualifying output is suppressed? [Completeness, Spec §FR-008, §SC-004; Research §4.4 D6; Tasks T049]
+- [x] CHK027 Are cooldown and `last_fire_second` semantics resolved explicitly so a suppressed would-have-clipped decision updates them exactly as the ungated decision would? [Clarity, Data Model §3.3; Research §4.4 D6; Autonomous Decisions §10]
+- [x] CHK028 Are timer requirements complete: suppression records register no timer, chat-side chain timers remain unchanged, and watermark-driven evaluation continues on the same schedule? [Coverage, Contract §4.5; Data Model §3.3; Research §4.2, §4.5]
+- [x] CHK029 Is the permitted difference between paired runs narrowly defined as clip output plus the required suppression metric and structured log, with every other keyed-state write unchanged? [Measurability, Spec §SC-004; Data Model I11, I14; Quickstart §A4]
+- [x] CHK030 Are anomaly-counting and channel-isolation requirements consistent with output-only gating, including continued anomaly counting and no notice changing another broadcaster's eligibility or state? [Consistency, Spec §NFR-002, §NFR-006; Plan §Design at a glance; Research R8]
+
+## Non-Functional Quality - Contract, Failure, and Observability
+
+- [x] CHK031 Are fail-open requirements complete for missing notification coverage, auxiliary refusal, delayed or malformed suppression data, empty/expired state, broker publication failure, and restart without restored state? [Coverage, Spec §FR-011, §FR-017-§FR-018; Contract §3.6, §4; Data Model I9-I12]
+- [x] CHK032 Are healthy coverage, both partial states, auxiliary refusal, delivery lag, ignored notices, malformed input, rejected records, capacity refusal, and each suppressed spike required to be separately attributable and distinguishable through appropriately bounded metrics/logs, with broadcaster attribution retained where NFR-006 requires it? [Completeness, Spec §NFR-004-§NFR-006; Plan §Design at a glance; Tasks T025, T033, T039-T042]
+- [x] CHK033 Is "lagging suppression delivery" quantified from `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)` using the injected/current consumer clock at `process_element2` receipt, with `suppression_delivery_age_seconds`, threshold, negative-skew clamp/log behavior, optional `received_at_ms` diagnostic-only semantics, and stale/silent-input handling that distinguishes idle/unknown from measured healthy or lagging records? [Ambiguity resolved, Spec §NFR-005, §SC-010; Research §4.6, D13; Contract §2.2, §4.1 rule 7; Data Model I19; Autonomous Decisions §20; Plan §Design at a glance; Tasks T039, T042, T046, T053]
+- [x] CHK034 Is the producer/consumer contract versioned and evolution-safe, with producer/consumer deployment order for incompatible versions, one-hour coexistence, and rules for optional versus required changes? [Completeness, Contract §2.1, §4.2, §6; Research D8]
+- [x] CHK035 Is the disposition for a Kafka key that disagrees with payload `broadcaster_id` specified, including which party can observe it, which identity controls routing, and where malformed-payload rejection and its observability belong? [Ambiguity resolved, Contract §1, §3.5, §4.0, §4.1 rule 3, §5.1; Research D15; Data Model I18; Tasks T033, T037, T041]
+- [x] CHK036 Are identity, time, trigger, and exclusion requirements complete: required trustworthy channel/time fields, keying by broadcaster, exactly three trigger categories, all other categories excluded, diagnostic-only `viewer_count`, and no producer-computed deadline/window? [Completeness, Spec §FR-003-§FR-006, §FR-017; Contract §1-§3; Research D7-D9]
+
+## Dependencies and Assumptions - Release and Scope Gates
+
+- [x] CHK037 Is forward deployment ordering consistent about reducing the ramp on the current single-subscription revision before deploying dual coverage with gating off, and about when E1 may block progression? [Conflict resolved, Plan §Rollout and rollback; Quickstart §B0-§B3; Research §8 R6, R9, §9 E1; Autonomous Decisions §21]
+- [x] CHK038 Is rollback ordering capacity-safe and unambiguous about the threshold value in force before auxiliary subscriptions are unwound? [Conflict resolved, Plan §Rollback order, capacity-safe by construction; Autonomous Decisions §15 (superseded), §21; Quickstart §B7; Research R11; Tasks T053]
+- [x] CHK039 Are local/offline claims sharply separated from deployed E1-E5 evidence, with each deployed gate, actor, order, and prohibition on satisfying it from fixtures, replay, static assertions, or reasoning stated explicitly, and is conditional PyFlink evidence scoped so it is never treated as covered by the always-run pure suites? [Assumption, Quickstart §A3, §A6, §Part B, §Evidence status; Research §9; Tasks T038, T047, T056, §Deferred Deployed Evidence]
+- [x] CHK040 Are scope boundaries consistent across artifacts: no second application identity, token reseed or scope expansion, dependency or persistence migration, separate raid subscription, partial rollout, viewer-derived duration, chat-schema change, ranking-policy change, heartbeat or synthetic-record protocol, hidden code-level hysteresis band, or weakening of acceptance due to local constraints? [Consistency, Spec §FR-004, §FR-016, §NFR-007, §Out of Scope; Plan §Technical Context, §Deployment wiring; Tasks T054, §Notes]
+
+## Notes
+
+- Treat every unchecked item and its `Gap` note as unresolved until the owning
+  requirement artifacts are amended and the author and merge reviewer agree
+  the question can be checked.
+- Checked items assess only the current writing; they make no claim about
+  implementation or deployed behavior. In particular, CHK008 and its
+  NFR-007/SC-011 bound assess that a disposition is *specified*; the 24-hour
+  churn measurement itself remains pending deployed evidence (E2/B4), as do
+  E1, E3, E4, and E5.
+- Remediation pass, 2026-09-04: CHK008, CHK018, CHK033, CHK035, CHK037, and
+  CHK038 moved from unresolved to checked after their owning artifacts were
+  amended — respectively by NFR-007/SC-011, the bounded auxiliary-refusal
+  exception in FR-001/NFR-003/SC-001, the three-state delivery classification in
+  NFR-005/SC-010, the producer-side key/payload invariant with payload-only
+  consumer validation, the separation of the preliminary ramp-down from E1's
+  gate, and the capacity-safe rollback order. CHK017, CHK019, CHK021, CHK023,
+  CHK031, CHK032, CHK039, and CHK040 were strengthened in the same pass;
+  CHK019 now also owns the idle-to-active watermark re-entry question. All 40
+  items pass.
