@@ -5,7 +5,9 @@
 **Status**: Clarified and planned — amended 2026-09-04 by an artifact remediation
 pass that added NFR-007 and SC-011, bounded the auxiliary-coverage exception in
 FR-001/NFR-003/SC-001, and defined delivery-lag semantics in NFR-005/SC-010
-(see [autonomous-decisions.md](./autonomous-decisions.md) §17-§21)
+(see [autonomous-decisions.md](./autonomous-decisions.md) §17-§21), then by an
+implementation-review correction that made windows notice-bounded and added a
+fixed 30-second future-time trust bound (§22-§23)
 **Input**: Suppress gift- and raid-driven chat bursts from clip emission while
 preserving complete chat counting, dual notification coverage for every
 monitored channel, and safe operation within existing account capacity.
@@ -37,7 +39,7 @@ subscription slots as reconnect and adoption safety headroom.
 ### Session 2026-09-03
 
 - Q: What suppression-window values and policy apply to gift and raid notices? → A: Operator-configured windows default to 120 seconds for gifts and 180 seconds for raids; raid viewer count does not affect duration.
-- Q: Which notice types trigger suppression, and is overlapping genuine hype an accepted false negative? → A: Only `community_sub_gift`, `sub_gift`, and `raid` trigger suppression; `unraid`, plain `sub`, and `resub` are excluded, and overlapping genuine hype is an accepted false negative.
+- Q: Which notice types trigger suppression, and is overlapping genuine hype an accepted false negative? → A: Only `community_sub_gift`, `sub_gift`, and `raid` trigger suppression; `unraid`, plain `sub`, and `resub` are excluded, and genuine hype whose spike peak falls at or after the notice and before the active deadline is an accepted false negative. A spike that peaked before the notice is not an overlap and remains eligible even if its hold reports later.
 
 ### Session 2026-09-04
 
@@ -70,11 +72,14 @@ and verify which spikes emit clips.
 2. **Given** the same chat sequence without an active suppression window,
    **When** the sequence meets the existing clip threshold, **Then** the clip
    remains eligible for emission.
+   A spike whose peak is before a later notice likewise remains eligible even
+   if its hold reports after that notice arrives.
 3. **Given** an unrelated chat notification, **When** a qualifying chat spike
    occurs, **Then** the unrelated notification does not suppress the clip.
 4. **Given** an active gift or raid suppression window overlaps a genuine hype
-   moment, **When** its spike would otherwise emit a clip, **Then** no clip is
-   emitted; this is an accepted false negative.
+   moment, **When** its spike peak is at or after the notice occurrence and
+   strictly before the active deadline and it would otherwise emit a clip,
+   **Then** no clip is emitted; this is an accepted false negative.
 5. **Given** notification coverage or suppression delivery is absent or
    lagging and no suppression signal has established an active window,
    **When** a spike qualifies, **Then** normal clip eligibility continues and
@@ -161,26 +166,35 @@ not exposed by an earlier window ending.
 ending at the first deadline would reintroduce the false-positive behavior.
 
 **Independent Test**: Apply notices before, at, and after an existing deadline
-and compare the resulting deadline with the later of the existing deadline and
-the new notice's candidate deadline.
+and verify the resulting half-open interval: overlapping extensions retain the
+earliest start and later deadline, earlier/equal candidates change no state,
+and notices at or after the deadline start a new interval at their occurrence.
 
 **Acceptance Scenarios**:
 
-1. **Given** an active suppression deadline, **When** another relevant notice
-   occurs and its occurrence time plus applicable window is later, **Then** the
-   suppression deadline extends to that later time.
+1. **Given** an active suppression interval, **When** another relevant notice
+   occurs before its deadline and its occurrence time plus applicable window
+   is later, **Then** the deadline extends to that later time and the interval
+   start remains the earliest start in the overlapping chain.
 2. **Given** an active suppression deadline, **When** another relevant notice
-   would produce an earlier or equal deadline, **Then** the existing deadline
-   does not move backward.
+   would produce an earlier or equal deadline, **Then** the complete existing
+   suppression state remains unchanged.
 3. **Given** gift and raid notices overlap, **When** their applicable window
    lengths differ, **Then** the channel remains suppressed until the later
    candidate deadline using the operator-configured gift and raid durations.
+4. **Given** a prior suppression interval, **When** another relevant notice
+   occurs at or after its deadline, **Then** a new half-open interval begins at
+   the new notice occurrence rather than extending the old interval backward.
 
 ### Edge Cases
 
-- A notification arrives exactly at the current suppression deadline; the
-  resulting deadline is still the later of the existing deadline and the new
-  notification's occurrence time plus its applicable window.
+- A notification occurs exactly at the current suppression deadline. Because
+  the old interval is half-open, it starts a new interval at that occurrence.
+- A spike peaks before a relevant notice but its hold reports after the notice
+  arrives. The peak remains outside the notice-bounded interval and is eligible
+  for normal clip emission; this is not the accepted overlap false negative.
+- A spike peaks exactly at the notice occurrence and is inside the interval. A
+  spike peaks exactly at the suppression deadline and is outside it.
 - A relevant notification arrives late, after a spike has already been
   evaluated. Clip eligibility before receipt remains unchanged, an already
   emitted clip is never retracted, and any unexpired deadline established by
@@ -218,6 +232,11 @@ the new notice's candidate deadline.
 - A relevant notification lacks a trustworthy channel identity or occurrence
   time. It cannot create a guessed suppression deadline; the malformed input
   is made operationally visible.
+- A decoded notice claims an occurrence time at most 30 seconds ahead of the
+  consumer receipt clock. It is accepted, its delivery age is clamped to zero,
+  and the existing clock-skew diagnostic is emitted. A notice even one
+  millisecond farther ahead is rejected as malformed fields, counted and
+  logged, and produces no delivery observation or suppression-state write.
 
 ## Requirements *(mandatory)*
 
@@ -244,13 +263,20 @@ the new notice's candidate deadline.
 - **FR-005**: Only `community_sub_gift`, `sub_gift`, and `raid` notifications
   MUST create or extend suppression. `unraid`, plain `sub`, `resub`, and every
   other notification category MUST leave suppression unchanged.
-- **FR-006**: A relevant notice MUST set the channel's suppression deadline to
-  the later of (a) its current deadline and (b) the notice occurrence time plus
-  the operator-configured window for that notice category. Gift and raid
-  windows MUST default to 120 seconds and 180 seconds, respectively. Raid
-  viewer count MUST NOT affect the window duration.
-- **FR-007**: While a channel is suppressed, the system MUST prevent an
-  otherwise qualifying spike from emitting a clip.
+- **FR-006**: Suppression MUST be a half-open interval from notice occurrence
+  through, but not including, its deadline. A notice before the current
+  deadline belongs to the current overlapping chain; if it extends the
+  deadline, the state MUST retain the earliest chain start and the later
+  deadline. A notice at or after the current deadline MUST begin a new interval
+  at its occurrence. A notice whose candidate deadline is earlier than or
+  equal to the current deadline MUST leave the complete state unchanged. Gift
+  and raid windows MUST default to 120 seconds and 180 seconds, respectively.
+  Raid viewer count MUST NOT affect the window duration.
+- **FR-007**: The system MUST prevent an otherwise qualifying spike from
+  emitting a clip exactly when its peak is at or after the active interval's
+  notice-bounded start and strictly before its deadline. A spike that peaked
+  before the notice MUST remain eligible even if reported after the notice;
+  a peak exactly at the deadline MUST remain eligible.
 - **FR-008**: Suppression MUST gate only clip emission. Every chat message
   received during suppression MUST continue to update rolling message counts,
   the rolling baseline, and all other message-derived state used by later
@@ -280,11 +306,18 @@ the new notice's candidate deadline.
   permissions.
 - **FR-017**: A malformed suppression input that lacks a trustworthy channel
   identity or occurrence time MUST NOT create a guessed deadline and MUST be
-  operationally visible.
+  operationally visible. `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS` MUST be a fixed
+  contract bound of 30 seconds, not an environment setting. After schema and
+  field decoding, a record is trustworthy only when
+  `occurred_at_ms <= consumer_receipt_ms + 30_000`; a record one millisecond
+  beyond that bound MUST be rejected as malformed fields, counted and logged,
+  with no delivery observation and no state write. Accepted future skew within
+  the bound MUST use delivery age zero and emit the existing clock-skew
+  diagnostic.
 - **FR-018**: A suppression signal received after a clip was emitted MUST NOT
   retroactively retract that clip. If the signal establishes a suppression
-  deadline that has not expired, that deadline MUST apply only to subsequent
-  clip decisions.
+  interval that has not expired, it MUST apply only to subsequent clip
+  decisions whose peaks fall inside that notice-bounded interval.
 
 ### Non-Functional Requirements
 
@@ -313,7 +346,10 @@ the new notice's candidate deadline.
   status separately identifies missing notification subscriptions. Complete
   coverage combined with topic silence MUST NOT be reported as proven-healthy
   delivery, and the feature does not claim to detect a stalled delivery path
-  during a period in which no relevant notice occurred.
+  during a period in which no relevant notice occurred. The fixed
+  `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` trust check MUST run after decode
+  and field validation but before any delivery-health observation or state
+  mutation; over-bound records are malformed, not healthy clock skew.
 - **NFR-006**: The metric and structured log for each suppressed
   would-have-clipped spike MUST be attributable to the affected channel and
   distinguishable from coverage, delivery, malformed-input, and capacity
@@ -337,9 +373,11 @@ the new notice's candidate deadline.
   channel, occurrence time, and one of the triggering categories
   `community_sub_gift`, `sub_gift`, or `raid`. Raid audience size does not
   affect suppression duration.
-- **Suppression window**: Channel-specific state with a deadline during which
-  clip emission is gated while message-derived detector state continues to
-  advance. Its duration is operator-configured by notice category, defaulting
+- **Suppression window**: Channel-specific half-open interval
+  `[suppress_from_ms, suppress_until_ms)` during which clip emission is gated
+  while message-derived detector state continues to advance. Its start is the
+  earliest notice occurrence retained for the current overlapping chain; its
+  duration is determined from operator-configured category windows defaulting
   to 120 seconds for gifts and 180 seconds for raids.
 - **Would-have-clipped spike**: A detection decision that meets normal clip
   eligibility but does not emit because a suppression window is active.
@@ -360,18 +398,21 @@ the new notice's candidate deadline.
   channel-correct suppression signals and 0% of the excluded categories create
   or extend suppression.
 - **SC-003**: Across deterministic gift, raid, and overlapping-notice
-  scenarios, zero otherwise qualifying spikes emit clips while their channels
-  are inside active suppression windows, and 100% of those suppressed
-  would-have-clipped spikes emit both an operator-visible metric and a
-  structured log.
+  scenarios, zero otherwise qualifying spikes whose peaks are inside
+  `[suppress_from_ms, suppress_until_ms)` emit clips, and 100% of those
+  suppressed would-have-clipped spikes emit both an operator-visible metric
+  and a structured log. Spikes peaking before the notice or exactly at the
+  deadline retain normal eligibility.
 - **SC-004**: For identical replayed message sequences, message counts, rolling
   baseline, and other message-derived state after suppression are identical to
   a run without emission gating; only clip emission and the required
   would-have-clipped metric and structured log may differ.
-- **SC-005**: For every overlapping-notice scenario, the observed suppression
-  deadline equals the maximum of the previous deadline and each relevant
-  notice's occurrence time plus its configured window; default-duration
-  validation uses 120 seconds for gifts and 180 seconds for raids.
+- **SC-005**: For every overlapping-notice scenario, an extending notice before
+  the current deadline preserves the earliest start and advances the deadline
+  to its later candidate, an earlier/equal candidate leaves all state
+  unchanged, and a notice at or after the deadline starts a new interval at its
+  occurrence. Default-duration validation uses 120 seconds for gifts and 180
+  seconds for raids.
 - **SC-006**: At maximum capacity, exactly 400 channels receive complete dual
   coverage using 800 subscriptions, the effective join and leave thresholds
   are both 400, at least 100 subscription slots remain as safety headroom, and
@@ -389,7 +430,10 @@ the new notice's candidate deadline.
   retracted. Delivery health is reported as healthy, lagging, or idle/unknown
   strictly from received-record age against the 30-second default warning
   threshold, and an observation window of legitimate silence is reported as
-  idle/unknown rather than as either healthy or lagging.
+  idle/unknown rather than as either healthy or lagging. Records at the fixed
+  30-second future-skew boundary are accepted with age zero and a clock-skew
+  diagnostic; records one millisecond beyond are rejected, counted, and logged
+  before any delivery observation or state write.
 - **SC-011**: Across a 24-hour deployed observation with the 400/400
   thresholds in force, desired-set entries plus departures attributable to the
   zero-width band average at most 8 membership changes per poll — 2% of the
@@ -416,7 +460,8 @@ the new notice's candidate deadline.
   default to 120 and 180 seconds respectively, and are not derived from raid
   viewer count.
 - Suppression deliberately accepts the false negative when a genuine hype
-  moment overlaps an active gift or raid window.
+  spike peaks inside the notice-bounded gift or raid interval. A spike that
+  peaked before the notice remains eligible even if reported afterward.
 - Missing or lagging auxiliary coverage and delayed suppression delivery fail
   open; they remain operationally visible and never cause retroactive clip
   retraction.
@@ -457,6 +502,8 @@ requirement or success criterion above.
   reconnect/adoption safety headroom.
 - A heartbeat, keep-alive, or synthetic-record protocol on the suppression path
   to make legitimate silence distinguishable from a stalled delivery path.
+- A configurable future-time allowance; the 30-second maximum future skew is a
+  fixed contract bound and introduces no environment variable.
 - A hidden code-level hysteresis band or any other in-code deviation from the
   configured 400/400 thresholds.
 - Changing channel ranking, clipping eligibility, anomaly thresholds, or clip

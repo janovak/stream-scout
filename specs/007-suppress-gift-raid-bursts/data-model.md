@@ -10,7 +10,7 @@ Three stores hold this feature's state, and each owns a disjoint part of it:
 |---|---|---|
 | `EventSubPoolTransport` in-memory indexes | Subscription slots, channel coverage, connection occupancy | Process lifetime; rebuilt from Twitch by re-adoption |
 | Kafka `suppression-events` | The immutable notice record | Topic retention (short) |
-| Flink keyed state (`AnomalyDetector`) | `suppress_until` per broadcaster | State TTL, or until the key stops being written |
+| Flink keyed state (`AnomalyDetector`) | Notice-bounded suppression interval per broadcaster | State TTL, or until the key stops being written |
 
 Nothing new is persisted in Postgres or Redis, and there is no migration.
 
@@ -132,7 +132,8 @@ same TTL configuration (`retained_seconds × 4`, `NeverReturnExpired`).
 
 | Field | Type | Meaning |
 |---|---|---|
-| `suppress_until_ms` | `int` | Epoch ms, Twitch clock. Emission is gated for peaks strictly before this instant |
+| `suppress_from_ms` | `int` | Epoch ms, Twitch clock. Earliest start retained for the current overlapping chain; emission is gated only for peaks at or after this instant |
+| `suppress_until_ms` | `int` | Epoch ms, Twitch clock. Exclusive interval end; a peak exactly at this instant is eligible |
 | `notice_type` | `str` | The category that last **moved** the deadline; diagnostic, for the required structured log |
 | `notice_at_ms` | `int` | `occurred_at_ms` of that same notice; diagnostic and the Twitch-clock input to the receipt-only delivery-age calculation — never a continuously refreshed gauge (research D13, I19) |
 
@@ -141,13 +142,19 @@ Absent state (never written, expired, or read back as absent under
 "unknown" — that is the structural form of the fail-open decision (FR-011).
 
 `consumer_receipt_ms` is not stored state. `process_element2` captures it from
-an injected clock in tests and the current consumer clock at runtime, then
-computes `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`.
-That value alone is compared with `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` and
-observed as seconds in `suppression_delivery_age_seconds`. A negative raw age
-is clamped to zero and structured-logged as clock skew. Optional
-`received_at_ms` may decompose the latency diagnostically, but is never a
-classification input and no state transition depends on it.
+an injected clock in tests and the current consumer clock at runtime. After
+schema and field validation, and before delivery observation or state access,
+it enforces the fixed contract bound
+`SUPPRESSION_MAX_FUTURE_SKEW_SECONDS = 30`: a record with
+`occurred_at_ms > consumer_receipt_ms + 30_000` is rejected as malformed
+fields, counted and logged, with no observation and no state write. An accepted
+record then computes
+`delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`. That value
+alone is compared with `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` and observed as
+seconds in `suppression_delivery_age_seconds`. Accepted negative raw age is
+clamped to zero and structured-logged as clock skew. Optional `received_at_ms`
+may decompose latency diagnostically, but is never a classification input and
+no state transition depends on it.
 
 ### 3.1 Transition: applying a notice
 
@@ -156,31 +163,40 @@ Pure function in `spike_detector.py`, callable without Flink:
 ```text
 apply_notice(state, notice_type, occurred_at_ms, config) -> SuppressionState | unchanged
 
-  window        = config.window_for(notice_type)          # gift 120 s, raid 180 s
-  candidate_ms  = occurred_at_ms + window * 1000
-  current_ms    = state.suppress_until_ms if state else 0
+  window             = config.window_for(notice_type)     # gift 120 s, raid 180 s
+  candidate_until_ms = occurred_at_ms + window * 1000
 
-  if candidate_ms <= current_ms:  return state            # unchanged: never moves backward
-  return SuppressionState(candidate_ms, notice_type, occurred_at_ms)
+  if state is None or occurred_at_ms >= state.suppress_until_ms:
+      return SuppressionState(occurred_at_ms, candidate_until_ms,
+                              notice_type, occurred_at_ms)
+
+  if candidate_until_ms <= state.suppress_until_ms:
+      return state                                       # complete state unchanged
+
+  return SuppressionState(min(state.suppress_from_ms, occurred_at_ms),
+                          candidate_until_ms, notice_type, occurred_at_ms)
 ```
 
-Consequences that fall out of `max()` alone, with no extra bookkeeping:
+Consequences of the notice-bounded transition:
 
 | Case | Result | Requirement |
 |---|---|---|
-| Notice extends beyond the deadline | Deadline moves out | FR-006, US4-1 |
-| Notice would produce an earlier or equal deadline | No change, no second window | FR-006, FR-010, US4-2 |
+| Overlapping notice extends beyond the deadline | Deadline moves out; start becomes the earlier of the current start and extending notice occurrence | FR-006, US4-1 |
+| Overlapping notice would produce an earlier or equal deadline | Complete state is unchanged, including its start and diagnostics | FR-006, FR-010, US4-2 |
 | The same notice delivered twice | Second application is a no-op | FR-010, edge case "duplicated" |
-| Notices arrive out of order | Same final deadline either way | FR-010 |
+| Notices arrive out of order | Final deadline remains the maximum candidate; the lower bound follows the explicit extension/no-op transition rather than an order-independence claim | FR-010, decision 22 |
 | Gift and raid overlap with different windows | The later candidate wins | US4-3, SC-005 |
-| Notice arrives exactly at the current deadline | `candidate > current`, so it extends | Edge case "exactly at the deadline" |
+| Notice occurs exactly at or after the current deadline | Old half-open interval has ended; a new interval starts at the notice occurrence | Edge case "exactly at the deadline" |
 | Excluded notice type reaches the consumer anyway | No `window_for` entry → record ignored | FR-005 |
 
 ### 3.2 Transition: gating an emission
 
 ```text
 is_suppressed(state, peak_second) -> bool
-  return state is not None and peak_second * 1000 < state.suppress_until_ms
+  peak_ms = peak_second * 1000
+  return (state is not None
+          and state.suppress_from_ms <= peak_ms
+          and peak_ms < state.suppress_until_ms)
 ```
 
 Applied **only** at the end of `on_timer`, and only when `decision.emit` is not
@@ -193,8 +209,11 @@ Applied **only** at the end of `on_timer`, and only when `decision.emit` is not
 | present | `True` | `anomalies_detected_total` + `clips_suppressed_total` + structured suppression log + **no yield** |
 
 The compared instant is the **peak** second (`spike.detected_at_seconds`), not
-the report second, so a burst that peaks inside the window cannot escape by
-being reported after `hold_cap_seconds` (research D5).
+the report second. A burst that peaks inside the half-open interval cannot
+escape by being reported after `hold_cap_seconds`; conversely, a burst that
+peaks before the notice remains eligible even if its hold reports after the
+notice arrives. A peak at the notice occurrence is inside, and one at the
+deadline is outside (research D5, autonomous decision 22).
 
 ### 3.3 What the gate must not touch
 
@@ -330,10 +349,10 @@ Each is stated so it can be asserted by a test rather than reasoned about.
 | **I3** | The two slots of a channel are tracked independently; deleting, revoking, or losing one never implicitly removes the other from the indexes |
 | **I4** | Connection occupancy counts subscriptions and never exceeds 300; the channel-coverage gauge counts channels and never exceeds 400 (FR-015) |
 | **I5** | Steady-state subscriptions ≤ 800, leaving ≥ 100 of the 900 slots free (FR-014, NFR-001) |
-| **I6** | `suppress_until_ms` is non-decreasing for a given key while the state exists; no input can move it backward (FR-006, FR-010) |
-| **I7** | Applying the same notice more than once, or applying notices in any order, yields the same `suppress_until_ms` (FR-010) |
+| **I6** | Each active interval is half-open: `suppress_from_ms <= peak_ms < suppress_until_ms`. A peak before the notice is eligible, a peak at the notice is gated, and a peak at the deadline is eligible (FR-006, FR-007) |
+| **I7** | An overlapping extension preserves the earliest retained chain start and moves only the deadline and its diagnostics; an earlier/equal candidate is a complete-state no-op; a notice at or after the old deadline starts a new interval at its occurrence (FR-006, FR-010) |
 | **I8** | A notice whose category is outside `{community_sub_gift, sub_gift, raid}` never creates or extends state, at either the producer or the consumer (FR-005) |
-| **I9** | A notice with an untrustworthy channel identity or occurrence time produces no event, no deadline, and an incremented malformed counter (FR-017) |
+| **I9** | A notice with an untrustworthy channel identity or occurrence time produces no event, no interval, and an incremented malformed counter (FR-017) |
 | **I10** | Absent suppression state is indistinguishable from "not suppressed" and never blocks emission (FR-011) |
 | **I11** | The gate changes only whether the anomaly is yielded; every keyed state write in `on_timer` is identical to the ungated run (FR-008, SC-004) |
 | **I12** | An emitted clip is never retracted; a suppression event that arrives after emission affects only later decisions (FR-018) |
@@ -343,5 +362,6 @@ Each is stated so it can be asserted by a test rather than reasoned about.
 | **I16** | When a long-idle suppression subtask becomes active again with a single isolated notice, it may hold the operator's two-input watermark for at most `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` before going idle and releasing it. Sustained notice traffic advances the watermark normally and never reaches this bound (research §4.1.1, R10) |
 | **I17** | `degraded_chat_only` is always time-bounded: a hold-off never exceeds `AUXILIARY_REFUSAL_RETRY_SECONDS`, is cleared early by reconnect, retirement, successful create, or adoption, and never prevents a later repair attempt (FR-001, NFR-003, SC-001) |
 | **I18** | Key/payload agreement is asserted at the producer, where the key exists. The consumer deserializes values only, never observes the key, and derives routing, keying, and state from the payload `broadcaster_id`; a malformed payload is rejected and counted (research D15, contract §5.1) |
-| **I19** | Suppression delivery health has exactly three classifications. For a received record, `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)` from the injected/current consumer clock is the sole threshold input and is observed in `suppression_delivery_age_seconds`; negative raw age is clamped and structured-logged as skew, while optional `received_at_ms` remains diagnostic-only. A window with no record is idle/unknown and reports no value (NFR-005, research D13) |
+| **I19** | Suppression delivery health has exactly three classifications. For a trusted received record, `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)` from the injected/current consumer clock is the sole threshold input and is observed in `suppression_delivery_age_seconds`; accepted negative raw age is clamped and structured-logged as skew, while optional `received_at_ms` remains diagnostic-only. A window with no record is idle/unknown and reports no value (NFR-005, research D13) |
 | **I20** | `desired_set_churn_total` increments by entered plus departed channels per poll, with no per-channel label growth, so the NFR-007 bound of ≤ 8 changes per poll averaged over 24 deployed hours is directly computable from it (SC-011, research D14) |
+| **I21** | `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS` is the fixed value 30. After decode/field validation and before delivery observation or state access, `occurred_at_ms <= consumer_receipt_ms + 30_000` is accepted; one millisecond beyond is rejected as malformed fields, counted and logged, with no delivery sample and no state write (FR-017, NFR-005, autonomous decision 23) |

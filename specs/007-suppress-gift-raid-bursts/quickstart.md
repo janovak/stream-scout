@@ -159,33 +159,48 @@ in `test_spike_detector.py`, which does not skip.
 
 Required assertions:
 
-1. **Max-register** — extension, equal-deadline no-op, earlier-deadline no-op,
-   duplicate application, and arbitrary ordering all agree with data-model §3.1.
+1. **Notice-bounded interval transition** — an overlapping extending notice
+   preserves/minimizes `suppress_from_ms` and advances `suppress_until_ms`; an
+   earlier/equal candidate is a complete-state no-op; a notice at or after the
+   old deadline starts a new interval at its occurrence; duplicate application
+   is idempotent. Arbitrary ordering must preserve the maximum deadline, but
+   the test must not assert full-state order independence (data-model §3.1).
 2. **Per-category windows** — gift 120 s and raid 180 s by default, both
    configurable; the later candidate wins when they overlap (SC-005).
-3. **Gate predicate** — the **peak** second decides, not the report second
-   (research D5); absent state never suppresses (FR-011).
+3. **Gate predicate** — the **peak** second decides, not the report second, and
+   is gated exactly when
+   `suppress_from_ms <= peak_second * 1000 < suppress_until_ms`. A pre-notice
+   peak remains eligible even if reported later; the notice boundary is
+   inclusive and deadline boundary exclusive (research D5, decision 22).
+   Absent state never suppresses (FR-011).
 4. **Excluded categories** — a record with a non-trigger `notice_type` is
    ignored by the consumer as well as the producer.
 5. **Malformed records** — bad JSON, unknown `schema_version`, wrong field
-   types: each ignored, counted, and never raised.
+   types, and `occurred_at_ms` one millisecond beyond
+   `consumer_receipt_ms + 30_000`: each ignored, counted, and never raised.
+   The over-future case is checked after decode/field validation and produces
+   no delivery observation and no state write.
 6. **Suppression source settings** — the pure `SuppressionSourceSettings`
    construct in `spike_detector.py` names the `suppression-events` topic,
    `latest()` starting offsets, bounded out-of-orderness equal to
    `WATERMARK_OUT_OF_ORDERNESS_SECONDS`, `SUPPRESSION_IDLENESS_SECONDS = 5`
    strictly below chat's 10 s, 4 expected partitions matching parallelism 4,
-   `delivery_lag_warn_seconds=30`, and
+   `delivery_lag_warn_seconds=30`,
+   fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30`, and
    `checked_in_gating_enabled=False`. `SuppressionConfig.from_env()` remains
-   the runtime reader and its gating code default remains `true`. Asserted
-   here, with no PyFlink import (research D16).
+   the runtime reader and its gating code default remains `true`; the future
+   trust bound has no environment variable. Asserted here, with no PyFlink
+   import (research D16).
 7. **Delivery classification** — capture `consumer_receipt_ms` from an
    injected clock at `process_element2` receipt and classify
    `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`: at or below
    the warning threshold is healthy, above it is lagging, and no record at all
    produces no sample and no health claim. Include a case with small producer
    delay but injected consumer delay above 30 seconds, plus negative raw age
-   clamped to zero with a structured clock-skew diagnostic. Optional
-   `received_at_ms` remains diagnostic-only (NFR-005, research D13).
+   at exactly 30 seconds future accepted and clamped to zero with a structured
+   clock-skew diagnostic, and one millisecond beyond rejected as malformed
+   before observation/state. Optional `received_at_ms` remains diagnostic-only
+   (NFR-005, FR-017, research D13).
 
 ### A4. Emission-gating equivalence (the SC-004 check)
 
@@ -224,6 +239,12 @@ Also assert, in the same file:
 - **Late notice** — a notice delivered after a spike has already emitted does
   not retract it, and its unexpired deadline applies to later decisions only
   (FR-018).
+- **Pre-notice peak with later report** — a spike peaking before the notice
+  remains eligible when its hold reports after the notice; a peak exactly at
+  the notice is suppressed, while a peak exactly at the deadline is eligible.
+- **Future trust bound** — a record exactly 30 seconds ahead is accepted with
+  age zero and the skew diagnostic; one millisecond farther ahead is rejected,
+  counted and logged with no delivery sample or state change.
 
 Determinism is still a hard requirement: running the harness twice over the
 same input must diff empty.
@@ -262,7 +283,9 @@ This PyFlink-free Flink selection owns:
 - The pure `SuppressionSourceSettings` fields are
   `delivery_lag_warn_seconds=30` and
   `checked_in_gating_enabled=False`; expected partitions and expected
-  parallelism are both 4.
+  parallelism are both 4. The pure
+  `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` contract constant is asserted
+  separately and has no compose/environment entry.
 - `FLINK_PYFILES` is unchanged (no new module).
 
 Neither selection starts a service or infrastructure process.
@@ -398,10 +421,13 @@ Then capture a real gift-bomb and raid slice and confirm:
 - `suppression_delivery_age_seconds`, computed from
   `max(0, consumer_receipt_ms - occurred_at_ms)`, is small relative to the
   120 s window and well inside `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS = 30`,
-  with records classified healthy rather than lagging;
-- suppressed would-have-clipped spikes produce both required signals and no
-  clip;
-- clips outside any window are unaffected (SC-007).
+  with trusted records classified healthy rather than lagging; over-bound
+  future timestamps, if observed, are visible as rejected malformed fields and
+  never appear in this distribution;
+- suppressed would-have-clipped spikes whose peaks fall in the half-open
+  notice-bounded interval produce both required signals and no clip;
+- clips outside any window, including pre-notice peaks reported later, are
+  unaffected (SC-007).
 
 ### B7. E5 — rollback rehearsal
 
@@ -436,7 +462,7 @@ The topic may be left in place.
 | Pool two-slot correctness and capacity arithmetic | A2 | Yes |
 | Bounded auxiliary-refusal hold-off, expiry, and reconnect re-eligibility | A2 | Yes |
 | Notice mapping, contract conformance, malformed handling, producer key/payload equality | A2 | Yes |
-| Gate arithmetic, window overlap, duplicates, ordering | A3 | Yes |
+| Gate arithmetic, notice-bounded overlap, duplicates, both interval boundaries, and fixed future-time trust bound | A3 | Yes |
 | Suppression source settings and `suppression_delivery_age_seconds` classification, PyFlink-free | A3 | Yes |
 | Gated vs ungated state equivalence (SC-004) | A4 | Yes |
 | Sparse idle → active watermark bound, simplified harness model only | A4 | Yes, as the simplified model; **not** as PyFlink runtime behaviour |
@@ -446,7 +472,7 @@ The topic may be left in place.
 | **E2** 400-channel convergence, 800 subscriptions, headroom (SC-006) | B4 | **No** |
 | **E2 churn** 24-hour desired-set churn against the NFR-007 bound (SC-011) | B4 | **No** |
 | **E3** two-input watermark and idleness under a silent topic, **and** the isolated-notice re-entry bound | B5 | **No** |
-| **E4** delivery age, real-burst confirmation for SC-003, and window-default tuning/adequacy for SC-005 | B6 | **No** |
+| **E4** trusted-record delivery age, malformed-future visibility, real-burst confirmation for SC-003, and notice-bounded window-default tuning/adequacy for SC-005 | B6 | **No** |
 | **E5** rollback rehearsal in the capacity-safe order | B7 | **No** |
 
 Do not mark any Part B item complete from unit tests, fixtures, replay output,

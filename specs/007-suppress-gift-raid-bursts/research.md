@@ -7,7 +7,7 @@ This file records what was verified against primary sources, what was read out
 of the current checkout, and the decisions (D) and risks (R) the plan depends
 on. Nothing here was measured on live infrastructure: this workstation is
 code-and-unit-test only. Every quantity that needs a live system is listed in
-§8 as deferred evidence, not as a finding.
+§9 as deferred evidence, not as a finding.
 
 ---
 
@@ -297,19 +297,29 @@ smaller than the shortest suppression window by more than an order of magnitude.
 It is recorded as R10, asserted offline in the replay harness's simplified model
 (T050), and measured on the deployed system as part of E3.
 
-### 4.2 Why suppression needs no timers, no windows, and no join
+### 4.2 Why suppression needs no timers, no Flink windows, and no join
 
-`suppress_until` is a **monotone max-register** per broadcaster:
-`suppress_until = max(suppress_until, occurred_at_ms + window(notice_type))`
-(FR-006). That single property does the work of an event-time join:
+Suppression is one notice-bounded half-open interval per broadcaster:
+`[suppress_from_ms, suppress_until_ms)`. The deadline remains monotone within
+an overlapping chain, while the lower bound prevents a spike that peaked
+before the notice from being suppressed merely because its hold reports later
+(FR-006, FR-007, autonomous decision 22):
 
 - **Idempotent** — re-applying the same notice cannot move the deadline
   (FR-010, duplicate delivery; Twitch explicitly re-sends on uncertainty, see
   `MessageMetadata.message_id` in §2.2).
-- **Order-insensitive** — applying notices in any order yields the same
-  deadline, so out-of-order delivery is not a correctness problem (FR-010).
-- **Never regresses** — so a late notice can only extend, never shorten, and it
-  cannot retroactively affect a decision already taken (FR-018).
+- **No backward deadline movement** — an earlier/equal candidate is a complete
+  state no-op. An overlapping extension preserves the earliest retained start;
+  a notice at or after the old deadline starts a new interval at its own
+  occurrence.
+- **Deadline-order-insensitive, not full-state-order-insensitive** — arbitrary
+  notice ordering still yields the maximum candidate deadline, but the lower
+  bound follows the explicit extension/no-op transition. The former blanket
+  order-independence claim is therefore retired rather than applied to the new
+  interval state.
+- **No retroactive decision change** — a late notice affects only decisions
+  made after receipt, and even then only peaks at or after its retained lower
+  bound (FR-018).
 
 The suppression input therefore never registers a timer and never buffers.
 It reads state, writes state, emits nothing. All timers stay on the chat side,
@@ -330,6 +340,17 @@ are Twitch's clock, not the ingest host's (§2.2). The chat path's own measured
 delivery lag (spec 004 research, p99 257 ms, p99.99 1,255 ms) is the best
 available estimate for the notification path too, but it is **not** a
 measurement of it — E4 in §8.
+
+That shared-clock expectation is not sufficient as a trust boundary. After
+schema/field decode and before any delivery observation or state write, the
+consumer enforces the fixed
+`SUPPRESSION_MAX_FUTURE_SKEW_SECONDS = 30`. A timestamp at or below
+`consumer_receipt_ms + 30_000` is accepted; negative raw age is clamped to zero
+and logged with the existing clock-skew diagnostic. A timestamp one
+millisecond beyond is rejected as malformed fields, counted and logged, and
+does not contribute a delivery-health sample or suppression state. This is
+defence in depth against unit mistakes and bad clocks while retaining
+fail-open behaviour (autonomous decision 23).
 
 ### 4.4 Detector-state contamination (baseline, peak hold, cooldown, last fire)
 
@@ -356,6 +377,12 @@ its own is not sufficient, exactly as the roadmap warns:
   a suppressed decision a genuine new episode cannot open — but that window
   sits inside a 120–180 s suppression window anyway, where a clip could not
   have been emitted regardless.
+- **Gate bounds** — also downstream of every state write. The output filter
+  uses the peak in `[suppress_from_ms, suppress_until_ms)`; a pre-notice peak
+  remains eligible even if the hold closes after the notice. Thus the accepted
+  overlap false negative is genuine hype whose peak is inside the interval,
+  not any decision reported while an interval happens to exist (D5/D6,
+  autonomous decision 22).
 - **`hold_regressed`** — unaffected. It is an unmeasurable-second path that
   never produces an `emit`, so the gate never sees it.
 
@@ -397,8 +424,8 @@ measure. A heartbeat would create that traffic, and it is out of scope — it
 would be a second protocol on the topic, with its own failure modes, purely to
 service a monitoring question.
 
-So the classification is defined on **received records**, and silence is named
-rather than guessed:
+So the classification is defined on **trusted received records**, and silence
+is named rather than guessed:
 
 | Observation in a window | Classification |
 |---|---|
@@ -408,6 +435,10 @@ rather than guessed:
 
 At `process_element2` entry, the consumer captures `consumer_receipt_ms` from
 an injected clock in tests and the current consumer clock at runtime. The
+record is first decoded and field-validated. It is then rejected as malformed
+fields, counted and logged, if
+`occurred_at_ms > consumer_receipt_ms + 30_000`; this fixed trust check occurs
+before all delivery observation and state access. For an accepted record, the
 classification input is exactly:
 
 ```text
@@ -416,9 +447,11 @@ delivery_age_ms = max(0, raw_delivery_age_ms)
 ```
 
 That clamped value is compared with the warning threshold and observed as
-seconds in `suppression_delivery_age_seconds`. A negative raw age indicates
-clock skew; it is observed and classified as zero and produces a structured
-diagnostic log rather than expanding scope with another metric.
+seconds in `suppression_delivery_age_seconds`. A negative raw age within the
+30-second allowance indicates tolerable clock skew; it is observed and
+classified as zero and produces a structured diagnostic log rather than
+expanding scope with another metric. A raw age below -30 seconds is not a
+delivery observation at all; it fails the timestamp trust check.
 `received_at_ms` remains optional and diagnostic-only. When present it can
 split Twitch-to-producer (`received_at_ms - occurred_at_ms`) from
 producer-to-consumer (`consumer_receipt_ms - received_at_ms`) latency, but
@@ -448,10 +481,12 @@ same reason a fabricated `occurred_at_ms` is rejected in D9.
 
 ### 4.7 Keeping the sparse-source design offline-testable
 
-Everything in §4.1, §4.1.1 and §4.6 is a claim about configuration values —
+Everything in §4.1, §4.1.1 and §4.6 is a claim about fixed/testable values —
 topic, offset mode, out-of-orderness, idleness, partition count against
 parallelism, and the pure fields `delivery_lag_warn_seconds=30` and
-`checked_in_gating_enabled=False`. If those values live as literals inside
+`checked_in_gating_enabled=False`, plus the fixed contract constant
+`SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30`. The future-skew bound is deliberately
+not an environment setting. If those values live as literals inside
 `clip_detector_job.py`, the only way to assert them is a test that imports
 PyFlink, and that test is skipped whenever `apache-flink` is not installed.
 The evidence for the feature's highest risk would then be conditional on an
@@ -564,18 +599,18 @@ change would ask for 1,440–1,600 subscriptions against a 900 ceiling.
 | **D2** | A 403-class refusal on the **auxiliary** type while chat is live is recorded in the pool as auxiliary-refused, does not propagate `SubscriptionRefusedError` to the reconciler, and leaves the channel chat-covered and visibly degraded. The hold-off is **bounded**: repeated notification creates are suppressed for `AUXILIARY_REFUSAL_RETRY_SECONDS` = 3600 s, after which the channel is repairable again; a websocket reconnect or connection retirement forces re-eligibility immediately; successful creation or adoption clears the state (superseded the original permanent form — see autonomous decision 17). | Propagating the refusal (marks the whole channel refused for 7 days — kills chat for that channel). Retrying every pass forever (unbounded noise and create budget at 400 channels). Never retrying until restart (a transient refusal becomes a permanent coverage hole and quietly violates FR-001). |
 | **D3** | Suppression reaches Flink as a **dedicated `suppression-events` Kafka topic**, keyed by `broadcaster_id`, consumed by a second `KafkaSource` connected to the keyed chat stream through a `KeyedCoProcessFunction`. | Broadcast state (fan-out to all subtasks and a non-keyed state model for per-channel data). Sentinel records inside `chat-messages` (breaks the frozen chat schema contract and the `CommandFilter`/mapping path). Postgres or Redis lookup from the operator (per-decision I/O on the hot path; violates "Kafka for all inter-service messaging"). |
 | **D4** | The suppression source uses `for_bounded_out_of_orderness(WATERMARK_OUT_OF_ORDERNESS_SECONDS)` on `occurred_at_ms`, `with_idleness(SUPPRESSION_IDLENESS_SECONDS = 5)`, `KafkaOffsetsInitializer.latest()`, and 4 partitions matching `FLINK_PARALLELISM`. | `no_watermarks()` (stalls the two-input minimum and freezes all detection). Longer idleness than the chat stream's 10 s (makes suppression the binding minimum). `earliest()` offsets (replays old timestamps and pins the operator watermark in the past). |
-| **D5** | The gate compares the **peak second** of the decision (`spike.detected_at_seconds`) against `suppress_until`, not the report second. | Report second (a burst that peaks inside the window but is reported after `hold_cap_seconds` would escape). Either-of-the-two (suppresses spikes that peaked before the notice existed, for no requirement). |
-| **D6** | Gating is an **output-only filter** at the end of `on_timer`. Every state write — buckets, expiry, hold, chain timer, **and `last_fire_second`** — happens exactly as it does today. | Gating inside `evaluate()` (changes hold/`emit` trajectories; breaks SC-004 and the pure module's test suite). Skipping the `last_fire_second` update (diverges from the ungated run for 30 s after every suppressed decision; makes SC-004's "identical state" unprovable). |
+| **D5** | **Clarified by autonomous decision 22:** the gate compares the decision's peak second (`spike.detected_at_seconds`) with the notice-bounded half-open interval `suppress_from_ms <= peak_ms < suppress_until_ms`, not merely with the deadline and never with the report second. | Deadline-only gating (incorrectly suppresses a pre-notice peak whose hold reports later). Report-time gating (a burst that peaks inside the interval but reports after `hold_cap_seconds` escapes). Either-of-the-two (again suppresses a pre-notice peak). |
+| **D6** | Gating is an **output-only filter** at the end of `on_timer`. Every state write — buckets, expiry, hold, chain timer, **and `last_fire_second`** — happens exactly as it does today; interval membership changes only the final yield and required suppression signals. | Gating inside `evaluate()` (changes hold/`emit` trajectories; breaks SC-004 and the pure module's test suite). Skipping the `last_fire_second` update (diverges from the ungated run for 30 s after every suppressed decision; makes SC-004's "identical state" unprovable). |
 | **D7** | Suppression **windows are applied at the consumer** from `SUPPRESSION_GIFT_WINDOW_SECONDS` / `SUPPRESSION_RAID_WINDOW_SECONDS`; the producer publishes only the raw notice (`notice_type`, `occurred_at_ms`). | Producer-computed `suppress_until` (bakes policy into the topic, makes retention replay wrong after a tuning change, and splits the window constants across two services). |
 | **D8** | The contract is **versioned** (`schema_version`) and carries exactly the identity/notice/time fields the consumer needs; `viewer_count` is optional and diagnostic-only. | An unversioned payload (no safe way to add a field later against a live topic). Carrying the full notice payload (user content on an operational topic, no requirement). |
 | **D9** | A notice with no trustworthy channel identity **or** no parseable `occurred_at_ms` is **not published**; it increments a malformed counter and logs, per FR-017. | Publishing with `occurred_at_ms: null` (the consumer would have to invent a time — a fabricated deadline). Substituting the ingest clock (a guessed deadline wearing a trustworthy field name). |
 | **D10** | Ship 400/400 exactly as locked, add a desired-set churn signal so the zero-width band's cost is measured, and record the narrower-join option as a follow-up requiring a spec change. | Silently deviating to 380/400 (contradicts FR-013 and SC-006). Special-casing hysteresis in code (hides policy from configuration). |
 | **D11** | Emission gating has an operator kill switch, `SUPPRESSION_GATING_ENABLED`. The **code default in `SuppressionConfig` is `true`**, while `docker-compose.yml` **checks in `false`**, so a deploy is inert until an operator changes the compose value after E1-E3 and the 24-hour E2 churn observation pass. With it false the detector behaves exactly as pre-007 while both subscriptions and the topic stay in place. | Revert-only rollback (a code deploy to undo a detection-policy problem, at the moment clips are being lost). Checking in `true` (a deploy would start gating before any deployed evidence existed). |
 | **D12** | Deployment is two-step: the ramp is reduced to 400/400 on the **current** single-subscription revision and allowed to converge, **then** the feature revision is deployed. That preliminary ramp-down is 400 × 1 = 400 of 900 and is therefore unconditionally capacity-safe; it is **not** gated by E1, which gates dual-coverage sign-off and enabling gating. Rollback runs the same logic in reverse: gating off, then unwind the transport **while thresholds stay at 400/400**, then wait for the notification subscriptions to disappear, and only then raise thresholds (autonomous decision 21). | One-step deploy of thresholds and transport together (the Redis-resident desired set makes the reconciler chase ~1,600 subscriptions before the first poll rewrites it — R9). Raising thresholds before unwinding the auxiliary subscriptions (at 2 subscriptions per channel, any threshold above 400 can cross the 900 ceiling — R11). |
-| **D13** | Delivery health is classified **per received record** from `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`, where `consumer_receipt_ms` comes from the injected/current consumer clock at `process_element2` receipt. Compare only that value with `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` = 30 s — healthy at or below, lagging above — and observe it in `suppression_delivery_age_seconds`; negative raw age is clamped to zero and structured-logged as clock skew. Optional `received_at_ms` is diagnostic-only and may split Twitch-to-producer from producer-to-consumer latency, but it never affects classification. A window with no record is **idle/unknown**, neither healthy nor lagging (§4.6). | A continuously refreshed per-channel delivery gauge from `on_timer` (must fabricate a value during legitimate silence). A heartbeat or synthetic record to keep the topic warm (a second protocol, out of scope). Classifying from optional producer receipt time (makes behavior depend on an optional field and misses consumer delay). Treating silence as healthy (makes a stalled broker path invisible) or as lagging (pages on a working system every quiet hour). |
+| **D13** | **Clarified by autonomous decision 23:** delivery health is classified per trusted received record from `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`. After decode/field validation and before observation/state, the fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` rejects larger future timestamps as malformed fields; accepted negative raw age is clamped to zero and structured-logged as clock skew. Compare only the clamped value with `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` = 30 s — healthy at or below, lagging above — and observe it in `suppression_delivery_age_seconds`. Optional `received_at_ms` remains diagnostic-only, and no record means **idle/unknown** (§4.6). | A continuously refreshed per-channel delivery gauge from `on_timer` (must fabricate a value during legitimate silence). A heartbeat or synthetic record (a second protocol, out of scope). No future bound (lets unit mistakes create far-future suppression). Rejecting every future timestamp (turns harmless skew into avoidable false positives). |
 | **D14** | The zero-width 400/400 band's cost gets a **numeric release disposition**: entries plus departures averaged per poll over 24 deployed hours must not exceed 8, i.e. 2% of the 400-channel ceiling (NFR-007, SC-011). Over the bound blocks enabling gating and is resolved by a spec change to a narrower join threshold inside the firm ceiling. | Leaving the churn signal without a threshold (unfalsifiable acceptance). Blocking on a tighter bound (boundary-rank movement is normal and a tighter bound would fail for reasons unrelated to this feature). Auto-adjusting the threshold in code when churn is high (the hidden-policy option D10 already rejected). |
 | **D15** | Key/payload agreement is a **producer** invariant, asserted where the key is visible (T033). The job's sources use value-only deserialization, so `process_element2` never sees the record key; consumer routing and state use the payload `broadcaster_id`, and the consumer's duty is malformed-**payload** rejection. | Consumer-side key/payload comparison (asserts something the consumer structurally cannot observe). Switching to a key-and-value deserialization schema purely to enable that check (a change to the source shape for no behavioural gain, on the hot path). |
-| **D16** | The suppression source's configuration — topic, `latest()` offsets, out-of-orderness, `SUPPRESSION_IDLENESS_SECONDS`, expected partitions/parallelism, `delivery_lag_warn_seconds=30`, and `checked_in_gating_enabled=False` — lives in a pure `SuppressionSourceSettings` construct in `spike_detector.py`, asserted in `test_spike_detector.py` and against `docker-compose.yml`; `SuppressionConfig.from_env()` remains the runtime reader with gating defaulting to `true`, and `clip_detector_job.py` builds the real source from the pure settings (§4.7). | Literals inline in `clip_detector_job.py` (the only assertions would import PyFlink and skip when it is absent, making the highest-risk evidence conditional). A new configuration module (new `FLINK_PYFILES` entry and compose mounts — the wiring hazard the structure decision avoids). |
+| **D16** | The suppression source's configuration — topic, `latest()` offsets, out-of-orderness, `SUPPRESSION_IDLENESS_SECONDS`, expected partitions/parallelism, `delivery_lag_warn_seconds=30`, and `checked_in_gating_enabled=False` — plus fixed contract constant `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` live in pure `spike_detector.py`. `test_spike_detector.py` asserts all pure values and static compose checks assert both required wiring and the absence of a future-skew environment variable; `SuppressionConfig.from_env()` remains the runtime reader with gating defaulting to `true`, and `clip_detector_job.py` builds the real source from the pure settings (§4.7). | Literals inline in `clip_detector_job.py` (the only assertions would import PyFlink and skip when it is absent, making the highest-risk evidence conditional). A configurable future-skew allowance (unnecessary environment surface for a trust boundary). A new configuration module (new `FLINK_PYFILES` entry and compose mounts). |
 
 ---
 
@@ -586,7 +621,7 @@ change would ask for 1,440–1,600 subscriptions against a 900 ceiling.
 | **R1** | A two-type `list()` where one walk fails could look "complete" and let the reconciler drop live subscriptions. | The enumeration is complete only if **both** walks finish; either failure marks it incomplete, which already holds drops back (`reconciler.py:723`). Covered by a deterministic pool test. | A channel repaired one pass later than today at worst. |
 | **R2** | Rendezvous imbalance puts one connection at 300 while the pair for a channel needs two slots. | `route()` places a pair only where two slots fit; if the channel's home connection has one slot, the pair splits across connections and both slots are tracked independently. | Slightly less locality; a socket death then touches two channels' partial coverage rather than one channel's whole coverage. Both states are already modelled. |
 | **R3** | The suppression stream becomes the binding watermark minimum and stalls all detection. | D4 (real watermarks, shorter idleness than chat, `latest()` offsets, partitions == parallelism). Deterministic replay covers "suppression silent for hours, chat keeps firing". | A PyFlink-level idleness behaviour that cannot be reproduced offline; E3 is the deployed gate, and D11 is the immediate lever if it appears. |
-| **R4** | A notification arrives late enough to miss the burst it should have suppressed. | Accepted and specified (FR-018, US1 scenario 6). No buffering, no retraction. Delivery lag is observable via `suppression_delivery_age_seconds`, measured from Twitch occurrence to consumer receipt. | False-positive clips at the rate of the lag tail; measured by E4, not assumed. |
+| **R4** | A notification arrives after a decision, or after a spike peaked but before its hold reports. | No buffering or retraction (FR-018). A late notice affects later decisions only, and the lower bound ensures a pre-notice peak remains eligible even if reported afterward. Delivery lag is observable from trusted records via `suppression_delivery_age_seconds`. | False-positive clips caused by notices arriving after the relevant peak/decision remain possible and are measured by E4; genuine hype peaking before a notice is intentionally not counted as an accepted suppression false negative. |
 | **R5** | The auxiliary subscription doubles subscription churn on every desired-set change, and at 400/400 the desired set has no hysteresis band (§6). | D10's churn signal plus D14's numeric bound: ≤ 8 entries-plus-departures per poll averaged over 24 deployed hours (NFR-007, SC-011). The ramp change lands only after pool tests pass; the 100-subscription headroom absorbs in-flight create/delete overlap. | Boundary-rank channels can re-warm their baseline repeatedly; visible as detection gaps for those channels only. If the measured rate exceeds the bound, gating stays off until a spec change narrows the join threshold. |
 | **R6** | `channel.chat.notification` costs more than 0 against `max_total_cost = 10`. | E1 checks `total_cost` on the deployed system as early in dual-coverage convergence as possible; a non-zero cost blocks dual-coverage sign-off and the feature. The preliminary 400/400 ramp-down on the single-subscription revision is 400 × 1 and is **not** blocked by E1. | Feature-level: if non-zero, the two-subscription design is not viable on this token and the plan must stop rather than degrade. The preliminary ramp-down is independently safe and need not be reversed to run the check. |
 | **R7** | An unknown or renamed `notice_type` silently stops triggering suppression. | Trigger set is an explicit allow-list; everything else is counted under an `other` bucket so a vanished category is visible as a distribution change rather than as silence. | Twitch renaming a trigger type is detected operationally, not automatically. |
@@ -594,6 +629,7 @@ change would ask for 1,440–1,600 subscriptions against a 900 ceiling.
 | **R9** | Deploying the two-subscription transport while Redis still holds the old ~800-channel desired set asks for ~1,600 subscriptions against a 900 ceiling. `chat:desired` survives a restart, and the reconciler converges to it immediately while the poller only rewrites it up to 120 s later. | Two-step deployment: lower the ramp to 400/400 on the **current** single-subscription revision and let the desired set converge, **then** deploy the feature revision (D12; plan "Rollout and rollback"). | If the two steps are collapsed by mistake, the failure is loud (mass refusals, `pool is at its 3-connection limit`) and recovers by lowering the threshold; no data is lost. |
 | **R10** | A long-idle suppression subtask re-enters the two-input watermark minimum when one isolated notice arrives, briefly holding the operator watermark and delaying per-second evaluation for the keys on that subtask. | Accepted with a conservative bound of `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` (§4.1.1, data-model I16), asserted offline in the replay harness's simplified model (T050) and measured deployed as part of E3, which must exercise **both** prolonged silence and an isolated notice after silence. | A short, bounded evaluation delay on a sparse-notice channel set — far smaller than the 120 s minimum suppression window. Sustained notice traffic never reaches the bound. |
 | **R11** | During rollback, raising thresholds back toward the single-subscription ramp while `channel.chat.notification` subscriptions still exist would permit more than 800 subscriptions and can cross the 900 ceiling. | The rollback order is fixed and invariant-driven: gating off → unwind the transport **with thresholds still at 400/400** → wait until notification subscriptions are gone and total subscriptions ≈ desired channel count (~400) with stable coverage metrics → only then raise thresholds. Thresholds are never above 400 while any notification subscription remains (plan "Rollback order", autonomous decision 21). | If the order is inverted anyway, the failure is the same loud refusal mode as R9 and is recovered by lowering the threshold again. |
+| **R12** | A corrupt unit or bad producer clock places `occurred_at_ms` far in the future, creating a long false suppression interval and a misleading healthy age-zero sample. | Enforce fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` after decode/field validation and before delivery observation/state; reject one millisecond beyond as malformed fields with a counter and structured log. Accept bounded skew with age zero and the existing skew diagnostic. | A bad timestamp within 30 seconds can shift the interval slightly; the allowance is intentionally bounded and E4 remains the deployed evidence for real timestamp/age behavior. |
 
 ---
 
@@ -607,5 +643,5 @@ claimed from unit tests, fixtures, or reasoning.
 | **E1** | `Get EventSub Subscriptions` shows both types on live sessions with `total_cost` unchanged at 0 against `max_total_cost` 10. | Blocks dual-coverage sign-off and enabling gating, and blocks the feature if cost is non-zero. Does **not** block the preliminary 400/400 ramp-down on the single-subscription revision, which is 400 × 1 and safe on its own |
 | **E2** | 400 channels converge to 800 subscriptions, no connection over 300, `eventsub_channel_coverage{state="complete"}` == desired count, the pool refuses the 401st channel without exceeding the ceiling, and `desired_set_churn_total` over a **24-hour** observation at 400/400 averages ≤ 8 entries-plus-departures per poll. | Blocks the ramp sign-off (SC-006) and, through the churn bound, blocks enabling gating (NFR-007, SC-011) |
 | **E3** | With the suppression topic silent for at least one hour, chat detection continues and Flink source watermark lag on the chat input is unchanged from the pre-007 baseline; **and** a single isolated notice delivered after that silence holds the operator watermark for no longer than `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` before the source goes idle again. Both cases must be measured, not just the silence. | Blocks enabling gating in production (R3, R10) |
-| **E4** | Twitch-occurrence-to-consumer age distribution from `suppression_delivery_age_seconds` against `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` = 30 s, and a captured real gift-bomb/raid slice showing suppression firing on the intended bursts. | Real-burst confirmation for SC-003, tuning/adequacy evidence for the window defaults under SC-005, and evidence for the delivery-lag threshold (NFR-005, SC-010) |
+| **E4** | Twitch-occurrence-to-consumer age distribution from trusted records in `suppression_delivery_age_seconds` against `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` = 30 s, malformed-future rejection visibility, and a captured real gift-bomb/raid slice showing notice-bounded suppression firing on the intended bursts without suppressing pre-notice peaks. | Real-burst confirmation for SC-003, tuning/adequacy evidence for the window defaults under SC-005, and deployed evidence for delivery age and timestamp behavior (NFR-005, SC-010); deterministic boundary behavior remains local |
 | **E5** | Rollback rehearsal: `SUPPRESSION_GATING_ENABLED=false` restores pre-007 emission behaviour with no other change, and the capacity-safe rollback order is executable — transport unwound with thresholds still at 400/400, thresholds raised only after the notification subscriptions are gone. | Blocks production enablement (D11, R11) |

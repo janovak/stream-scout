@@ -43,11 +43,15 @@ Three things carry all the risk, and the plan is ordered around them:
    `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` before
    it goes idle again (research R10, data-model I16).
 
-The detector change is deliberately small: `suppress_until` is a per-channel
-monotone max-register, and the gate is an **output-only filter** at the end of
-`on_timer`. No state write changes, so a replay with gating and a replay
-without it produce identical counts, baselines, holds, and `last_fire_second`
-(SC-004); only the clip and the two required operator signals differ.
+The detector change is deliberately small: suppression state is a per-channel
+notice-bounded half-open interval
+`[suppress_from_ms, suppress_until_ms)`, and the gate is an **output-only
+filter** at the end of `on_timer`. An extending overlapping notice preserves
+the earliest start and later deadline, an earlier/equal candidate is a complete
+state no-op, and a notice at or after the old deadline starts a new interval.
+No detector-state write changes, so a replay with gating and a replay without
+it produce identical counts, baselines, holds, and `last_fire_second` (SC-004);
+only the clip and the two required operator signals differ.
 
 ## Technical Context
 
@@ -60,8 +64,8 @@ without it produce identical counts, baselines, holds, and `last_fire_second`
 **Authorization**: existing application identity and operator user token; `user:read:chat` already covers **both** chat coverage types — no reseeding, no new scope (FR-016, research §1.3)
 **Capacity**: 3 websocket connections × 300 enabled subscriptions = 900 per client-id/user-id; 400 monitored channels × 2 subscriptions = 800 steady state; ≥100 slots reserved (FR-014)
 **Suppression windows**: gift 120 s, raid 180 s, operator-configured, applied at the **consumer** (research D7); raid viewer count never affects duration
-**New configuration surface**: `SUPPRESSION_GIFT_WINDOW_SECONDS`, `SUPPRESSION_RAID_WINDOW_SECONDS`, `SUPPRESSION_GATING_ENABLED`, `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS=30` on **both** Flink blocks; `AUXILIARY_REFUSAL_RETRY_SECONDS=3600` on `stream-monitoring`. `docker-compose.yml` checks in `SUPPRESSION_GATING_ENABLED=false`; the code-level `SuppressionConfig` default stays `true` (decision 21)
-**Offline testability**: the suppression source's settings — topic name, `latest()` offset mode, bounded out-of-orderness, `SUPPRESSION_IDLENESS_SECONDS = 5`, expected 4 partitions and parallelism 4, plus pure fields `delivery_lag_warn_seconds=30` and `checked_in_gating_enabled=False` — live in `SuppressionSourceSettings` in `spike_detector.py`, so they are asserted in `test_spike_detector.py` and against `docker-compose.yml` without importing PyFlink. `SuppressionConfig.from_env()` remains the runtime reader and its code default for gating remains `true`
+**New configuration surface**: `SUPPRESSION_GIFT_WINDOW_SECONDS`, `SUPPRESSION_RAID_WINDOW_SECONDS`, `SUPPRESSION_GATING_ENABLED`, `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS=30` on **both** Flink blocks; `AUXILIARY_REFUSAL_RETRY_SECONDS=3600` on `stream-monitoring`. `docker-compose.yml` checks in `SUPPRESSION_GATING_ENABLED=false`; the code-level `SuppressionConfig` default stays `true` (decision 21). `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` is a fixed consumer contract constant, not a configuration value or environment variable (decision 23)
+**Offline testability**: the suppression source's settings — topic name, `latest()` offset mode, bounded out-of-orderness, `SUPPRESSION_IDLENESS_SECONDS = 5`, expected 4 partitions and parallelism 4, plus pure fields `delivery_lag_warn_seconds=30` and `checked_in_gating_enabled=False` — and fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` live in `spike_detector.py`, so they are asserted in `test_spike_detector.py` and against `docker-compose.yml` without importing PyFlink. `SuppressionConfig.from_env()` remains the runtime reader and its code default for gating remains `true`
 **Constraints**: the suppression input must never become the binding watermark minimum (research R3); the `chat-messages` schema stays frozen (spec 004 FR-008); `evaluate()` stays pure and signature-compatible
 **Scale/Scope**: 400 channels, ~800 subscriptions, ~3 suppression events per channel per hour at the high end — a topic that is silent for most seconds on most partitions
 
@@ -137,7 +141,7 @@ survive losing.
 specs/007-suppress-gift-raid-bursts/
 ├── spec.md                  # Product behaviour (do not change in planning)
 ├── plan.md                  # This file
-├── research.md              # Phase 0 — sources, decisions D1-D11, risks R1-R8, deferred evidence E1-E5
+├── research.md              # Phase 0 — sources, decisions D1-D16, risks R1-R12, deferred evidence E1-E5
 ├── data-model.md            # Phase 1 — entities, state, transitions, invariants
 ├── contracts/
 │   └── suppression-events.schema.md   # Phase 1 — the versioned Kafka contract
@@ -249,11 +253,14 @@ Flink job                                               │
   suppression-events ──► key_by(broadcaster_id) ──────────────┘   (KeyedCoProcessFunction)
                                                                     │
    process_element1: bucket + arm timer            (unchanged)      │
-   process_element2: suppress_until = max(...)     (no timer)       │
+   process_element2: decode/fields → fixed future-time trust check  │
+                     → apply [suppress_from, suppress_until)         │
+                     (no timer; rejected future record observes/writes nothing)
    on_timer:  evaluate() -> all state writes       (unchanged)      │
               then, and only then:                                  │
                  emit is None                      -> nothing       │
-                 peak second < suppress_until      -> metric + log, no clip
+                 suppress_from <= peak < suppress_until
+                                                    -> metric + log, no clip
                  otherwise                         -> yield anomaly ──► ClipCreator
 ```
 
@@ -266,7 +273,7 @@ NFR-006):
 | `eventsub_channel_coverage{state="complete"\|"chat_only"\|"notification_only"\|"degraded_chat_only"}` | Is dual coverage complete, which half is missing, and is a channel inside a bounded auxiliary-refusal hold-off (FR-001, FR-002, FR-015, NFR-003) |
 | `suppression_notices_ignored_total{notice_type}` | Was a notice correctly dropped because its category is outside the trigger set, with an `other` bucket for unrecognised values (FR-005, research R7) |
 | `suppression_notices_malformed_total{reason}` | Was a notice dropped for untrustworthy identity or time (FR-017) |
-| `suppression_records_rejected_total{reason}` | Did the consumer refuse a record for decode, `schema_version`, or field reasons (contract §4, FR-017) |
+| `suppression_records_rejected_total{reason}` | Did the consumer refuse a record for decode, `schema_version`, field-type/category reasons, or an occurrence time beyond the fixed 30-second future trust bound (contract §4, FR-017) |
 | `suppression_records_consumed_total{lag_class="healthy"\|"lagging"}` + `suppression_delivery_age_seconds` observed **once per received record** | Is suppression delivery healthy, lagging, or idle/unknown, while detection continues fail-open (NFR-005). Silence produces no sample, which is exactly what makes idle/unknown distinguishable from healthy |
 | `desired_set_churn_total` | Is the zero-width 400/400 band actually thrashing the monitored set, and does it stay inside the NFR-007 bound (research D10) |
 
@@ -278,14 +285,18 @@ refreshed per-channel delivery gauge driven from `on_timer` — that would have 
 invent a value during legitimate silence, and inventing one is what makes
 "complete coverage plus silence" look falsely healthy (decision 20).
 
-For each accepted record, `process_element2` captures
-`consumer_receipt_ms` from its injected/current consumer clock and computes
+For each decoded and field-valid record, `process_element2` captures
+`consumer_receipt_ms` from its injected/current consumer clock and first
+enforces fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30`. A record at
+`consumer_receipt_ms + 30_000` is accepted; one millisecond beyond is rejected
+as malformed fields, counted and logged, before any delivery observation or
+state write. Each accepted record then computes
 `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`. That value is
 the sole input to the lag threshold and is observed as seconds in
-`suppression_delivery_age_seconds`. Negative raw age is clamped to zero and
-structured-logged as clock skew. Optional `received_at_ms` can diagnose
-Twitch-to-producer versus producer-to-consumer latency, but classification
-never reads it and no logic depends on its presence.
+`suppression_delivery_age_seconds`. Accepted negative raw age is clamped to
+zero and structured-logged as clock skew. Optional `received_at_ms` can
+diagnose Twitch-to-producer versus producer-to-consumer latency, but
+classification never reads it and no logic depends on its presence.
 
 `anomalies_detected_total` keeps incrementing for a suppressed decision, so
 "detected but not clipped" stays computable and the existing
@@ -298,15 +309,15 @@ never reads it and no logic depends on its presence.
 | FR-001, FR-004 | Phase 1 pool pair placement; one `channel.chat.notification` subscription supplies gift and raid; the bounded auxiliary-refusal hold-off (`AUXILIARY_REFUSAL_RETRY_SECONDS`, reconnect re-eligibility) keeps the degraded exception temporary |
 | FR-002, NFR-003 | Per-(channel, type) slots and the joined `list()`; both partial states converge without duplicating the surviving type; `degraded_chat_only` expires back to `chat_only` and resumes ordinary repair |
 | FR-003, FR-005 | `map_suppression_event` allow-list; contract identity/notice/time fields; `suppression_notices_ignored_total` |
-| FR-006, FR-010, SC-005 | `apply_notice()` monotone max-register (data-model §3) |
-| FR-007, SC-003 | Output-only gate in `on_timer` |
+| FR-006, FR-010, SC-005 | `apply_notice()` notice-bounded interval transition: overlapping extension preserves/minimizes start, earlier/equal candidate is a full no-op, notice at/after deadline starts a new interval (data-model §3) |
+| FR-007, SC-003 | Output-only gate in `on_timer` using `suppress_from_ms <= peak_ms < suppress_until_ms`; pre-notice peaks and exact-deadline peaks remain eligible |
 | FR-008, FR-009, SC-004, SC-007 | Gate placement after every state write; `evaluate()` untouched |
 | FR-011, NFR-005, SC-010 | Absent state = not suppressed; coverage state plus the received-record delivery classification (healthy / lagging / idle-unknown) against `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` |
 | FR-012, NFR-006 | `clips_suppressed_total{broadcaster_id, notice_type}` + structured log, distinct from coverage/delivery/ignored/malformed/rejected/capacity signals |
 | FR-013, FR-014, NFR-001, SC-006 | T026 capacity proof, then T027/T028 ramp tests/change; 400 × 2 = 800 ≤ 900, independent of later runtime producer/topic work T033-T036 |
 | FR-015 | Subscription-counting occupancy vs channel-counting coverage gauge |
 | FR-016 | `user:read:chat` already covers both types (research §1.3) |
-| FR-017 | Producer drops untrustworthy notices and counts them; the consumer rejects malformed payloads with `suppression_records_rejected_total{reason}` |
+| FR-017 | Producer drops untrustworthy notices and counts them; after schema/field decode the consumer rejects timestamps beyond fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` as malformed fields before delivery observation or state write |
 | FR-018 | State read at decision time only; no retraction path exists |
 | NFR-002 | Both inputs keyed on payload `broadcaster_id`; state is per-key |
 | NFR-004 | Coverage, ignored, malformed, rejected, capacity-refusal and delivery signals are separate series |
@@ -343,13 +354,13 @@ lands.
 
 | Surface | Anchor | Change |
 |---|---|---|
-| `WATERMARK_OUT_OF_ORDERNESS_SECONDS` / `WATERMARK_IDLENESS_SECONDS` | `spike_detector.py:99`, `:157` | Unchanged; new `SUPPRESSION_IDLENESS_SECONDS = 5` and `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS = 30` documented against them |
+| `WATERMARK_OUT_OF_ORDERNESS_SECONDS` / `WATERMARK_IDLENESS_SECONDS` | `spike_detector.py:99`, `:157` | Unchanged; new `SUPPRESSION_IDLENESS_SECONDS = 5`, `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS = 30`, and fixed non-environment `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS = 30` documented against them |
 | `DetectorConfig` | `:217` | Unchanged; new `SuppressionConfig.from_env()` and pure `SuppressionSourceSettings` beside it |
 | `evaluate()` | `:504` | **Unchanged** — the gate is outside it |
 | `AnomalyDetector.open` | `clip_detector_job.py:656` | Registers the `suppression` `ValueState` with the existing TTL config |
 | `AnomalyDetector.process_element` | `:695` | Becomes `process_element1`, body unchanged |
-| new `process_element2` | — | Decode, validate, max-register, write. No timer, no output |
-| `AnomalyDetector.on_timer` | `:717` | Gate at the `yield` only; every state write above it unchanged |
+| new `process_element2` | — | Decode and validate fields; reject over-bound future time before delivery observation/state; otherwise classify delivery and apply the interval transition. No timer, no output |
+| `AnomalyDetector.on_timer` | `:717` | Gate at the `yield` only using the half-open notice-bounded interval; every state write above it unchanged |
 | `main()` pipeline | `:1045`-`:1090` | Second `KafkaSource` + watermark strategy; `connect().key_by(...).process(...)` |
 | `_init_metrics` | `:88` | New counters/gauges registered the same way |
 
@@ -358,9 +369,9 @@ lands.
 | File | Anchor | Coverage added |
 |---|---|---|
 | `test_stream_monitoring.py` | `FakeWebsocket` `:4619`, `make_pool` `:4724`, `TestPool*` `:4748`-`:5943` | `FakeWebsocket.listen_channel_chat_notification`; 150-channels-per-session; mixed types on one session; both ids tracked; per-type route/list/create/adopt/drop/revoke/reconnect; chat-only and notification-only partial states; 409 for either type; occupancy in subscriptions vs coverage in channels; mid-ramp reconnect and rebalance; 400/400 config; bounded auxiliary-refusal hold-off, its expiry, and reconnect re-eligibility; producer key/payload equality |
-| `test_spike_detector.py` | whole file | `max()` extension, equal/earlier deadline no-ops, duplicates, per-category windows, peak-second predicate, absent state fails open; `SuppressionSourceSettings` values; static `docker-compose.yml` assertions. **Guaranteed offline** — no PyFlink import, so this file is the non-skippable evidence |
-| `test_replay.py` | whole file | Suppression stream silent while chat fires; suppressed vs unsuppressed replay produce identical state and differ only in emission; late notice does not retract; sparse idle → active re-entry holds the simplified two-input watermark by no more than `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` |
-| `test_clip_detector.py` | whole file | Suppression record decode, malformed record ignored, unknown `schema_version` ignored, operator and topology wiring against fakes. **Conditional** — it imports `clip_detector_job`, so it runs only when the pinned `apache-flink==1.18.0` is already installed; it never starts a cluster or MiniCluster |
+| `test_spike_detector.py` | whole file | Interval start/end transition, equal/earlier full-state no-ops, duplicate idempotence, new interval at/after deadline, per-category windows, both gate boundaries, pre-notice eligibility, fixed future-skew constant, absent state fails open; `SuppressionSourceSettings` values; static `docker-compose.yml` assertions. **Guaranteed offline** — no PyFlink import, so this file is the non-skippable evidence |
+| `test_replay.py` | whole file | Suppression stream silent while chat fires; suppressed vs unsuppressed replay produce identical state and differ only in emission; a pre-notice peak reported later remains eligible; late notice does not retract; sparse idle → active re-entry holds the simplified two-input watermark by no more than `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` |
+| `test_clip_detector.py` | whole file | Suppression record decode, malformed and over-future records ignored before observation/state, exact future-bound acceptance, unknown `schema_version` ignored, operator and topology wiring against fakes. **Conditional** — it imports `clip_detector_job`, so it runs only when the pinned `apache-flink==1.18.0` is already installed; it never starts a cluster or MiniCluster |
 
 Note: there is **no** `test_eventsub_pool.py` in this checkout. All pool tests
 live in `test_stream_monitoring.py`; extend those classes rather than creating a

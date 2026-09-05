@@ -65,7 +65,18 @@ not carried.
 
 At `process_element2` receipt, the consumer captures
 `consumer_receipt_ms` from its injected clock in tests and the current consumer
-clock at runtime. For every accepted record:
+clock at runtime. After schema and field decode, it first enforces the fixed
+contract constant `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS = 30`:
+
+```text
+occurred_at_ms <= consumer_receipt_ms + 30_000
+```
+
+Equality is accepted. A record one millisecond beyond is rejected under
+`reason="fields"`, counted and structured-logged, with no
+`suppression_delivery_age_seconds` observation, no consumed classification,
+and no state read or write. This is a fixed defence-in-depth bound, not an
+environment variable. For every record that passes:
 
 ```text
 raw_delivery_age_ms = consumer_receipt_ms - occurred_at_ms
@@ -74,7 +85,7 @@ delivery_age_ms = max(0, raw_delivery_age_ms)
 
 `delivery_age_ms` is the only value compared with
 `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` and the value observed, in seconds, by
-`suppression_delivery_age_seconds`. If `raw_delivery_age_ms` is negative, the
+`suppression_delivery_age_seconds`. If `raw_delivery_age_ms` is negative within the allowed 30 seconds, the
 consumer observes and classifies zero and emits a structured clock-skew
 diagnostic log; no new metric is required. When `received_at_ms` is present it
 may additionally support diagnostic decomposition into Twitch-to-producer
@@ -160,9 +171,10 @@ Three rules follow, and they are binding on the task list:
 3. **Malformed-payload validation is entirely the consumer's job**, and it is
    real work: a payload whose `broadcaster_id`, `notice_type`, or
    `occurred_at_ms` is missing or of the wrong type is rejected and counted
-   (§4.3). "The consumer cannot check the key" is not a licence to skip payload
-   checking — it is the reason payload checking is the only defence the consumer
-   has.
+   (§4.3), and a field-valid payload with an occurrence time beyond the fixed
+   future trust bound is then rejected under §4.4. "The consumer cannot check
+   the key" is not a licence to skip payload checking — it is the reason
+   payload checking is the only defence the consumer has.
 
 ### 4.1 Rules
 
@@ -180,34 +192,42 @@ Three rules follow, and they are binding on the task list:
    Anything else is ignored with `reason="fields"`. In particular, a
    `notice_type` outside the trigger set is ignored rather than defaulted to a
    window (FR-005 defence in depth).
-4. **Apply.** `state = apply_notice(state, notice_type, occurred_at_ms, config)`
-   and write only when the value changed — the same write-only-on-change rule
-   `hold` already uses.
-5. **No timer, no output, no buffering.** `process_element2` registers nothing
-   and emits nothing. Waiting for suppression before deciding is explicitly
-   rejected: the spec requires fail-open, not a delay (decision 3).
-6. **Lateness is not an error.** A record whose `occurred_at_ms` is behind the
-   operator watermark is applied normally. It affects only decisions taken
-   after it lands (FR-018), and it is classified through the delivery-age
-   signals rather than dropped.
-7. **Delivery-health classification, on receipt only.** At method receipt,
-   capture `consumer_receipt_ms` from the injected/current consumer clock.
-   Each accepted record computes
-   `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`, observes
-   `delivery_age_ms / 1000` in `suppression_delivery_age_seconds`, and increments
+4. **Future-time trust, before observation or state.** Capture
+   `consumer_receipt_ms`, then require
+   `occurred_at_ms <= consumer_receipt_ms + 30_000` using fixed
+   `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30`. Reject one millisecond beyond with
+   `reason="fields"` and a structured malformed-record log. Do not observe
+   delivery age, increment a consumed lag class, read state, or write state for
+   that record. Equality passes; accepted future skew is handled by rule 5.
+5. **Delivery-health classification, on trusted receipt only.** For each
+   record that passed rule 4, compute
+   `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`, observe
+   `delivery_age_ms / 1000` in `suppression_delivery_age_seconds`, and increment
    `suppression_records_consumed_total{lag_class}` with `lag_class="healthy"`
    when `delivery_age_ms` is at or below
    `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS * 1000` (default 30 s) and
    `lag_class="lagging"` when it is above; a lagging record also emits a
-   structured log line. A negative raw age is clamped to zero for both
-   observation and classification and emits a structured clock-skew diagnostic
-   log. Optional `received_at_ms` is diagnostic-only and never changes this
-   classification. **Nothing is published for a window in which no record
-   arrived** — that window is idle/unknown, and it is read as
+   structured log line. A negative raw age within the allowed 30 seconds is
+   clamped to zero for both observation and classification and emits a
+   structured clock-skew diagnostic log. Optional `received_at_ms` is
+   diagnostic-only and never changes this classification. **Nothing is
+   published for a window in which no record arrived** — that window is
+   idle/unknown, and it is read as
    `increase(suppression_records_consumed_total[W]) == 0` in Prometheus. No
    per-channel delivery gauge is refreshed from `on_timer`, because during
    legitimate silence any value it published would be invented (NFR-005,
    research D13).
+6. **Apply.** After delivery observation under rule 5,
+   `state = apply_notice(state, notice_type, occurred_at_ms, config)` and write
+   only when the value changed — the same write-only-on-change rule `hold`
+   already uses.
+7. **No timer, no output, no buffering.** `process_element2` registers nothing
+   and emits nothing. Waiting for suppression before deciding is explicitly
+   rejected: the spec requires fail-open, not a delay (decision 3).
+8. **Lateness is not an error.** A record whose `occurred_at_ms` is behind the
+   operator watermark is applied normally. It affects only decisions taken
+   after it lands (FR-018), and it is classified through the delivery-age
+   signals rather than dropped.
 
 ---
 
@@ -221,18 +241,27 @@ Three rules follow, and they are binding on the task list:
    (research D15, §4.0).
 2. `occurred_at_ms` is epoch **milliseconds** on the same clock as
    `chat-messages.sent_at`, produced by the same `to_epoch_ms` converter. This
-   is what makes `peak_second * 1000 < suppress_until_ms` a meaningful
+   is what makes
+   `suppress_from_ms <= peak_second * 1000 < suppress_until_ms` a meaningful
    comparison.
 3. `notice_type` on the topic is always one of the three trigger values. The
    consumer's allow-list is defence in depth, not the only filter.
 4. The record is immutable and self-contained: no consumer needs any other
    record, any earlier record, or any external lookup to apply it.
-5. Applying any multiset of records for a key, in any order, yields the same
-   `suppress_until_ms` (data-model I6, I7).
+5. The active interval is half-open and notice-bounded. An overlapping
+   extending notice preserves the earliest retained start and advances the
+   deadline; an earlier/equal candidate is a complete-state no-op; a notice at
+   or after the old deadline starts a new interval. Arbitrary ordering retains
+   the same maximum deadline but is not claimed to produce an identical lower
+   bound (data-model I6, I7).
 6. No record ever carries a computed deadline or any window duration.
 7. A record never carries chat message text or a chatter identity.
 8. Version 1 consumers ignore unknown `schema_version` values; a version 2 must
    therefore only ever be introduced alongside a consumer that accepts both.
+9. `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS` is fixed at 30. A field-valid record
+   at the bound is accepted with age zero and a skew diagnostic; one
+   millisecond beyond is rejected as malformed fields before any delivery
+   observation or state access.
 
 ---
 

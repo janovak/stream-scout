@@ -218,6 +218,19 @@ services:
       # removes few real events. The value stays at 30 on purpose. Plan 06
       # keeps it at 30 for now, so that this phase changes one thing only.
       - DETECTION_COOLDOWN_SECONDS=30
+      # Feature 007. The gift and raid suppression windows, in seconds. These
+      # are the SuppressionConfig code defaults, written here as well so the
+      # jobmanager and the taskmanager run the same policy.
+      - SUPPRESSION_GIFT_WINDOW_SECONDS=120
+      - SUPPRESSION_RAID_WINDOW_SECONDS=180
+      # The kill switch, checked in as false even though the SuppressionConfig
+      # code default is true: deploying this feature must change no clip
+      # behaviour. Flip it to true operationally only after E1-E3 and the
+      # 24-hour E2 churn observation gate pass.
+      - SUPPRESSION_GATING_ENABLED=false
+      # Reporting threshold only. A record older than this is still applied;
+      # it is counted as lagging and logged.
+      - SUPPRESSION_DELIVERY_LAG_WARN_SECONDS=30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
@@ -373,6 +386,19 @@ services:
       - CLIP_INITIAL_DELAY_SECONDS=0
       - CLIP_CREATE_RETRY_DELAYS=0,2,4
       - CLIP_METADATA_RETRY_DELAYS=5,10,15,30
+      # Feature 007. The gift and raid suppression windows, in seconds. These
+      # are the SuppressionConfig code defaults, written here as well so the
+      # jobmanager and the taskmanager run the same policy.
+      - SUPPRESSION_GIFT_WINDOW_SECONDS=120
+      - SUPPRESSION_RAID_WINDOW_SECONDS=180
+      # The kill switch, checked in as false even though the SuppressionConfig
+      # code default is true: deploying this feature must change no clip
+      # behaviour. Flip it to true operationally only after E1-E3 and the
+      # 24-hour E2 churn observation gate pass.
+      - SUPPRESSION_GATING_ENABLED=false
+      # Reporting threshold only. A record older than this is still applied;
+      # it is counted as lagging and logged.
+      - SUPPRESSION_DELIVERY_LAG_WARN_SECONDS=30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro

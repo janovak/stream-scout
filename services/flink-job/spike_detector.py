@@ -43,6 +43,13 @@ its busy seconds only. The baseline would average its own busy seconds. The
 warm-up gate below tells a silent channel from an unobserved one. It measures
 how long the detector has watched the channel. It does not measure how busy
 the channel is.
+
+Spec 007 adds a second, independent half to this module. It holds the gift and
+raid suppression window policy, the keyed state that policy writes, and the
+decoder for the `suppression-events` topic. That half sits at the bottom of the
+file behind its own banner. It lives here so the operator ships one file and
+needs no new -pyFiles entry, and it reads and writes nothing that evaluate()
+reads or writes.
 """
 
 import json
@@ -50,7 +57,7 @@ import math
 import os
 import re
 from dataclasses import asdict, dataclass
-from typing import List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 # Plan 06 Phase 2: the allowed out-of-orderness of the watermark strategy, in
 # seconds. clip_detector_job.py's WatermarkStrategy and tools/replay.py's
@@ -726,3 +733,653 @@ def _in_cooldown(
     if last_fire_second is None:
         return False
     return (second - last_fire_second) <= config.cooldown_seconds
+
+
+# ===========================================================================
+# Spec 007 -- suppress gift and raid chat bursts. The pure half.
+# ===========================================================================
+#
+# Arithmetic and validation only: no clock, no Kafka, no Flink, no I/O.
+# AnomalyDetector.process_element2 in clip_detector_job.py is the adapter. It
+# decodes a `suppression-events` value with decode_suppression_record(), folds
+# the notice into a keyed ValueState with apply_notice(), and asks
+# is_suppressed() once, at the very end of on_timer, when a decision would
+# otherwise be yielded.
+#
+# The gate is strictly downstream of every state write that evaluate() drives,
+# and nothing in this section is reachable from evaluate(). A gated run and an
+# ungated run therefore leave identical detector state, which is what SC-004
+# asserts and data-model I11 states.
+#
+# References: specs/007-suppress-gift-raid-bursts/data-model.md sections 3.1
+# and 3.2, contracts/suppression-events.schema.md sections 2 and 4, research
+# D4, D5, D7, D11, D13, D15, D16.
+
+# The only `schema_version` this consumer understands. An unknown value -- and
+# a missing one -- is ignored rather than guessed at, which is what makes a
+# later field addition safe against a live topic (contract section 4.1 rule 2,
+# research D8).
+SUPPRESSION_SCHEMA_VERSION = 1
+
+# The two gift categories share one window; a raid gets its own. Both spellings
+# come from Twitch's `channel.chat.notification` notice_type.
+SUPPRESSION_GIFT_NOTICE_TYPES = ("community_sub_gift", "sub_gift")
+SUPPRESSION_RAID_NOTICE_TYPE = "raid"
+
+# The closed trigger set, in contract order. Anything outside it -- `unraid`,
+# `sub`, `resub`, an empty string, a different case, a future Twitch category
+# -- creates no state at the producer and none at the consumer either. The
+# consumer's copy of the allow-list is defence in depth for FR-005, not the
+# only filter (contract invariant 3).
+SUPPRESSION_TRIGGER_NOTICE_TYPES = SUPPRESSION_GIFT_NOTICE_TYPES + (
+    SUPPRESSION_RAID_NOTICE_TYPE,
+)
+
+# How long a suppression source split may be silent before with_idleness()
+# releases it from the operator's watermark minimum. Deliberately below
+# WATERMARK_IDLENESS_SECONDS (10): the suppression input is sparse by nature --
+# minutes pass with no notice on a channel -- so it must never become the
+# binding minimum for the chat stream it gates (data-model I15).
+#
+# The cost of the low value is bounded and one-sided: a long-idle subtask that
+# becomes active again with a single isolated notice can hold the two-input
+# watermark for at most this plus WATERMARK_OUT_OF_ORDERNESS_SECONDS, i.e. 7
+# seconds, which is a twentieth of the shortest window it can open
+# (data-model I16, research R10).
+SUPPRESSION_IDLENESS_SECONDS = 5
+
+# The delivery age, in seconds, at or below which a consumed record counts as
+# healthy. Above it the record is lagging and the operator logs it. This is a
+# reporting threshold only: a lagging record is still applied, because lateness
+# is not an error here (contract section 4.1 rules 5 and 8).
+SUPPRESSION_DELIVERY_LAG_WARN_SECONDS = 30
+
+# How far ahead of the consumer receipt a decoded occurrence time may claim to
+# be and still be trusted. Fixed at 30 seconds by contract, deliberately NOT an
+# environment variable: this is defence in depth against a poisoned deadline,
+# not an operator tuning knob (FR-017, contract section 4.1 rule 4, decision
+# 23).
+#
+# The bound exists because apply_notice() is a register that only ever moves a
+# deadline outward. One record claiming to have occurred centuries from now --
+# microseconds read as milliseconds, a badly set producer clock, a writer that
+# is not this producer -- would pin suppress_until_ms past every later notice
+# and silence that channel until its keyed state expired. Nothing downstream
+# can undo it, so the only place to stop it is before it.
+#
+# Ordinary clock disagreement is not that. Within the allowance a future
+# timestamp is applied normally and its negative raw age is clamped to zero
+# with the existing skew diagnostic (contract section 2.2).
+SUPPRESSION_MAX_FUTURE_SKEW_SECONDS = 30
+
+# Why a record was ignored. These become a Prometheus label, so the set is
+# closed by construction and ordered decode -> version -> fields, which is also
+# the order the decoder tests them in (contract section 4.1, T042).
+SUPPRESSION_REJECT_DECODE = "decode"
+SUPPRESSION_REJECT_SCHEMA_VERSION = "schema_version"
+SUPPRESSION_REJECT_FIELDS = "fields"
+SUPPRESSION_REJECT_REASONS = (
+    SUPPRESSION_REJECT_DECODE,
+    SUPPRESSION_REJECT_SCHEMA_VERSION,
+    SUPPRESSION_REJECT_FIELDS,
+)
+
+# Delivery health has exactly two published classes, and no third one for
+# silence. A window with no record is idle/unknown and publishes nothing at
+# all, because any value published during legitimate silence would be invented
+# (NFR-005, research D13, data-model I19).
+SUPPRESSION_LAG_HEALTHY = "healthy"
+SUPPRESSION_LAG_LAGGING = "lagging"
+SUPPRESSION_LAG_CLASSES = (SUPPRESSION_LAG_HEALTHY, SUPPRESSION_LAG_LAGGING)
+
+# The spellings SUPPRESSION_GATING_ENABLED accepts, compared after strip() and
+# lower(). Anything else is a start-up error rather than a silent default: a
+# kill switch that reads as its default leaves the operator believing gating is
+# off while clips are being dropped.
+_TRUE_SPELLINGS = ("true", "1", "yes", "on")
+_FALSE_SPELLINGS = ("false", "0", "no", "off")
+
+# Distinguishes "the key was not in the decoded object" from "the key was there
+# and held None". Only the first is a legacy state that may be reconstructed;
+# the second is a value this code never wrote (SuppressionState.from_json).
+_ABSENT = object()
+
+
+def _is_plain_int(value: Any) -> bool:
+    """True for an `int` that is not a `bool`.
+
+    `bool` subclasses `int` and `True == 1`, so every check below that accepts
+    an int has to say so explicitly. A `schema_version` of `true`, or a
+    `broadcaster_id` of `false`, must be rejected rather than read as 1 and 0.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _suppression_env_int(name: str, default: int) -> int:
+    """The variable as a whole number, or the code default when it is unset.
+
+    Unset and empty are different: an unset variable takes the code default,
+    while `NAME=` is an operator who meant to configure something and wrote
+    nothing. The error names the variable, so the message points at the
+    docker-compose.yml line that caused it.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{name} must be a whole number of seconds, got {raw!r}"
+        ) from None
+
+
+def _suppression_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _TRUE_SPELLINGS:
+        return True
+    if normalized in _FALSE_SPELLINGS:
+        return False
+    raise ValueError(
+        f"{name} must be one of {_TRUE_SPELLINGS + _FALSE_SPELLINGS}, "
+        f"got {raw!r}"
+    )
+
+
+@dataclass(frozen=True)
+class SuppressionConfig:
+    """The window policy. It lives entirely in the consumer (research D7).
+
+    The topic carries a notice and never a deadline, so retuning a window here
+    changes the next decision and never invalidates a record already written.
+    Nothing in this object depends on the size of a gift batch or on a raid's
+    audience: decision 1 answered "should raid windows scale with audience?"
+    with no, and viewer_count therefore reaches no field and no argument.
+    """
+
+    # 120 s and 180 s are the shipped defaults, duplicated into both Flink
+    # blocks of docker-compose.yml so the jobmanager and the taskmanager run
+    # the same policy.
+    gift_window_seconds: int = 120
+    raid_window_seconds: int = 180
+
+    # The kill switch. True in code and `false` in docker-compose.yml on
+    # purpose: deploying this feature must change no clip behaviour until an
+    # operator flips the compose value after the E1-E3 evidence gates
+    # (research D11, autonomous decision 21). SuppressionSourceSettings
+    # .checked_in_gating_enabled carries the checked-in half of that pair.
+    gating_enabled: bool = True
+
+    delivery_lag_warn_seconds: int = SUPPRESSION_DELIVERY_LAG_WARN_SECONDS
+
+    def __post_init__(self):
+        # Fail where the object is built, exactly as DetectorConfig does, so
+        # the job stops at start-up with a message naming the field rather than
+        # running a policy that can never gate anything.
+        for name in ("gift_window_seconds", "raid_window_seconds"):
+            value = getattr(self, name)
+            if not _is_plain_int(value) or value < 1:
+                raise ValueError(
+                    f"{name} must be a whole number of seconds >= 1, got "
+                    f"{value!r}. A zero or negative window writes a deadline "
+                    f"in the past, which costs a state write and gates nothing."
+                )
+        if not _is_plain_int(self.delivery_lag_warn_seconds) or (
+            self.delivery_lag_warn_seconds < 0
+        ):
+            raise ValueError(
+                f"delivery_lag_warn_seconds must be a whole number of seconds "
+                f">= 0, got {self.delivery_lag_warn_seconds!r}"
+            )
+        # Zero is allowed above and is a real tuning choice: every record with
+        # any measurable age is then reported as lagging.
+        if not isinstance(self.gating_enabled, bool):
+            raise ValueError(
+                f"gating_enabled must be a bool, got {self.gating_enabled!r}"
+            )
+
+    def window_for(self, notice_type: Any) -> Optional[int]:
+        """The window this category opens, or None when it opens none.
+
+        None is the whole of the FR-005 defence: a category outside the trigger
+        set has no entry here, so apply_notice() ignores it rather than
+        defaulting it to some window. The comparison is case-sensitive and
+        exact, because the topic carries Twitch's own spelling.
+        """
+        if not isinstance(notice_type, str):
+            return None
+        if notice_type in SUPPRESSION_GIFT_NOTICE_TYPES:
+            return self.gift_window_seconds
+        if notice_type == SUPPRESSION_RAID_NOTICE_TYPE:
+            return self.raid_window_seconds
+        return None
+
+    @classmethod
+    def from_env(cls) -> "SuppressionConfig":
+        """The runtime reader. __post_init__ validates whatever it returns."""
+        return cls(
+            gift_window_seconds=_suppression_env_int(
+                "SUPPRESSION_GIFT_WINDOW_SECONDS", cls.gift_window_seconds
+            ),
+            raid_window_seconds=_suppression_env_int(
+                "SUPPRESSION_RAID_WINDOW_SECONDS", cls.raid_window_seconds
+            ),
+            gating_enabled=_suppression_env_bool(
+                "SUPPRESSION_GATING_ENABLED", cls.gating_enabled
+            ),
+            delivery_lag_warn_seconds=_suppression_env_int(
+                "SUPPRESSION_DELIVERY_LAG_WARN_SECONDS",
+                cls.delivery_lag_warn_seconds,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class SuppressionState:
+    """The per-broadcaster half-open interval, kept in a Types.STRING() ValueState.
+
+    AnomalyDetector keeps this the same way it already keeps HoldState, under
+    the same TTL. Absent state -- never written, or read back as absent under
+    NeverReturnExpired -- means not suppressed. There is no third value and no
+    "unknown": that is the structural form of the fail-open rule (FR-011,
+    data-model I10).
+
+    Both ends are stored, because both are needed. A deadline alone says only
+    when suppression ENDS, which reads as "every instant in recorded history is
+    suppressed" -- and on_timer reports a peak up to hold_cap_seconds after it
+    happened, so a notice landing during that hold would retroactively gate a
+    spike that peaked before the gift or raid existed (FR-006, FR-007, FR-018).
+
+    The window duration is deliberately not stored. Only the instants it
+    produced are, so a retuned window applies to the next notice and never
+    retroactively.
+    """
+
+    suppress_from_ms: int           # epoch ms; inclusive start of the current chain
+    suppress_until_ms: int          # epoch ms; exclusive end of the same interval
+    notice_type: str                # the category that last MOVED the deadline
+    notice_at_ms: int               # occurred_at_ms of that same notice; diagnostic
+
+    def to_json(self) -> str:
+        # asdict() carries all four fields, so a newly written state always
+        # states where its interval opens. Only the reader tolerates the field
+        # being absent, and only for a state written before it existed.
+        return json.dumps(asdict(self), separators=(",", ":"))
+
+    @classmethod
+    def from_json(cls, encoded: Optional[str]) -> Optional["SuppressionState"]:
+        """The state, or None for anything this consumer cannot read.
+
+        HoldState.from_json can raise, because a HoldState it cannot read is a
+        bug worth failing on. This one must not: it is read inside on_timer,
+        and an exception there fails the operator and stops chat detection for
+        every key on the subtask. Unreadable therefore degrades to absent,
+        which is the same value as not-suppressed, so the failure mode is a
+        clip that is allowed rather than a pipeline that stops.
+
+        Unknown keys are ignored, matching decode_suppression_record(): a
+        newer writer may add a field, and an older reader must still read the
+        fields it knows.
+
+        A MISSING suppress_from_ms is the one exception, and it is a rolling-
+        upgrade allowance rather than a default: a state string written by the
+        pre-interval consumer opened its window at the notice it recorded, so
+        notice_at_ms is the correct reconstruction. Present-but-unreadable is
+        not the same thing -- a wrong type means the string did not come from
+        this code, and it fails open like every other unreadable state.
+        """
+        if not encoded:
+            return None
+        try:
+            decoded = json.loads(encoded)
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        suppress_until_ms = decoded.get("suppress_until_ms")
+        notice_type = decoded.get("notice_type")
+        notice_at_ms = decoded.get("notice_at_ms")
+        if not _is_plain_int(suppress_until_ms) or not _is_plain_int(notice_at_ms):
+            return None
+        # apply_notice() is the only writer and it only ever writes a trigger
+        # category, so a value outside the set means the string did not come
+        # from this code and cannot be trusted to gate anything.
+        if notice_type not in SUPPRESSION_TRIGGER_NOTICE_TYPES:
+            return None
+        suppress_from_ms = decoded.get("suppress_from_ms", _ABSENT)
+        if suppress_from_ms is _ABSENT:
+            suppress_from_ms = notice_at_ms
+        elif not _is_plain_int(suppress_from_ms):
+            return None
+        # Every state this code writes satisfies this ordering: the chain start
+        # is at or before the notice that last moved the deadline, and that
+        # notice is strictly inside the interval it opened (data-model I6, I7).
+        # A string that does not is inconsistent rather than merely old, and an
+        # inconsistent interval fails open like any other unreadable state.
+        if not suppress_from_ms <= notice_at_ms < suppress_until_ms:
+            return None
+        return cls(
+            suppress_from_ms=suppress_from_ms,
+            suppress_until_ms=suppress_until_ms,
+            notice_type=notice_type,
+            notice_at_ms=notice_at_ms,
+        )
+
+
+@dataclass(frozen=True)
+class SuppressionSourceSettings:
+    """Every value the sparse suppression source depends on, as plain data.
+
+    clip_detector_job.py builds its KafkaSource and WatermarkStrategy from this
+    object instead of inline literals. The point is evidence: the numbers that
+    decide watermark behaviour can then be asserted with nothing installed and
+    no broker running, which is what keeps this feature's offline proof
+    unconditional (research D16).
+
+    Nothing here reads a file, a socket or the environment. The fields are the
+    checked-in shape of the topic and of docker-compose.yml, and a static test
+    compares the two.
+    """
+
+    topic: str = "suppression-events"
+
+    # earliest() would feed hours-old occurred_at_ms values into event time and
+    # pin the operator watermark in the past, stalling detection for every
+    # channel. A restart therefore starts every channel fail-open, which is
+    # intended (research D4, data-model section 5.6).
+    starting_offsets: str = "latest"
+
+    # The same bound the chat stream uses. Two inputs on one operator with
+    # different bounds would make the joint watermark harder to reason about
+    # for no gain.
+    out_of_orderness_seconds: int = WATERMARK_OUT_OF_ORDERNESS_SECONDS
+
+    idleness_seconds: int = SUPPRESSION_IDLENESS_SECONDS
+
+    # One split per source subtask, so split idleness is well defined and no
+    # subtask owns two partitions whose silence gaps interleave (research
+    # section 4.1, contract section 1).
+    expected_partitions: int = 4
+    expected_parallelism: int = 4
+
+    delivery_lag_warn_seconds: int = SUPPRESSION_DELIVERY_LAG_WARN_SECONDS
+
+    # The value docker-compose.yml checks in, which is deliberately NOT the
+    # SuppressionConfig code default. The pair is the deploy-inert rule stated
+    # once, in data: shipping the code changes nothing until an operator edits
+    # compose (research D11).
+    checked_in_gating_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class SuppressionNotice:
+    """One accepted version-1 record, reduced to what the consumer may use.
+
+    The optional fields the topic carries -- notice_id, received_at_ms,
+    viewer_count -- are accepted by the decoder and deliberately dropped here.
+    A field that never reaches this object cannot grow a consumer that depends
+    on it: notice_id must not become a de-dup key (apply_notice()'s max() is
+    already duplicate-safe), received_at_ms must not become a classification
+    input, and viewer_count must not reach the window policy at all
+    (contract section 2.2).
+    """
+
+    broadcaster_id: int             # the payload identity; the consumer never sees the key
+    notice_type: str                # always one of SUPPRESSION_TRIGGER_NOTICE_TYPES
+    occurred_at_ms: int             # epoch ms on the same clock as chat-messages.sent_at
+
+
+@dataclass(frozen=True)
+class SuppressionDecode:
+    """Either a notice or a reason, never both and never an exception."""
+
+    notice: Optional[SuppressionNotice] = None
+    rejected_reason: Optional[str] = None       # one of SUPPRESSION_REJECT_REASONS
+
+
+def decode_suppression_record(
+    value: Any, config: Optional[SuppressionConfig] = None
+) -> SuppressionDecode:
+    """Decode one `suppression-events` value. Never raises.
+
+    The job's Kafka sources deserialize values only, so the record key is not
+    observable here at all. Routing, keying and state all come from the payload
+    `broadcaster_id`, and key/payload agreement is asserted at the producer,
+    where the key exists (contract section 4.0, research D15). That is also why
+    payload validation is not optional: it is the only defence this side has.
+
+    A rejection is a typed reason rather than an exception, because an
+    exception out of process_element2 would fail the operator and stop chat
+    detection for every key on the subtask (contract section 4.1 rule 1).
+
+    `config` decides nothing about what decodes -- only which categories have a
+    window, and that set is fixed. Retuning a window therefore cannot change
+    which records are accepted (research D7).
+    """
+    if config is None:
+        config = SuppressionConfig()
+
+    try:
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8")
+        payload = json.loads(value)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return SuppressionDecode(rejected_reason=SUPPRESSION_REJECT_DECODE)
+    if not isinstance(payload, dict):
+        # Valid JSON, but a list, a string or a number is not a record.
+        return SuppressionDecode(rejected_reason=SUPPRESSION_REJECT_DECODE)
+
+    schema_version = payload.get("schema_version")
+    if (
+        not _is_plain_int(schema_version)
+        or schema_version != SUPPRESSION_SCHEMA_VERSION
+    ):
+        # Missing is treated as unknown. A version 2 must therefore ship its
+        # consumer first (contract section 6).
+        return SuppressionDecode(rejected_reason=SUPPRESSION_REJECT_SCHEMA_VERSION)
+
+    broadcaster_id = payload.get("broadcaster_id")
+    notice_type = payload.get("notice_type")
+    occurred_at_ms = payload.get("occurred_at_ms")
+    if not _is_plain_int(broadcaster_id):
+        return SuppressionDecode(rejected_reason=SUPPRESSION_REJECT_FIELDS)
+    if config.window_for(notice_type) is None:
+        # A category outside the window map is ignored, not defaulted to some
+        # window (contract section 4.1 rule 3, FR-005 defence in depth).
+        return SuppressionDecode(rejected_reason=SUPPRESSION_REJECT_FIELDS)
+    if not _is_plain_int(occurred_at_ms):
+        # Never substituted with a receipt clock: that would fabricate a
+        # deadline, which FR-017 forbids on both sides of the topic.
+        return SuppressionDecode(rejected_reason=SUPPRESSION_REJECT_FIELDS)
+
+    # Every other key, known-optional or entirely new, is dropped here. That is
+    # what makes adding an optional field a version-1 change (contract 6).
+    return SuppressionDecode(
+        notice=SuppressionNotice(
+            broadcaster_id=broadcaster_id,
+            notice_type=notice_type,
+            occurred_at_ms=occurred_at_ms,
+        )
+    )
+
+
+def apply_notice(
+    state: Optional[SuppressionState],
+    notice_type: Any,
+    occurred_at_ms: Any,
+    config: SuppressionConfig,
+) -> Optional[SuppressionState]:
+    """The notice-bounded interval transition of data-model section 3.1.
+
+    Returns the SAME object when nothing moved. The operator writes state only
+    when the returned object is not the one it read, which is the write-only-on-
+    change rule `hold` already follows (contract section 4.1 rule 6).
+
+    Three cases, and no bookkeeping beyond them:
+
+      - no state, or a notice at or after the current deadline: the old
+        half-open interval has already ended, so a NEW interval opens at this
+        occurrence rather than merging back into a window that is over
+        (spec edge case "exactly at the deadline");
+      - a candidate deadline earlier than or equal to the current one: the
+        COMPLETE state is unchanged, including its start and its diagnostics.
+        That is what makes a redelivery free and an out-of-order notice a
+        no-op, and it is why the contract forbids a de-dup cache (FR-010);
+      - anything else is an overlapping notice that extends: the deadline moves
+        out, and the start stays at the earliest occurrence of the chain, so
+        one continuous suppressed period is described by one interval
+        (FR-006, US4-1).
+
+    Only the maximum deadline is order-independent. The lower bound follows the
+    transition above rather than an order-independence claim, because an
+    earlier/equal candidate is deliberately a complete no-op (decision 22).
+
+    Viewer count is not a parameter. Raid audience size cannot reach the
+    arithmetic because the arithmetic never accepts it (FR-006, decision 1).
+    """
+    window_seconds = config.window_for(notice_type)
+    if window_seconds is None:
+        return state
+    if not _is_plain_int(occurred_at_ms):
+        # The decoder rejects this before it gets here, so reaching it means a
+        # caller bypassed the decoder. Leave the state alone rather than raise
+        # or fabricate a deadline from an untrustworthy time (FR-017).
+        return state
+
+    candidate_ms = occurred_at_ms + window_seconds * 1000
+    if state is None or occurred_at_ms >= state.suppress_until_ms:
+        return SuppressionState(
+            suppress_from_ms=occurred_at_ms,
+            suppress_until_ms=candidate_ms,
+            notice_type=notice_type,
+            notice_at_ms=occurred_at_ms,
+        )
+    if candidate_ms <= state.suppress_until_ms:
+        return state
+    return SuppressionState(
+        suppress_from_ms=min(state.suppress_from_ms, occurred_at_ms),
+        suppress_until_ms=candidate_ms,
+        notice_type=notice_type,
+        notice_at_ms=occurred_at_ms,
+    )
+
+
+def is_trustworthy_notice_time(
+    occurred_at_ms: Any,
+    consumer_receipt_ms: Any,
+    max_future_skew_seconds: Any = SUPPRESSION_MAX_FUTURE_SKEW_SECONDS,
+) -> bool:
+    """Whether a decoded occurrence time may be applied at this receipt instant.
+
+    Pure, and with no clock of its own: the receipt instant is passed in, the
+    same way process_element2 captures it from its injected clock. A helper
+    that read the wall clock could not be tested deterministically and would
+    make that injected clock a lie (research D13).
+
+    The allowance is bounded rather than zero because two hosts a few seconds
+    apart are ordinary and the delivery-age clamp already answers that case
+    (contract section 2.2). Equality at the bound passes; one millisecond
+    beyond is malformed. Lateness is never untrustworthy -- an hour-old record
+    is applied and reported as lagging (contract section 4.1 rule 8).
+
+    Anything it cannot read -- a bool on either side, a string, a float, a
+    negative allowance -- is untrustworthy rather than raising, because the
+    only caller is inside process_element2, where an exception would stop chat
+    detection for every key on the subtask.
+    """
+    if not _is_plain_int(occurred_at_ms) or not _is_plain_int(consumer_receipt_ms):
+        return False
+    if not _is_plain_int(max_future_skew_seconds) or max_future_skew_seconds < 0:
+        return False
+    return occurred_at_ms <= consumer_receipt_ms + max_future_skew_seconds * 1000
+
+
+def is_suppressed(state: Optional[SuppressionState], peak_second: Any) -> bool:
+    """Whether a decision peaking at `peak_second` is inside an open interval.
+
+    Two arguments and no clock. The kill switch, the metric and the structured
+    log belong to the operator, not to the arithmetic, and the report time is
+    not an input: the compared instant is the PEAK second, so a burst that
+    peaks inside a window cannot escape by being reported hold_cap_seconds
+    later (research D5, data-model section 3.2).
+
+    Absent state is not suppressed, which is the fail-open rule (FR-011). An
+    unreadable peak second is treated the same way, for the same reason: this
+    predicate runs inside on_timer, where refusing to answer would cost every
+    key on the subtask.
+
+    The interval is half-open at both ends, and both ends matter. A peak before
+    the notice is eligible -- the gift or raid had not happened yet, so it
+    cannot have caused that burst (FR-007, FR-018) -- and a peak exactly at the
+    deadline is eligible too, which pairs with a notice at the deadline opening
+    a new interval: the two together neither double-count nor leave a gap.
+    """
+    if state is None:
+        return False
+    if not _is_plain_int(peak_second) or peak_second < 0:
+        return False
+    peak_ms = peak_second * 1000
+    return state.suppress_from_ms <= peak_ms < state.suppress_until_ms
+
+
+@dataclass(frozen=True)
+class DeliveryObservation:
+    """How stale one consumed record was, and what that makes it.
+
+    Carries nothing else. There is no per-channel gauge and no third class for
+    silence: a window with no record is idle/unknown and publishes no value,
+    because any value published during legitimate silence would be invented
+    (NFR-005, research D13, data-model I19).
+    """
+
+    delivery_age_ms: int
+    lag_class: str                  # one of SUPPRESSION_LAG_CLASSES
+    clock_skew: bool                # the raw age was negative and was clamped
+
+    @property
+    def delivery_age_seconds(self) -> float:
+        """The value suppression_delivery_age_seconds observes."""
+        return self.delivery_age_ms / 1000
+
+
+def observe_delivery_age(
+    occurred_at_ms: int, consumer_receipt_ms: int, config: SuppressionConfig
+) -> DeliveryObservation:
+    """Classify one record's delivery health from the consumer receipt alone.
+
+    `consumer_receipt_ms - occurred_at_ms` is the only classification input.
+    The optional producer-side `received_at_ms` is not a parameter at all, so
+    no logic here can come to depend on its presence: a fast Twitch-to-producer
+    hop followed by a slow producer-to-consumer hop is lagging, which is the
+    case NFR-005 exists for (contract section 2.2, section 4.1 rule 5).
+
+    A negative raw age means the two clocks disagree, not that the record
+    arrived before it happened. It is clamped to zero for both the observation
+    and the classification, and flagged so the operator can log the skew
+    without a second metric.
+
+    At or below the threshold is healthy; above it is lagging. A lagging record
+    is still applied -- lateness is a reporting fact here, not an error
+    (contract section 4.1 rule 8).
+    """
+    if isinstance(occurred_at_ms, bool) or isinstance(consumer_receipt_ms, bool):
+        raise TypeError(
+            "delivery age needs epoch milliseconds on both sides, not a bool"
+        )
+
+    raw_age_ms = int(consumer_receipt_ms - occurred_at_ms)
+    delivery_age_ms = max(0, raw_age_ms)
+    threshold_ms = config.delivery_lag_warn_seconds * 1000
+    lag_class = (
+        SUPPRESSION_LAG_HEALTHY
+        if delivery_age_ms <= threshold_ms
+        else SUPPRESSION_LAG_LAGGING
+    )
+    return DeliveryObservation(
+        delivery_age_ms=delivery_age_ms,
+        lag_class=lag_class,
+        clock_skew=raw_age_ms < 0,
+    )

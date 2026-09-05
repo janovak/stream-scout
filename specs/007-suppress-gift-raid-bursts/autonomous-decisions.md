@@ -6,6 +6,8 @@ selected autonomously after the user instructed the agent not to ask further
 questions.
 
 Decisions 17-21 were taken during a later remediation pass over the artifacts.
+Decisions 22-23 are implementation-review corrections that clarify earlier
+window and timestamp decisions before their code changes landed.
 Where a remediation decision replaces an earlier one, the earlier entry is
 marked **superseded** and left in place with its original text rather than being
 rewritten, so the reasoning that led to the replacement stays readable.
@@ -502,7 +504,8 @@ window it protects, and it delays per-second evaluation rather than stopping it.
 Option B introduces exactly the heartbeat protocol the feature's scope forbids,
 with its own failure modes, purely to avoid a delay measured in seconds.
 Option C is the two-clocks mistake decision 9 already rejected — it would make
-`peak_second * 1000 < suppress_until_ms` a comparison between different clocks.
+`suppress_from_ms <= peak_second * 1000 < suppress_until_ms` a comparison
+between different clocks.
 Option D trades the hold for flapping: a very short idleness makes the source
 oscillate between idle and active around every record, and it narrows the margin
 below the chat stream's 10 s that keeps suppression from being the binding
@@ -641,3 +644,70 @@ enablement precondition to the rollout; clarifies that the preliminary 400/400
 ramp-down on the single-subscription revision is unconditionally capacity-safe
 and is not blocked by E1, which gates dual-coverage sign-off and enabling gating
 instead.
+
+## 22. Notice-bounded half-open suppression windows
+
+**Question**: Which instants belong to a suppression window, especially when a
+spike peaks before a notice but its hold reports after the notice arrives?
+
+| Option | Description |
+|--------|-------------|
+| A | Deadline-only: suppress every peak before `suppress_until_ms`, regardless of whether it predates the notice. |
+| B | Notice-bounded half-open: suppress exactly when `suppress_from_ms <= peak_ms < suppress_until_ms`; retain the earliest start of an extending overlapping chain, leave complete state unchanged for an earlier/equal candidate deadline, and start a new interval when a notice occurs at or after the old deadline. |
+| C | Report-time: decide from the second the held spike is reported rather than from its peak. |
+
+**Selection**: Option B — implementation review correction.
+
+**Rationale**: Option A contradicts the reason research D5 selected peak time:
+it still suppresses genuine activity that happened before the notice merely
+because peak-hold delayed the report. Option C has the opposite defect: a peak
+inside the burst can escape after the hold cap. A notice-bounded half-open
+interval models the causal claim precisely. The notice instant is included,
+the deadline is excluded, and an exact-deadline notice starts a new interval.
+Keeping an earlier/equal candidate as a complete-state no-op preserves
+idempotence and avoids diagnostics or lower bounds changing when the deadline
+does not. This means only the maximum deadline, not the entire interval state,
+is order-independent; the earlier blanket claim is corrected explicitly.
+
+**Stage**: Implementation review correction.
+
+**Impact**: Clarifies and corrects decision 11 and research D5 rather than
+rewriting their history; adds `suppress_from_ms` to `SuppressionState`; updates
+FR-006, FR-007, SC-003, SC-005, the gate predicate, overlap transition,
+invariants, replay expectations, and existing tasks T030-T032, T040, T044,
+T049, and T050. Genuine hype is an accepted false negative only when its peak
+is inside the notice-bounded interval; a pre-notice peak remains eligible.
+
+## 23. Fixed 30-second maximum future timestamp skew
+
+**Question**: How much future clock skew may a decoded suppression record claim
+before its occurrence time becomes untrustworthy?
+
+| Option | Description |
+|--------|-------------|
+| A | Reject any `occurred_at_ms` later than the consumer receipt clock. |
+| B | Allow a fixed 30-second skew: accept equality at `consumer_receipt_ms + 30_000`, clamp accepted negative age to zero with the existing clock-skew diagnostic, and reject one millisecond beyond as malformed fields before delivery observation or state access. |
+| C | Apply no future bound and clamp every future timestamp to delivery age zero. |
+
+**Selection**: Option B — implementation review correction.
+
+**Rationale**: Option A turns ordinary cross-host clock skew into avoidable
+fail-open misses. Option C lets a seconds-versus-milliseconds mistake or bad
+clock install a far-future interval while also appearing as healthy age zero.
+Thirty seconds matches the existing operational lag scale while strictly
+bounding that failure. The bound is a defence-in-depth contract invariant, not
+an operator tuning parameter, so it introduces no environment variable. The
+ordering is part of the decision: decode and field types first, then future
+trust, then and only then delivery observation and state.
+
+**Stage**: Implementation review correction.
+
+**Impact**: Clarifies decision 20 and research D13 rather than silently changing
+their meaning; fixes `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30`; amends FR-017,
+NFR-005, SC-010, the consumer contract, data-model invariants, risk analysis,
+quickstart assertions, and existing tasks T029, T031, T037, T039, T041, T042,
+T046, T047, and T050. Over-bound records increment
+`suppression_records_rejected_total{reason="fields"}`, emit a structured
+malformed log, fail open, and produce neither a delivery observation nor a
+state write. E4 remains deployed evidence for real timestamp and delivery-age
+behavior.
