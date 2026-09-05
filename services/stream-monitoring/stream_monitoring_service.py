@@ -467,7 +467,10 @@ class StreamMonitoringService:
             desired_store=self.desired_store,
             config=resolve_reconciler_config(),
             # active_stream_count used to count IRC rooms. It now follows the
-            # reconciler's actual set -- the subscriptions that really exist.
+            # reconciler's actual set, which is CHANNELS -- one entry per
+            # monitored broadcaster, not per subscription. The subscription
+            # total is `eventsub_subscription_count`, published from the
+            # transport, and on the two-slot pool it is twice this (FR-015).
             on_pass_complete=active_stream_count.set,
             refusal_store=self._build_refusal_store(),
         )
@@ -526,20 +529,24 @@ class StreamMonitoringService:
         """Subscriptions vanished under us -- a dead socket, or a revocation.
 
         A websocket that cannot reconnect takes all ~300 of its subscriptions
-        with it (T023); a revocation takes one.
+        with it (T023); a revocation takes one. The unit here is
+        SUBSCRIPTIONS, not channels: a dead socket holding 150 fully covered
+        channels reports 300.
 
         Nothing is repaired here. The reconciler is told its picture of the
         world is stale, re-enumerates on the next pass, finds those channels
         absent and re-creates them on a surviving or new connection. The
-        `eventsub_subscription_count` dip in between is the alert (FR-012).
+        `eventsub_subscription_count` dip in between is the alert (FR-012),
+        and `eventsub_channel_coverage` says which halves the channels lost.
         """
         logger.error("EventSub connection lost", extra={
             "lost_subscriptions": lost_subscriptions
         })
         if self.reconciler is not None:
-            # The count goes with it, so the FR-012 gauge can drop now instead
-            # of at the end of the next pass -- by which time a successful
-            # re-create would have hidden the dip entirely.
+            # The pool has already forgotten the lost slots, so this
+            # republishes the transport-derived gauges immediately and the dip
+            # lands on the next scrape -- rather than at the end of the next
+            # pass, by which time a successful re-create would have hidden it.
             self.reconciler.invalidate_actual_set(lost_subscriptions)
 
     async def _on_eventsub_message(self, event):

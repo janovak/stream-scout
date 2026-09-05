@@ -41,10 +41,27 @@ The message path
 ----------------
 `SubscriptionTransport` is create/delete/list only -- it says nothing about
 receiving. The pool takes a `message_handler` and calls it once per chat
-event. `stream_monitoring_service.py` passes a handler that runs
-`map_chat_message` and hands the result to the existing Kafka producer path.
-The mapping is a module-level pure function so it can be tested without a
-socket, a Twitch client or a producer (T020, T021).
+event, and a `notification_handler` for the auxiliary type.
+`stream_monitoring_service.py` passes a handler that runs `map_chat_message`
+and hands the result to the existing Kafka producer path. The mapping is a
+module-level pure function so it can be tested without a socket, a Twitch
+client or a producer (T020, T021).
+
+Two subscriptions per channel (Feature 007)
+-------------------------------------------
+A monitored channel needs `channel.chat.message` for the chat itself and
+`channel.chat.notification` for the gift and raid notices that cause the
+bursts the detector has to ignore. They are two independent Twitch
+subscriptions with their own ids, their own failures and their own
+revocations, so the pool keeps one `_Slot` per (channel, `CoverageType`) and
+never infers one from the other.
+
+The unit that follows from that is the one thing to keep straight: a
+CONNECTION holds at most 300 SUBSCRIPTIONS, so at most 150 fully covered
+CHANNELS; the pool holds at most 400 channels, which is 800 of the 900
+subscriptions the three sessions allow. `occupancy()` answers in
+subscriptions and `coverage_counts()` in channels, and mixing them is how a
+session silently goes to 301.
 
 Callbacks run on each socket's own asyncio loop, which is the library default.
 Do NOT pass `callback_loop`: the library calls `loop.create_task()` on it from
@@ -57,11 +74,23 @@ producer is shared exactly as the IRC path shared it.
 import asyncio
 import hashlib
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set
+from enum import Enum
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 from twitchAPI.eventsub.websocket import EventSubWebsocket
 from twitchAPI.type import (
@@ -74,6 +103,8 @@ from twitchAPI.type import (
 )
 
 from reconciler import (
+    ADOPTABLE_STATUSES,
+    CHANNEL_COVERAGE_STATES,
     ExistingSubscription,
     RateLimitedError,
     SubscriptionRefusedError,
@@ -100,9 +131,92 @@ SUBSCRIPTIONS_PER_CONNECTION = 300
 MAX_CONNECTIONS = 3
 MAX_SUBSCRIPTIONS = SUBSCRIPTIONS_PER_CONNECTION * MAX_CONNECTIONS
 
-# The only subscription type this pool creates. Also the filter for `list()`,
-# so a subscription made by something else never enters the actual set.
+# The two subscription types a monitored channel needs, and the filters for
+# `list()`, so a subscription made by something else never enters the actual
+# set. `channel.chat.message` carries the chat this service was built for;
+# `channel.chat.notification` carries the gift/raid notices Feature 007 uses to
+# suppress the bursts they cause. They are separate Twitch subscriptions with
+# separate ids, separate quotas and separate failure modes.
 CHAT_MESSAGE_SUBSCRIPTION_TYPE = "channel.chat.message"
+CHAT_NOTIFICATION_SUBSCRIPTION_TYPE = "channel.chat.notification"
+
+# How long a channel stays in `degraded_chat_only` after Twitch refuses its
+# notification subscription while chat is live (research D2, data-model I17).
+#
+# The hold-off exists because `streamers.eventsub_refused_at` is per CHANNEL
+# and lasts seven days: letting an auxiliary 403 reach the reconciler as a
+# refusal would kill that channel's CHAT for a week to protect a suppression
+# signal. It is bounded rather than permanent because a permanent pool-local
+# refusal trades one coverage hole for another and quietly contradicts FR-001.
+AUXILIARY_REFUSAL_RETRY_SECONDS = 3600
+
+
+def _positive_int_from_env(name: str, default: int) -> int:
+    """An operator override, or the checked-in default. Loud on nonsense."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} must be a whole number of seconds, got {raw!r}") from e
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+class CoverageType(Enum):
+    """The closed set of subscription types one monitored channel needs.
+
+    Closed on purpose: every capacity number in `data-model.md` §4 is derived
+    from there being exactly two of these (400 channels x 2 = 800 of the 900
+    subscriptions Twitch allows this token). A third member would change all
+    of them, so adding one has to be a deliberate edit here.
+    """
+
+    CHAT = "chat"
+    NOTIFICATION = "notification"
+
+    @property
+    def subscription_type(self) -> str:
+        """The Twitch `type` this coverage is made of."""
+        return _SUBSCRIPTION_TYPE_BY_COVERAGE[self]
+
+    @classmethod
+    def for_subscription_type(cls, subscription_type) -> Optional["CoverageType"]:
+        """The coverage a Twitch `type` belongs to, or None if it is not ours.
+
+        None rather than a guess: a subscription type this pool does not create
+        must never be resolved to one of ours, or a revocation would forget the
+        wrong half of a channel's pair.
+        """
+        return _COVERAGE_BY_SUBSCRIPTION_TYPE.get(subscription_type)
+
+
+_SUBSCRIPTION_TYPE_BY_COVERAGE = {
+    CoverageType.CHAT: CHAT_MESSAGE_SUBSCRIPTION_TYPE,
+    CoverageType.NOTIFICATION: CHAT_NOTIFICATION_SUBSCRIPTION_TYPE,
+}
+_COVERAGE_BY_SUBSCRIPTION_TYPE = {
+    subscription_type: coverage_type
+    for coverage_type, subscription_type in _SUBSCRIPTION_TYPE_BY_COVERAGE.items()
+}
+
+# The channel-level states derived from the pair. `absent` is deliberately not
+# counted: a channel with no slot at all is not in any index, so counting it
+# would mean counting every channel that has ever existed. The tuple is the
+# reconciler's, imported rather than repeated, because it is also the complete
+# label set of `eventsub_channel_coverage` and the two must not drift apart.
+COVERAGE_STATES = CHANNEL_COVERAGE_STATES
+
+# The two ORDINARY partial states: one coverage type live, the other missing,
+# and no hold-off standing in for it. They are the only states `list()` keeps
+# out of the actual set on purpose, which is what makes them repairable -- and
+# therefore the only ones the reconciler has to be handed a drop handle for
+# once the channel stops being wanted. `degraded_chat_only` is deliberately
+# NOT here: it is actual for the length of its hold-off, so the ordinary diff
+# already drops it, and reporting it as droppable would evict live chat (I1).
+PARTIAL_COVERAGE_STATES = ("chat_only", "notification_only")
 
 # How often the supervisor looks for a socket that has stopped receiving.
 DEFAULT_SUPERVISE_INTERVAL_SECONDS = 15.0
@@ -312,27 +426,90 @@ class _Connection:
         return len(self.subscription_ids) + self.reserved
 
 
+def _monotonic_ms() -> int:
+    """The default clock for the auxiliary hold-off, in milliseconds.
+
+    Monotonic, not wall clock: the hold-off is a duration, and a clock step
+    must not shorten or extend it. Injectable, because an hour cannot be
+    waited out in a test and sleeping through it would not be a test.
+    """
+    return int(time.monotonic() * 1000)
+
+
+async def _discard_notification(event) -> None:
+    """The default sink for `channel.chat.notification`.
+
+    Dual coverage is not conditional on anything having somewhere to put the
+    notices (FR-001): every monitored channel gets both subscriptions, so the
+    pool can be constructed without a notification handler and still create
+    the subscription. The producer that consumes these lands with T005.
+    """
+    logger.debug("Chat notification received with no handler wired, discarding")
+
+
 @dataclass(frozen=True)
 class _Slot:
-    """Where one broadcaster's subscription lives."""
+    """Where one broadcaster's subscription of ONE coverage type lives.
+
+    Two slots for the same channel are independent records. Either may exist
+    without the other, and neither may be inferred from the other's presence
+    or from the other's id (data-model I3).
+    """
 
     broadcaster_id: int
+    coverage_type: CoverageType
     connection_id: int
     subscription_id: str
     # The websocket session this subscription was made on. A reconnect gives
     # the connection a NEW session, and everything Twitch held on the old one
     # is gone -- so a slot whose session no longer matches its connection's is
     # stale whatever any local registry says. This is the only check that does
-    # not depend on the library telling the truth about what it holds.
+    # not depend on the library telling the truth about what it holds. It is
+    # read before each listen call, so the two halves of a pair created either
+    # side of a reconnect carry different, honest stamps.
     session_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ChannelCoverage:
+    """The derived, per-channel view over one channel's pair of slots.
+
+    This is the only thing that answers "is this channel covered". The
+    reconciler is channel-keyed, so it needs one answer per channel and not
+    one per subscription.
+    """
+
+    broadcaster_id: int
+    chat_slot: Optional[_Slot]
+    notification_slot: Optional[_Slot]
+    auxiliary_refused_until_ms: Optional[int]
+    state: str
+
+    @property
+    def is_actual(self) -> bool:
+        """May the reconciler count this channel as covered?
+
+        `degraded_chat_only` is the one state that says yes without both
+        halves, and only for the length of a bounded hold-off: without it the
+        reconciler would drop the channel from `_actual` every pass and
+        re-create a subscription Twitch has just refused.
+        """
+        return self.state in ("complete", "degraded_chat_only")
 
 
 class EventSubPoolTransport(SubscriptionTransport):
     """A growing pool of `EventSubWebsocket` sessions behind one transport.
 
     `message_handler` is an async callable invoked once per chat event, with
-    the raw `ChannelChatMessageEvent`. It runs on the receiving socket's own
-    event loop, so it must not assume the service's loop and must not block.
+    the raw `ChannelChatMessageEvent`. `notification_handler` is the same for
+    `ChannelChatNotificationEvent`. Both run on the receiving socket's own
+    event loop, so neither may assume the service's loop and neither may
+    block.
+
+    Every monitored channel holds one subscription of EACH `CoverageType`, so
+    a channel costs two of the 300 subscriptions a session can hold. Occupancy
+    is therefore counted in subscriptions and coverage in channels, and the
+    two units are never mixed (data-model I4).
     """
 
     def __init__(
@@ -340,6 +517,7 @@ class EventSubPoolTransport(SubscriptionTransport):
         twitch,
         message_handler: Callable[[Any], Awaitable[None]],
         *,
+        notification_handler: Optional[Callable[[Any], Awaitable[None]]] = None,
         user_id: Optional[str] = None,
         cap: int = SUBSCRIPTIONS_PER_CONNECTION,
         connection_factory: Optional[Callable[[], Any]] = None,
@@ -347,9 +525,12 @@ class EventSubPoolTransport(SubscriptionTransport):
         supervise_interval_seconds: float = DEFAULT_SUPERVISE_INTERVAL_SECONDS,
         connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
         max_connections: int = MAX_CONNECTIONS,
+        monotonic_ms: Optional[Callable[[], int]] = None,
+        auxiliary_refusal_retry_seconds: Optional[int] = None,
     ):
         self.twitch = twitch
         self.message_handler = message_handler
+        self.notification_handler = notification_handler or _discard_notification
         self.user_id = user_id
         self.cap = cap
         self._connection_factory = connection_factory or self._default_connection_factory
@@ -357,14 +538,29 @@ class EventSubPoolTransport(SubscriptionTransport):
         self.supervise_interval_seconds = supervise_interval_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
         self.max_connections = max_connections
+        self._monotonic_ms = monotonic_ms or _monotonic_ms
+        self.auxiliary_refusal_retry_seconds = (
+            auxiliary_refusal_retry_seconds
+            if auxiliary_refusal_retry_seconds is not None
+            else _positive_int_from_env(
+                "AUXILIARY_REFUSAL_RETRY_SECONDS", AUXILIARY_REFUSAL_RETRY_SECONDS
+            )
+        )
         # Monotonic deadline after a failed `_grow`, so the rest of a batch
         # fails fast instead of each channel waiting out its own connect.
         self._growth_blocked_until = 0.0
 
         self._connections: List[_Connection] = []
         self._next_connection_id = 0
-        self._slots: Dict[int, _Slot] = {}
+        # One entry per (channel, coverage type), never per channel: the two
+        # halves are created, adopted, deleted, revoked and lost separately.
+        self._slots: Dict[Tuple[int, CoverageType], _Slot] = {}
+        # Each subscription id resolves to its OWN slot, so no id can be
+        # mistaken for its sibling's.
         self._by_subscription: Dict[str, _Slot] = {}
+        # broadcaster -> monotonic ms at which a refused notification
+        # subscription becomes worth trying again (research D2).
+        self._auxiliary_refused_until: Dict[int, int] = {}
         # Serialises routing, reservations and growth. Held only around
         # bookkeeping and the one blocking `start()`, never around a create.
         self._lock = asyncio.Lock()
@@ -427,6 +623,7 @@ class EventSubPoolTransport(SubscriptionTransport):
         self._connections = []
         self._slots = {}
         self._by_subscription = {}
+        self._auxiliary_refused_until = {}
         # `_retire` schedules each socket's teardown on its own loop and does
         # not await it, so delivery has not actually stopped when this returns.
         # An event already dispatched runs the message handler -- and its
@@ -439,63 +636,85 @@ class EventSubPoolTransport(SubscriptionTransport):
     # -- SubscriptionTransport --------------------------------------------
 
     async def create(self, broadcaster_id: int) -> str:
-        """Subscribe to one channel's chat, on the connection it routes to."""
-        existing = self._slots.get(broadcaster_id)
-        existing_connection = (
-            self._connection_by_id(existing.connection_id) if existing is not None else None
-        )
-        if existing is not None and existing_connection is not None:
-            # A live connection is not proof of a live subscription. When the
-            # library's `_resubscribe()` gives up part way through a reconnect
-            # the socket stays up while the channels past the failure point no
-            # longer exist on Twitch, and `_slots` still maps them to their
-            # pre-reconnect ids. Returning the recorded id here made no Twitch
-            # call, so the periodic re-adoption would drop the channel from
-            # `_actual`, ask for it again, be handed the ghost straight back,
-            # and count it as covered for ever. Check the library's registry,
-            # which is the only local record of what the socket really holds.
-            if self._slot_is_current(existing, existing_connection, broadcaster_id):
-                return existing.subscription_id
-            logger.warning(
-                "Recorded subscription is not on its connection any more, recreating",
-                extra={
-                    "broadcaster_id": broadcaster_id,
-                    "connection": existing_connection.connection_id,
-                    "subscription_id": existing.subscription_id,
-                },
-            )
-            self._forget_slot(existing)
-            existing = None
-        if existing is not None:
-            # The slot points at a connection that is gone. Returning its id
-            # would report the channel as covered while no socket delivers
-            # for it -- dark, and permanently so, because nothing else clears
-            # a slot whose connection has already been retired.
-            self._forget_slot(existing)
+        """Bring one channel up to full coverage, creating only what is missing.
 
-        connection = await self._reserve(broadcaster_id)
-        # Read BEFORE the create, not after. The library builds the POST's
-        # transport from whatever session is current when the request is
-        # issued, and its socket thread can complete a reconnect -- and so
-        # change the session -- while that request is in flight. Stamping the
-        # slot with the session read AFTER the await therefore labelled a
-        # subscription made on the OLD session with the NEW one, and
-        # `_slot_is_current` would then agree with itself for ever: the session
-        # check passes, the library's registry holds the id because
-        # `_subscribe` added it, and `create()` hands the ghost back with no
-        # Twitch call while nothing delivers for that channel. The session the
-        # request was actually issued on is the only honest stamp.
+        A channel needs one `channel.chat.message` subscription and one
+        `channel.chat.notification` subscription (FR-001). Both are created
+        when the channel is absent; a channel that already holds one of them
+        gets only the other, so a repair never duplicates a working
+        subscription (FR-002).
+
+        The return value is the CHAT subscription id. The reconciler keys
+        `_actual` by channel and hands this id back to `delete()`, so the chat
+        half is the channel's handle -- the auxiliary half is always resolved
+        from the channel, never from an id.
+        """
+        self._refresh_slots(broadcaster_id)
+        to_create = self._coverage_to_create(broadcaster_id)
+        if not to_create:
+            return self._handle_for(broadcaster_id)
+
+        connection = await self._reserve(broadcaster_id, slots=len(to_create))
+        # `_create_one` consumes exactly one reserved subscription on every
+        # path it can take, so what is left to release here is only the types
+        # it never got to.
+        unattempted = len(to_create)
+        try:
+            for coverage_type in to_create:
+                unattempted -= 1
+                try:
+                    await self._create_one(broadcaster_id, coverage_type, connection)
+                except SubscriptionRefusedError as error:
+                    if coverage_type is not CoverageType.NOTIFICATION or not self._holds(
+                        broadcaster_id, CoverageType.CHAT
+                    ):
+                        raise
+                    # D2. Refusal is per CHANNEL in Postgres and stands for
+                    # seven days, so letting an auxiliary 403 out of here as a
+                    # `SubscriptionRefusedError` would evict this channel's
+                    # chat for a week to protect a suppression signal. Record a
+                    # bounded, pool-local hold-off instead and keep the chat.
+                    self._record_auxiliary_refusal(broadcaster_id, error)
+        finally:
+            if unattempted:
+                await self._release(connection, slots=unattempted)
+
+        return self._handle_for(broadcaster_id)
+
+    async def _create_one(
+        self, broadcaster_id: int, coverage_type: CoverageType, connection: _Connection
+    ) -> str:
+        """Create one subscription of one type. Consumes one reservation.
+
+        Every path through this -- success, adoption, refusal, a connection
+        retired underneath it, a reconnect that invalidates the result --
+        gives up exactly one of the reserved subscriptions, so the caller's
+        accounting stays a simple count.
+        """
+        # Read BEFORE the create, not after, and once per LISTEN CALL rather
+        # than once per channel. The library builds the POST's transport from
+        # whatever session is current when the request is issued, and its
+        # socket thread can complete a reconnect -- and so change the session
+        # -- while that request is in flight. Stamping the slot with the
+        # session read AFTER the await therefore labelled a subscription made
+        # on the OLD session with the NEW one, and `_slot_is_current` would
+        # then agree with itself for ever: the session check passes, the
+        # library's registry holds the id because `_subscribe` added it, and
+        # `create()` hands the ghost back with no Twitch call while nothing
+        # delivers for that channel. A single reading shared by both halves of
+        # a pair has the same defect, one reconnect narrower.
         session_before = self._session_id(connection)
         subscription_id = None
+        adopted = None
         try:
-            subscription_id = await connection.websocket.listen_channel_chat_message(
-                str(broadcaster_id), self.user_id, self._on_event
-            )
+            subscription_id = await self._listen(connection, broadcaster_id, coverage_type)
         except EventSubSubscriptionConflict:
             # The interface says a duplicate create adopts rather than fails
             # (FR-005). Twitch answers 409 when this exact subscription is
             # already there, which happens whenever the actual set is stale.
-            return await self._adopt_conflict(broadcaster_id)
+            # The adoption is per type: a chat conflict may only ever adopt a
+            # chat subscription.
+            adopted = await self._adopt_conflict(broadcaster_id, coverage_type)
         except EventSubSubscriptionError as e:
             raise self._classify(connection, e)
         except TwitchBackendException as e:
@@ -516,6 +735,12 @@ class EventSubPoolTransport(SubscriptionTransport):
             if subscription_id is None:
                 await self._release(connection)
 
+        if adopted is not None:
+            # The 409 path. The reservation was given up by the `finally`
+            # above, and only AFTER `_adopt_conflict` recorded the adopted
+            # subscription -- so `load` never dips between the two either.
+            return adopted
+
         async with self._lock:
             if self._connection_by_id(connection.connection_id) is None:
                 connection.reserved = max(0, connection.reserved - 1)
@@ -528,13 +753,14 @@ class EventSubPoolTransport(SubscriptionTransport):
                     "Connection was retired mid-create, discarding the subscription",
                     extra={
                         "broadcaster_id": broadcaster_id,
+                        "coverage_type": coverage_type.value,
                         "connection": connection.connection_id,
                         "subscription_id": subscription_id,
                     },
                 )
                 raise TransportError(
                     f"connection {connection.connection_id} was lost while subscribing "
-                    f"broadcaster {broadcaster_id}"
+                    f"{coverage_type.value} for broadcaster {broadcaster_id}"
                 )
             session_now = self._session_id(connection)
             reconnected = (
@@ -547,14 +773,14 @@ class EventSubPoolTransport(SubscriptionTransport):
                 # subscription, so `load` never dips between the two.
                 connection.reserved = max(0, connection.reserved - 1)
                 slot = _Slot(
-                    broadcaster_id,
-                    connection.connection_id,
-                    subscription_id,
-                    session_before,
+                    broadcaster_id=broadcaster_id,
+                    coverage_type=coverage_type,
+                    connection_id=connection.connection_id,
+                    subscription_id=subscription_id,
+                    session_id=session_before,
                 )
                 connection.subscription_ids.add(subscription_id)
-                self._slots[broadcaster_id] = slot
-                self._by_subscription[subscription_id] = slot
+                self._record_slot(slot)
 
         if not reconnected:
             return subscription_id
@@ -607,6 +833,7 @@ class EventSubPoolTransport(SubscriptionTransport):
             "Connection reconnected mid-create, discarding the subscription",
             extra={
                 "broadcaster_id": broadcaster_id,
+                "coverage_type": coverage_type.value,
                 "connection": connection.connection_id,
                 "subscription_id": subscription_id,
                 "session_at_create": session_before,
@@ -620,33 +847,363 @@ class EventSubPoolTransport(SubscriptionTransport):
             await self._release(connection)
         raise TransportError(
             f"connection {connection.connection_id} reconnected while "
-            f"subscribing broadcaster {broadcaster_id}"
+            f"subscribing {coverage_type.value} for broadcaster {broadcaster_id}"
+        )
+
+    async def _listen(
+        self, connection: _Connection, broadcaster_id: int, coverage_type: CoverageType
+    ) -> str:
+        """Issue the listen call for one coverage type, with its own callback.
+
+        Each type gets its OWN handler: a notification delivered to the chat
+        publisher would be mapped as a chat message and land on
+        `chat-messages`, which the Flink job reads.
+
+        Both use `self.user_id`, the operator account already authenticated --
+        `user:read:chat` covers both types, so nothing is reseeded (FR-016).
+        The listener is resolved from the websocket at call time rather than
+        bound earlier, because a reconnect can replace it.
+        """
+        if coverage_type is CoverageType.CHAT:
+            return await connection.websocket.listen_channel_chat_message(
+                str(broadcaster_id), self.user_id, self._on_event
+            )
+        return await connection.websocket.listen_channel_chat_notification(
+            str(broadcaster_id), self.user_id, self._on_notification
+        )
+
+    # -- coverage ---------------------------------------------------------
+
+    def channel_coverage(self, broadcaster_id: int) -> ChannelCoverage:
+        """What this pool holds for one channel, as a single derived answer."""
+        chat = self._slots.get((broadcaster_id, CoverageType.CHAT))
+        notification = self._slots.get((broadcaster_id, CoverageType.NOTIFICATION))
+        refused_until = self._auxiliary_refused_until_ms(broadcaster_id)
+
+        if chat is not None and notification is not None:
+            state = "complete"
+        elif chat is not None and refused_until is not None:
+            # The only state that reports a channel as actual without both
+            # halves, and only until the hold-off runs out.
+            state = "degraded_chat_only"
+        elif chat is not None:
+            state = "chat_only"
+        elif notification is not None:
+            state = "notification_only"
+        else:
+            state = "absent"
+
+        return ChannelCoverage(
+            broadcaster_id=broadcaster_id,
+            chat_slot=chat,
+            notification_slot=notification,
+            auxiliary_refused_until_ms=refused_until,
+            state=state,
+        )
+
+    def coverage_counts(self) -> Dict[str, int]:
+        """Channels by coverage state -- CHANNELS, not subscriptions.
+
+        The unit is the whole point (data-model I4). `occupancy()` answers in
+        subscriptions and is bounded by 300 per connection; this answers in
+        channels and is bounded by the 400-channel ceiling. Mixing them is how
+        a 400-channel pool reads as 800 against a 400 limit, or a 300-
+        subscription session reads as full at 150.
+        """
+        counts = {state: 0 for state in COVERAGE_STATES}
+        for broadcaster_id in {key[0] for key in self._slots}:
+            state = self.channel_coverage(broadcaster_id).state
+            if state in counts:
+                counts[state] += 1
+        return counts
+
+    def _holds(self, broadcaster_id: int, coverage_type: CoverageType) -> bool:
+        return (broadcaster_id, coverage_type) in self._slots
+
+    def partial_channel_handles(self) -> Dict[int, str]:
+        """One delete handle per ORDINARY partial channel. Drop-only (T021).
+
+        A channel that holds exactly one of its two coverage types is not in
+        the actual set -- `list()` withholds it on purpose, because that is
+        what makes the reconciler re-create the missing half. The cost of that
+        is that once the channel leaves the desired set it is in nothing the
+        reconciler diffs: not in `_actual`, so never dropped; not in `desired`,
+        so never created. The surviving subscription would then hold one of the
+        300 slots on its session for the life of the process (FR-014, NFR-003).
+
+        This is the reclamation handle for exactly that case, and nothing
+        else. It is NOT a second actual set: a channel here is still not
+        covered, still not counted, and still repairable by the ordinary
+        create path while it is wanted.
+
+        `complete` and active `degraded_chat_only` channels are excluded.
+        Both are already actual, so the ordinary diff drops them -- listing
+        them here would give the reconciler two routes to the same delete, and
+        for a degraded channel it would evict the live chat that its bounded
+        hold-off exists to protect (I1, I17).
+
+        The handle is each channel's CURRENT live id, resolved the same way
+        `delete()` resolves one, so a reconnect that rotated it cannot hand
+        back an id Twitch has already collected.
+        """
+        handles: Dict[int, str] = {}
+        for broadcaster_id in sorted({key[0] for key in self._slots}):
+            coverage = self.channel_coverage(broadcaster_id)
+            if coverage.state not in PARTIAL_COVERAGE_STATES:
+                continue
+            slot = coverage.chat_slot or coverage.notification_slot
+            if slot is None:  # pragma: no cover -- the state implies one
+                continue
+            handles[broadcaster_id] = self._live_handle_for(slot)
+        return handles
+
+    def _live_handle_for(self, slot: _Slot) -> str:
+        """The id a delete should be issued against for this slot right now."""
+        connection = self._connection_by_id(slot.connection_id)
+        live = self._live_subscription_ids(connection, slot)
+        return live[0] if live else slot.subscription_id
+
+    def _handle_for(self, broadcaster_id: int) -> str:
+        """The id the reconciler holds for this channel: the chat half."""
+        chat = self._slots.get((broadcaster_id, CoverageType.CHAT))
+        if chat is None:
+            raise TransportError(
+                f"broadcaster {broadcaster_id} has no chat subscription after create"
+            )
+        return chat.subscription_id
+
+    def _record_slot(self, slot: _Slot) -> None:
+        """Index one slot under its own key and its own id."""
+        self._slots[(slot.broadcaster_id, slot.coverage_type)] = slot
+        self._by_subscription[slot.subscription_id] = slot
+        if slot.coverage_type is CoverageType.NOTIFICATION:
+            # Coverage is complete for the auxiliary type, so whatever refusal
+            # put this channel in a hold-off is over (data-model §5.4.1).
+            self._clear_auxiliary_refusal(slot.broadcaster_id, "notification covered")
+
+    def _refresh_slots(self, broadcaster_id: int) -> None:
+        """Drop the slots that are no longer real, one coverage type at a time.
+
+        A live connection is not proof of a live subscription. When the
+        library's `_resubscribe()` gives up part way through a reconnect the
+        socket stays up while the channels past the failure point no longer
+        exist on Twitch, and `_slots` still maps them to their pre-reconnect
+        ids -- and it can give up between the two halves of one channel, so
+        each half has to be judged on its own.
+        """
+        for coverage_type in CoverageType:
+            slot = self._slots.get((broadcaster_id, coverage_type))
+            if slot is None:
+                continue
+            connection = self._connection_by_id(slot.connection_id)
+            if connection is None:
+                # The slot points at a connection that is gone. Keeping it
+                # would report the channel as covered while no socket delivers
+                # for it -- dark, and permanently so, because nothing else
+                # clears a slot whose connection has already been retired.
+                self._forget_slot(slot)
+                self._clear_auxiliary_refusal(broadcaster_id, "connection retired")
+                continue
+            if self._session_changed(slot, connection):
+                # A reconnect. Twitch holds nothing from the old session, and
+                # the refusal that started any hold-off may have been specific
+                # to it -- so this is a free opportunity to retest it (I17).
+                logger.warning(
+                    "Recorded subscription is on a replaced session, recreating",
+                    extra={
+                        "broadcaster_id": broadcaster_id,
+                        "coverage_type": coverage_type.value,
+                        "connection": connection.connection_id,
+                        "subscription_id": slot.subscription_id,
+                    },
+                )
+                self._forget_slot(slot)
+                self._clear_auxiliary_refusal(broadcaster_id, "websocket reconnected")
+                continue
+            if not self._slot_is_current(slot, connection):
+                logger.warning(
+                    "Recorded subscription is not on its connection any more, recreating",
+                    extra={
+                        "broadcaster_id": broadcaster_id,
+                        "coverage_type": coverage_type.value,
+                        "connection": connection.connection_id,
+                        "subscription_id": slot.subscription_id,
+                    },
+                )
+                self._forget_slot(slot)
+
+    def _coverage_to_create(self, broadcaster_id: int) -> List[CoverageType]:
+        """The types this channel is missing, minus anything held off.
+
+        Chat first, always: it is the data path, and it is what makes an
+        auxiliary refusal an auxiliary one rather than a channel refusal.
+        """
+        to_create = [
+            coverage_type
+            for coverage_type in CoverageType
+            if not self._holds(broadcaster_id, coverage_type)
+        ]
+        if (
+            CoverageType.NOTIFICATION in to_create
+            and self._auxiliary_refused_until_ms(broadcaster_id) is not None
+        ):
+            # Retrying inside the hold-off is the hot loop D2 exists to stop:
+            # the reconciler asks every pass, Twitch refuses every pass, and
+            # the create budget goes on a subscription that cannot be made.
+            to_create.remove(CoverageType.NOTIFICATION)
+        return to_create
+
+    # -- auxiliary refusal (D2, T024) -------------------------------------
+
+    def _auxiliary_refused_until_ms(self, broadcaster_id: int) -> Optional[int]:
+        """The live hold-off deadline for this channel, or None.
+
+        An expired deadline is not a hold-off, so it is dropped here rather
+        than reported: `degraded_chat_only` has to end on its own, or it would
+        be a standing exception to FR-001 instead of a bounded one.
+        """
+        deadline = self._auxiliary_refused_until.get(broadcaster_id)
+        if deadline is None:
+            return None
+        if deadline <= self._monotonic_ms():
+            del self._auxiliary_refused_until[broadcaster_id]
+            return None
+        return deadline
+
+    def _record_auxiliary_refusal(self, broadcaster_id: int, error: Exception) -> None:
+        deadline = (
+            self._monotonic_ms() + self.auxiliary_refusal_retry_seconds * 1000
+        )
+        self._auxiliary_refused_until[broadcaster_id] = deadline
+        logger.warning(
+            "Twitch refused the chat-notification subscription, keeping chat and "
+            "degrading suppression coverage for this channel",
+            extra={
+                "broadcaster_id": broadcaster_id,
+                "retry_after_seconds": self.auxiliary_refusal_retry_seconds,
+                "error": str(error),
+            },
+        )
+
+    def _clear_auxiliary_refusal(self, broadcaster_id: int, reason: str) -> None:
+        if self._auxiliary_refused_until.pop(broadcaster_id, None) is None:
+            return
+        logger.info(
+            "Chat-notification hold-off cleared, the channel is repairable again",
+            extra={"broadcaster_id": broadcaster_id, "reason": reason},
         )
 
     async def delete(self, subscription_id: str) -> None:
-        """Remove a subscription. Already gone is success, not an error (T024).
+        """Drop a channel: BOTH of its subscriptions, independently (T024).
+
+        The reconciler is channel-keyed and holds one id per channel, so the
+        id it passes identifies the CHANNEL; every coverage type that channel
+        still holds is deleted. A subscription that is already gone is
+        success, not an error.
 
         After a socket loses its keepalive the library reconnects and
         re-subscribes everything, which gives every subscription on that
-        socket a NEW id. The id the reconciler holds is then stale, and
-        deleting it would answer "not found" while the real subscription kept
-        delivering. So the live id is resolved from the connection before the
-        delete, and the stale one is only a fallback.
+        socket a NEW id -- per type. The id the reconciler holds is then
+        stale, so each type's live id is resolved from the connection before
+        its own delete, and the recorded one is only a fallback.
+
+        A rotated id is the id the reconciler ACTUALLY holds: `list()` reports
+        what Twitch has now, so the very next enumeration replaces the handle
+        with the post-reconnect one while `_by_subscription` still holds the
+        pre-reconnect pair. Resolving that id has to answer with the CHANNEL,
+        not with one subscription of it -- deleting only the half named would
+        leave the sibling live on Twitch, in the library's registry and in the
+        occupancy count, as a partial orphan nothing ever drops (the channel
+        has left the desired set, so no pass creates it, and `list()` does not
+        yield a partial channel, so no pass drops it either).
         """
         slot = self._by_subscription.get(subscription_id)
-        if slot is None:
-            # An id this pool does not recognise, which is not the same as an
-            # id that is not ours. After a reconnect rotates the ids on a
-            # socket, `list()` reports the NEW ones and the reconciler asks to
-            # delete one of those, while `_by_subscription` still holds the
-            # old. Deleting it and stopping there would leave the library's
-            # own registry intact -- so the socket re-creates the channel on
-            # its next reconnect -- and leave the pool's occupancy counting a
-            # subscription that no longer exists.
-            await self._delete_one(subscription_id)
-            self._forget_unrecognised(subscription_id)
+        if slot is not None:
+            await self._delete_channel(slot.broadcaster_id)
             return
 
+        # An id this pool does not recognise, which is not the same as an id
+        # that is not ours. The library's own registry is the only place a
+        # rotated id appears, and it carries the condition AND the type -- so
+        # both halves of the channel's identity come back from one lookup.
+        resolved = self._resolve_unrecognised(subscription_id)
+        if resolved is None:
+            # Genuinely unknown, or already gone. The DELETE is still issued
+            # so the call stays idempotent, and there is nothing local to
+            # clean up because nothing local knows this id.
+            await self._delete_one(subscription_id)
+            return
+
+        connection, broadcaster_id, coverage_type = resolved
+        if broadcaster_id is None or coverage_type is None:
+            # The registry has the id but not a usable identity behind it.
+            # Delete exactly what was named and clear the library's entry, so
+            # the socket does not resubscribe it on its next reconnect.
+            # Raising instead would be worse than useless: the DELETE has
+            # already succeeded, so `_drop_one` would never pop `_actual` and
+            # the reconciler would re-issue the same delete every pass for
+            # ever.
+            await self._delete_one(subscription_id)
+            self._forget_library_subscription(connection, subscription_id)
+            async with self._lock:
+                connection.subscription_ids.discard(subscription_id)
+            return
+
+        await self._delete_channel(
+            broadcaster_id, orphans={coverage_type: (connection, subscription_id)}
+        )
+
+    async def _delete_channel(
+        self,
+        broadcaster_id: int,
+        orphans: Optional[Dict[CoverageType, Tuple[_Connection, str]]] = None,
+    ) -> None:
+        """Delete every coverage type this channel still holds, in one pass.
+
+        `orphans` names a live id per coverage type for which the pool has no
+        slot at all -- the rotated id a caller handed in when its own slot has
+        already been forgotten. Without it that id would be deleted from
+        Twitch by nobody and resubscribed by the library on its next
+        reconnect.
+
+        Both halves are attempted whatever the other does. The one that failed
+        keeps its slot and its place in the occupancy count, so the next pass
+        retries exactly it -- aborting early would leave a live subscription
+        with no slot to find it by. The first error is re-raised once every
+        type has been attempted.
+        """
+        orphans = orphans or {}
+        failure = None
+        for coverage_type in CoverageType:
+            target = self._slots.get((broadcaster_id, coverage_type))
+            try:
+                if target is not None:
+                    await self._delete_slot(target)
+                    continue
+                orphan = orphans.get(coverage_type)
+                if orphan is None:
+                    continue
+                await self._delete_orphan(*orphan)
+            except TransportError as e:
+                failure = failure or e
+
+        if failure is None:
+            self._clear_auxiliary_refusal(broadcaster_id, "channel dropped")
+        else:
+            raise failure
+
+    async def _delete_orphan(
+        self, connection: _Connection, subscription_id: str
+    ) -> None:
+        """Delete a live id of a coverage type the pool holds no slot for."""
+        await self._delete_one(subscription_id)
+        self._forget_library_subscription(connection, subscription_id)
+        async with self._lock:
+            connection.subscription_ids.discard(subscription_id)
+            self._by_subscription.pop(subscription_id, None)
+
+    async def _delete_slot(self, slot: _Slot) -> None:
+        """Delete one coverage type's subscription and clear its indexes."""
         connection = self._connection_by_id(slot.connection_id)
         targets = self._live_subscription_ids(connection, slot)
         for target in targets:
@@ -656,14 +1213,22 @@ class EventSubPoolTransport(SubscriptionTransport):
 
         async with self._lock:
             if connection is not None:
-                connection.subscription_ids.discard(subscription_id)
+                connection.subscription_ids.discard(slot.subscription_id)
                 for target in targets:
                     connection.subscription_ids.discard(target)
-            self._slots.pop(slot.broadcaster_id, None)
-            self._by_subscription.pop(subscription_id, None)
+            self._slots.pop((slot.broadcaster_id, slot.coverage_type), None)
+            self._by_subscription.pop(slot.subscription_id, None)
 
     async def list(self) -> AsyncIterator[ExistingSubscription]:
-        """Yield the chat subscriptions that live on a session this pool holds.
+        """Yield the channels this pool can actually receive BOTH halves for.
+
+        Two type-filtered Helix walks, joined per channel (R1). A channel is
+        yielded only when its chat AND its notification subscription are
+        `enabled` on a session this pool holds -- or when it is in an active
+        auxiliary-refusal hold-off, which is the one bounded exception (I1).
+
+        The reconciler stays channel-keyed: what it gets back is one entry per
+        channel carrying the CHAT subscription id, exactly as before.
 
         Page count, never `total` -- the spike saw `total` report 300 while
         the pages held 396 (D6). The library paginates transparently, so the
@@ -673,14 +1238,108 @@ class EventSubPoolTransport(SubscriptionTransport):
         dies with the process that opened it, so one this pool does not hold
         can never deliver a message to it: counting it in the actual set would
         leave the channel silently dark. Twitch collects the leftovers itself.
+
+        Either walk failing propagates. "Clean" has to mean BOTH walks
+        finished, or the reconciler would delete live subscriptions it merely
+        failed to see -- it holds its drops back until one enumeration
+        completes, and this is what tells it one did not.
         """
         live_sessions = self._live_session_ids()
-        result = await self.twitch.get_eventsub_subscriptions(
-            sub_type=CHAT_MESSAGE_SUBSCRIPTION_TYPE, target_token=AuthType.USER
+        stats = {
+            "chat_seen": 0,
+            "chat_pages": 0,
+            "notification_seen": 0,
+            "notification_pages": 0,
+        }
+
+        # The chat walk first and in full: it carries the id the reconciler
+        # gets back, so nothing can be yielded before it is known. The session
+        # each row is on comes back with it, because that is what says whether
+        # a degraded channel's connection has reconnected since its refusal.
+        chat_ids: Dict[int, str] = {}
+        chat_sessions: Dict[int, Optional[str]] = {}
+        async for broadcaster_id, subscription_id, session_id in self._walk(
+            CoverageType.CHAT, live_sessions, stats
+        ):
+            chat_ids[broadcaster_id] = subscription_id
+            chat_sessions[broadcaster_id] = session_id
+
+        # The notification walk streams, so a channel is yielded the moment
+        # its pair is complete. A walk that dies half way therefore still
+        # reports what it saw, and the reconciler merges that with what it
+        # already had rather than treating the rest as absent (NFR-003).
+        complete: Set[int] = set()
+        async for broadcaster_id, _, _ in self._walk(
+            CoverageType.NOTIFICATION, live_sessions, stats
+        ):
+            if broadcaster_id not in chat_ids or broadcaster_id in complete:
+                continue
+            complete.add(broadcaster_id)
+            yield ExistingSubscription(
+                subscription_id=chat_ids[broadcaster_id],
+                broadcaster_id=broadcaster_id,
+                status="enabled",
+            )
+
+        degraded = 0
+        reconnected = 0
+        for broadcaster_id, subscription_id in chat_ids.items():
+            if broadcaster_id in complete:
+                continue
+            if self._auxiliary_refused_until_ms(broadcaster_id) is None:
+                # An ordinary partial state. Leaving it out is what makes the
+                # reconciler re-create the missing half on the next pass.
+                continue
+            if self._reconnected_out_of_hold_off(
+                broadcaster_id, subscription_id, chat_sessions.get(broadcaster_id)
+            ):
+                # The hold-off has just been cleared by the reconnect, so this
+                # is an ordinary `chat_only` channel again. Withholding it is
+                # the repair: it drops out of the actual set and the
+                # reconciler's own `to_create` makes the missing half on this
+                # same pass (I17).
+                reconnected += 1
+                continue
+            degraded += 1
+            yield ExistingSubscription(
+                subscription_id=subscription_id,
+                broadcaster_id=broadcaster_id,
+                status="enabled",
+            )
+
+        logger.info(
+            "Enumerated EventSub subscriptions",
+            extra={
+                "pages": stats["chat_pages"] + stats["notification_pages"],
+                "seen": stats["chat_seen"] + stats["notification_seen"],
+                "chat_on_our_sessions": len(chat_ids),
+                "complete_channels": len(complete),
+                "degraded_channels": degraded,
+                "hold_offs_cleared_by_reconnect": reconnected,
+                "connections": len(self._connections),
+            },
         )
 
-        seen = 0
-        yielded = 0
+    async def _walk(
+        self,
+        coverage_type: CoverageType,
+        live_sessions: Set[str],
+        stats: Dict[str, int],
+    ) -> AsyncIterator[Tuple[int, str, Optional[str]]]:
+        """One type-filtered Helix walk, yielding only what this pool can use.
+
+        `enabled` on a session this pool holds is the whole filter, and it has
+        to hold for BOTH halves or a channel whose notification subscription
+        was revoked would read as covered.
+
+        The session comes back with each row rather than being dropped once it
+        has passed the filter: which of this pool's sessions a subscription is
+        on is what distinguishes a channel whose connection has reconnected
+        since its slot was stamped from one that has simply not been repaired.
+        """
+        result = await self.twitch.get_eventsub_subscriptions(
+            sub_type=coverage_type.subscription_type, target_token=AuthType.USER
+        )
         pages = 1
         cursor = self._cursor_of(result)
         async for subscription in result:
@@ -688,30 +1347,110 @@ class EventSubPoolTransport(SubscriptionTransport):
             if moved != cursor:
                 pages += 1
                 cursor = moved
-            seen += 1
+            stats[f"{coverage_type.value}_seen"] += 1
+            if getattr(subscription, "status", None) not in ADOPTABLE_STATUSES:
+                continue
             transport = getattr(subscription, "transport", None) or {}
-            if transport.get("session_id") not in live_sessions:
+            session_id = transport.get("session_id")
+            if session_id not in live_sessions:
                 continue
             broadcaster_id = (getattr(subscription, "condition", None) or {}).get(
                 "broadcaster_user_id"
             )
             if broadcaster_id is None:
                 continue
-            yielded += 1
-            yield ExistingSubscription(
-                subscription_id=subscription.id,
-                broadcaster_id=int(broadcaster_id),
-                status=subscription.status,
-            )
+            yield int(broadcaster_id), subscription.id, session_id
+        stats[f"{coverage_type.value}_pages"] += pages
+
+    def _reconnected_out_of_hold_off(
+        self,
+        broadcaster_id: int,
+        live_subscription_id: str,
+        live_session_id: Optional[str],
+    ) -> bool:
+        """Has a degraded channel's connection reconnected since its refusal?
+
+        `_refresh_slots()` already answers this -- but it only runs inside
+        `create()`, and the reconciler never calls `create()` for a channel it
+        already counts as actual. A degraded channel is actual for the whole
+        hold-off, precisely so the reconciler does not hot-loop on a refusal
+        it cannot fix, so on the deployed path nothing ever noticed the
+        reconnect and I17's "immediately on reconnect" meant "in at most an
+        hour". The enumeration has to ask the question too.
+
+        Clearing the hold-off HERE, before the channel is judged actual, is
+        what makes the repair immediate: the channel is an ordinary
+        `chat_only` again, so it is withheld from the actual set and the
+        reconciler's own `to_create` diff makes the missing notification half
+        on this same pass. No `create()` call is needed to clear it and no
+        3600 seconds have to elapse; without a reconnect nothing here fires
+        and the hold-off goes on holding.
+
+        The surviving chat subscription is re-stamped against the id and
+        session Helix has just reported rather than forgotten. It is live, and
+        dropping the slot would make the repair subscribe a SECOND chat
+        subscription for the same channel (FR-002, I2).
+        """
+        slot = self._slots.get((broadcaster_id, CoverageType.CHAT))
+        if slot is None:
+            # Nothing recorded to compare a session against, so there is no
+            # evidence of a reconnect. Helix says a chat subscription is live
+            # on one of this pool's sessions; leave the hold-off alone rather
+            # than clear it on a guess.
+            return False
+
+        connection = (
+            self._connection_by_session(live_session_id) if live_session_id else None
+        ) or self._connection_by_id(slot.connection_id)
+        if connection is None:
+            # The connection is gone entirely. A refusal cannot outlive the
+            # session it was made on (I17), and the slot points at nothing.
+            self._forget_slot(slot)
+            self._clear_auxiliary_refusal(broadcaster_id, "connection retired")
+            return True
+
+        if not self._session_changed(slot, connection):
+            return False
 
         logger.info(
-            "Enumerated EventSub subscriptions",
+            "Degraded channel's connection has reconnected, repairing its "
+            "notification coverage now rather than at the hold-off's deadline",
             extra={
-                "pages": pages,
-                "seen": seen,
-                "on_our_sessions": yielded,
-                "connections": len(self._connections),
+                "broadcaster_id": broadcaster_id,
+                "connection": connection.connection_id,
+                "session_at_create": slot.session_id,
+                "session_now": self._session_id(connection),
             },
+        )
+        self._clear_auxiliary_refusal(broadcaster_id, "websocket reconnected")
+        self._restamp_slot(slot, connection, live_subscription_id)
+        return True
+
+    def _restamp_slot(
+        self, slot: _Slot, connection: _Connection, subscription_id: str
+    ) -> None:
+        """Re-record a surviving slot against the id and session it is on now.
+
+        One slot in, one slot out. The old id leaves every index -- including
+        the occupancy count it was held under -- and the new one takes its
+        place, so the channel neither loses the coverage type it still has nor
+        counts it twice.
+        """
+        self._slots.pop((slot.broadcaster_id, slot.coverage_type), None)
+        self._by_subscription.pop(slot.subscription_id, None)
+        previous = self._connection_by_id(slot.connection_id)
+        if previous is not None:
+            previous.subscription_ids.discard(slot.subscription_id)
+        connection.subscription_ids.discard(slot.subscription_id)
+        connection.subscription_ids.add(subscription_id)
+        self._record_slot(
+            _Slot(
+                broadcaster_id=slot.broadcaster_id,
+                coverage_type=slot.coverage_type,
+                connection_id=connection.connection_id,
+                subscription_id=subscription_id,
+                session_id=self._session_id(connection),
+            )
         )
 
     def occupancy(self) -> Dict[str, int]:
@@ -727,29 +1466,66 @@ class EventSubPoolTransport(SubscriptionTransport):
 
     # -- routing and growth -----------------------------------------------
 
-    def route(self, broadcaster_id: int) -> Optional[_Connection]:
-        """The connection this channel belongs on, or None if the pool is full.
+    def route(self, broadcaster_id: int, slots: int = 1) -> Optional[_Connection]:
+        """The connection `slots` subscriptions for this channel belong on.
+
+        `slots` is a SUBSCRIPTION count -- two for a new channel, one for a
+        repair -- because that is the unit the 300-per-session cap is in. A
+        connection with room for one is not a connection with room for a pair,
+        and treating them as the same is how a session goes to 301.
+
+        Locality first: a channel's pair is kept on one connection when that
+        connection has room, so a socket death costs the whole channel at once
+        rather than leaving a partial state behind. When it does not have
+        room, rendezvous order decides and the pair may split across two
+        connections -- legal and modelled (R2), because both partial states
+        are already convergent.
 
         Public because the routing rule is the part worth testing directly
         (T019a): the same broadcaster must come back to the same connection
         across reconciles.
         """
+        for connection in self._connections_holding(broadcaster_id):
+            if self._has_room(connection, slots):
+                return connection
+
         ordered = sorted(
             self._connections,
             key=lambda connection: _score(broadcaster_id, connection.connection_id),
             reverse=True,
         )
         for connection in ordered:
-            if connection.full_at is not None and connection.load >= connection.full_at:
-                continue
-            if connection.load < self.cap:
+            if self._has_room(connection, slots):
                 return connection
         return None
 
-    async def _reserve(self, broadcaster_id: int) -> _Connection:
-        """Pick the connection for this channel and hold a slot on it."""
+    def _connections_holding(self, broadcaster_id: int) -> List[_Connection]:
+        """The connections already carrying part of this channel's pair."""
+        holding: List[_Connection] = []
+        for coverage_type in CoverageType:
+            slot = self._slots.get((broadcaster_id, coverage_type))
+            if slot is None:
+                continue
+            connection = self._connection_by_id(slot.connection_id)
+            if connection is not None and connection not in holding:
+                holding.append(connection)
+        return holding
+
+    def _has_room(self, connection: _Connection, slots: int) -> bool:
+        """Can this connection take `slots` more subscriptions right now?
+
+        `load` already counts in-flight reservations, so this is the same
+        answer for a worker that has not created anything yet as for one that
+        has.
+        """
+        if connection.full_at is not None and connection.load + slots > connection.full_at:
+            return False
+        return connection.load + slots <= self.cap
+
+    async def _reserve(self, broadcaster_id: int, slots: int = 1) -> _Connection:
+        """Pick the connection for this channel and hold `slots` on it."""
         async with self._lock:
-            connection = self.route(broadcaster_id)
+            connection = self.route(broadcaster_id, slots=slots)
             if connection is None:
                 # Growth runs under the lock, and a connect can take up to
                 # `connect_timeout_seconds` to give up. Without the guard below
@@ -770,12 +1546,12 @@ class EventSubPoolTransport(SubscriptionTransport):
                         time.monotonic() + self.connect_timeout_seconds
                     )
                     raise
-            connection.reserved += 1
+            connection.reserved += slots
             return connection
 
-    async def _release(self, connection: _Connection):
+    async def _release(self, connection: _Connection, slots: int = 1):
         async with self._lock:
-            connection.reserved = max(0, connection.reserved - 1)
+            connection.reserved = max(0, connection.reserved - slots)
 
     async def _grow(self) -> _Connection:
         """Open one more session. Called with the lock held.
@@ -910,6 +1686,21 @@ class EventSubPoolTransport(SubscriptionTransport):
                 extra={"error": str(e), "error_type": type(e).__name__},
             )
 
+    async def _on_notification(self, event):
+        """Hand one chat notification to the service. Same loop, other sink.
+
+        Separate from `_on_event` on purpose: a notification handed to the
+        chat publisher would be mapped as a chat message and land on
+        `chat-messages`, which the Flink job reads as real chat.
+        """
+        try:
+            await self.notification_handler(event)
+        except Exception as e:
+            logger.error(
+                "Chat notification handler failed",
+                extra={"error": str(e), "error_type": type(e).__name__},
+            )
+
     async def _on_revocation(self, payload: dict):
         """Twitch withdrew a subscription. Runs on the socket's own loop.
 
@@ -931,7 +1722,10 @@ class EventSubPoolTransport(SubscriptionTransport):
         # `_active_subscriptions` and `_callbacks` BEFORE it calls this handler
         # (`_handle_revocation`), so by now no local registry can resolve it --
         # a lookup there is guaranteed to miss. Twitch sends the whole
-        # subscription object, condition included, so the channel is right here.
+        # subscription object, condition AND type included, so the channel and
+        # the coverage type are both right here. Both are needed: a reconnect
+        # rotates the ids of both halves, so the channel alone would not say
+        # WHICH half was revoked.
         condition = subscription.get("condition") or {}
         broadcaster_id = condition.get("broadcaster_user_id")
         self._loop.call_soon_threadsafe(
@@ -939,6 +1733,7 @@ class EventSubPoolTransport(SubscriptionTransport):
             subscription_id,
             subscription.get("status"),
             broadcaster_id,
+            subscription.get("type"),
         )
 
     def _forget_revoked(
@@ -946,6 +1741,7 @@ class EventSubPoolTransport(SubscriptionTransport):
         subscription_id: str,
         status: Optional[str],
         broadcaster_id: Optional[str] = None,
+        subscription_type: Optional[str] = None,
     ):
         slot = self._by_subscription.pop(subscription_id, None)
         if slot is None:
@@ -958,19 +1754,26 @@ class EventSubPoolTransport(SubscriptionTransport):
             # Returning here dropped the loss on the floor: nothing discarded
             # the channel, nothing invalidated the reconciler, and every count
             # went on reporting it as covered while no socket delivered for it.
-            slot = self._slot_for_broadcaster(broadcaster_id)
+            slot = self._slot_for(broadcaster_id, subscription_type)
         if slot is None:
             logger.error(
-                "Subscription revoked by Twitch, but the channel could not be "
-                "identified -- invalidating so the next pass re-enumerates",
-                extra={"subscription_id": subscription_id, "status": status},
+                "Subscription revoked by Twitch, but the channel and coverage type "
+                "could not be identified -- invalidating so the next pass "
+                "re-enumerates",
+                extra={
+                    "subscription_id": subscription_id,
+                    "status": status,
+                    "subscription_type": subscription_type,
+                },
             )
             # The channel is unknown, so the only safe move is to make the
             # reconciler rebuild its view from Twitch.
             if self.on_subscriptions_lost is not None:
                 self.on_subscriptions_lost(1)
             return
-        self._slots.pop(slot.broadcaster_id, None)
+        # Exactly one slot, never the pair. Twitch revokes one subscription,
+        # so the sibling is still live and re-creating it would duplicate it.
+        self._slots.pop((slot.broadcaster_id, slot.coverage_type), None)
         # Both ids. When the slot came back from the rotated-id lookup, the one
         # Twitch revoked is NOT the one occupancy was counted under, so
         # discarding only the revoked id would leave the channel in the count
@@ -985,10 +1788,13 @@ class EventSubPoolTransport(SubscriptionTransport):
             "Subscription revoked by Twitch",
             extra={
                 "broadcaster_id": slot.broadcaster_id,
+                "coverage_type": slot.coverage_type.value,
                 "subscription_id": subscription_id,
                 "status": status,
             },
         )
+        # One subscription, not one channel: the reconciler's count is in
+        # subscriptions, and the channel usually still holds its sibling.
         if self.on_subscriptions_lost is not None:
             self.on_subscriptions_lost(1)
 
@@ -1073,19 +1879,38 @@ class EventSubPoolTransport(SubscriptionTransport):
         )
         return TransportError(message)
 
-    async def _adopt_conflict(self, broadcaster_id: int) -> str:
-        """Answer a 409 with the id of the subscription that already exists."""
-        slot = self._slots.get(broadcaster_id)
+    async def _adopt_conflict(
+        self, broadcaster_id: int, coverage_type: CoverageType
+    ) -> str:
+        """Answer a 409 with the id of the subscription of THIS type.
+
+        Type-matched throughout. A chat conflict may only ever adopt a chat
+        subscription and a notification conflict only a notification one: a
+        cross-type adoption would record one half of the pair under the
+        other's key, so the channel would read as complete while one of its
+        two subscriptions had never been made and the other was indexed twice.
+        """
+        slot = self._slots.get((broadcaster_id, coverage_type))
         if slot is not None:
             return slot.subscription_id
 
         live_sessions = self._live_session_ids()
         result = await self.twitch.get_eventsub_subscriptions(
-            sub_type=CHAT_MESSAGE_SUBSCRIPTION_TYPE, target_token=AuthType.USER
+            sub_type=coverage_type.subscription_type, target_token=AuthType.USER
         )
         async for subscription in result:
             condition = getattr(subscription, "condition", None) or {}
             if condition.get("broadcaster_user_id") != str(broadcaster_id):
+                continue
+            # The `sub_type` filter is Twitch's; this is ours, because a
+            # transport that ignored it would silently accept whatever the
+            # filter let through.
+            row_type = getattr(subscription, "type", None)
+            if row_type is not None and row_type != coverage_type.subscription_type:
+                continue
+            if getattr(subscription, "status", None) not in ADOPTABLE_STATUSES:
+                # Revoked or disconnected. Adopting it would count a
+                # subscription that delivers nothing.
                 continue
             transport = getattr(subscription, "transport", None) or {}
             session_id = transport.get("session_id")
@@ -1095,18 +1920,19 @@ class EventSubPoolTransport(SubscriptionTransport):
             if connection is None:
                 continue
             slot = _Slot(
-                broadcaster_id,
-                connection.connection_id,
-                subscription.id,
-                self._session_id(connection),
+                broadcaster_id=broadcaster_id,
+                coverage_type=coverage_type,
+                connection_id=connection.connection_id,
+                subscription_id=subscription.id,
+                session_id=self._session_id(connection),
             )
             connection.subscription_ids.add(subscription.id)
-            self._slots[broadcaster_id] = slot
-            self._by_subscription[subscription.id] = slot
+            self._record_slot(slot)
             logger.info(
                 "Adopted a conflicting subscription",
                 extra={
                     "broadcaster_id": broadcaster_id,
+                    "coverage_type": coverage_type.value,
                     "subscription_id": subscription.id,
                     "connection": connection.connection_id,
                 },
@@ -1116,8 +1942,8 @@ class EventSubPoolTransport(SubscriptionTransport):
         # It exists somewhere this pool cannot receive from. Do not claim it:
         # the channel stays out of the actual set and the next pass retries.
         raise TransportError(
-            f"conflict for broadcaster {broadcaster_id}, but no matching "
-            "subscription on a session this pool holds"
+            f"conflict for broadcaster {broadcaster_id} ({coverage_type.value}), "
+            "but no matching subscription on a session this pool holds"
         )
 
     # -- deletes ----------------------------------------------------------
@@ -1210,19 +2036,27 @@ class EventSubPoolTransport(SubscriptionTransport):
         except Exception as e:  # pragma: no cover -- a test double without them
             logger.debug("Could not tear down a socket", extra={"error": str(e)})
 
-    def _slot_for_broadcaster(self, broadcaster_id) -> Optional[_Slot]:
-        """The slot this pool holds for a channel, whatever id it recorded.
+    def _slot_for(
+        self, broadcaster_id, subscription_type
+    ) -> Optional[_Slot]:
+        """The slot this pool holds for one (channel, type), whatever id it recorded.
 
         Used when a revocation names an id the pool has never seen, which is
         what a reconnect leaves behind: it rotates every id on the socket while
-        the pool keeps the ones it recorded at create time. The broadcaster
-        comes from the revocation payload rather than any local registry --
-        the library has already emptied those by the time it calls us.
+        the pool keeps the ones it recorded at create time. Both the
+        broadcaster and the type come from the revocation payload rather than
+        any local registry -- the library has already emptied those by the time
+        it calls us -- and BOTH are required. Resolving on the channel alone
+        would forget whichever half happened to be looked up first, which is
+        the sibling half the time.
         """
         if broadcaster_id is None:
             return None
+        coverage_type = CoverageType.for_subscription_type(subscription_type)
+        if coverage_type is None:
+            return None
         try:
-            return self._slots.get(int(broadcaster_id))
+            return self._slots.get((int(broadcaster_id), coverage_type))
         except (TypeError, ValueError):
             return None
 
@@ -1231,9 +2065,22 @@ class EventSubPoolTransport(SubscriptionTransport):
         session = getattr(connection.websocket, "active_session", None)
         return getattr(session, "id", None) if session is not None else None
 
-    def _slot_is_current(
-        self, slot: _Slot, connection: _Connection, broadcaster_id: int
-    ) -> bool:
+    def _session_changed(self, slot: _Slot, connection: _Connection) -> bool:
+        """Has this connection reconnected since the slot was stamped?
+
+        A reconnect always means a new session, and everything Twitch held on
+        the old one is gone with it -- whatever the library's registry still
+        claims. Each half of a pair is judged against its own stamp, because
+        the two can be made either side of one reconnect.
+        """
+        current_session = self._session_id(connection)
+        return (
+            slot.session_id is not None
+            and current_session is not None
+            and slot.session_id != current_session
+        )
+
+    def _slot_is_current(self, slot: _Slot, connection: _Connection) -> bool:
         """Is this recorded subscription still real on this connection?
 
         Two checks, because the registry alone is not trustworthy. The
@@ -1248,21 +2095,25 @@ class EventSubPoolTransport(SubscriptionTransport):
         circuits to the ghost again. Every FR-012 signal reads healthy while
         that socket's channels are dark.
 
-        The session check catches it. A reconnect always means a new session,
-        so a slot stamped with the old one is stale no matter what the map
-        says -- and that holds for a partial failure too.
+        The session check catches it, and it holds for a partial failure too.
         """
-        current_session = self._session_id(connection)
-        if (
-            slot.session_id is not None
-            and current_session is not None
-            and slot.session_id != current_session
-        ):
+        if self._session_changed(slot, connection):
             return False
-        return self._connection_holds(connection, broadcaster_id)
+        return self._connection_holds(connection, slot.broadcaster_id, slot.coverage_type)
 
-    def _connection_holds(self, connection: _Connection, broadcaster_id: int) -> bool:
-        """Does the library still have a subscription for this channel here?
+    def _connection_holds(
+        self,
+        connection: _Connection,
+        broadcaster_id: int,
+        coverage_type: CoverageType,
+    ) -> bool:
+        """Does the library still have a subscription of THIS type here?
+
+        The type is load-bearing. Matching on `broadcaster_user_id` alone
+        makes a channel that holds only its chat subscription read as
+        "current" for the notification type as well, so the missing half is
+        never created and the channel is silently stuck in `chat_only` while
+        every count says it is covered.
 
         The registry is private, and after a reconnect it can lie (see
         `_slot_is_current`), so this is the second of two checks rather than
@@ -1273,60 +2124,66 @@ class EventSubPoolTransport(SubscriptionTransport):
             return True
         wanted = str(broadcaster_id)
         return any(
-            (subscription.get("condition") or {}).get("broadcaster_user_id") == wanted
+            subscription.get("sub_type") == coverage_type.subscription_type
+            and (subscription.get("condition") or {}).get("broadcaster_user_id") == wanted
             for subscription in active.values()
         )
 
     def _forget_slot(self, slot: _Slot):
-        """Drop one slot from both indexes."""
-        self._slots.pop(slot.broadcaster_id, None)
+        """Drop one slot -- one coverage type -- from every index."""
+        self._slots.pop((slot.broadcaster_id, slot.coverage_type), None)
         self._by_subscription.pop(slot.subscription_id, None)
         connection = self._connection_by_id(slot.connection_id)
         if connection is not None:
             connection.subscription_ids.discard(slot.subscription_id)
 
-    def _forget_unrecognised(self, subscription_id: str):
-        """Clean up after deleting an id the pool had no slot for.
+    def _resolve_unrecognised(
+        self, subscription_id: str
+    ) -> Optional[Tuple[_Connection, Optional[int], Optional[CoverageType]]]:
+        """Who an id the pool's own indexes have never seen belongs to.
 
-        Finds the channel behind the id from the library's own registry --
-        that is the only place a rotated id appears -- and clears both the
-        library's entry and whatever slot the pool still holds for that
-        channel.
+        Finds the channel AND the coverage type behind the id in the library's
+        own registry -- the only place a rotated id appears. Both come back
+        from the ONE lookup, which is what lets `delete()` finish the whole
+        channel in the call it was given the id in; resolving the identity and
+        then re-deriving it a second time to act on it is how the sibling half
+        got left behind.
+
+        `None` means no connection here has ever heard of the id. A connection
+        with an unusable identity behind the id comes back with the connection
+        and `None`s, so the caller can still clear the registry entry rather
+        than leave the socket to resubscribe it.
         """
         for connection in list(self._connections):
             active = getattr(connection.websocket, "_active_subscriptions", None)
             if not isinstance(active, dict) or subscription_id not in active:
                 continue
-            condition = (active[subscription_id].get("condition") or {})
-            broadcaster = condition.get("broadcaster_user_id")
-            self._forget_library_subscription(connection, subscription_id)
-            connection.subscription_ids.discard(subscription_id)
-            if broadcaster is None:
-                return
+            entry = active[subscription_id]
+            if not isinstance(entry, dict):
+                return connection, None, None
+            condition = entry.get("condition") or {}
+            coverage_type = CoverageType.for_subscription_type(entry.get("sub_type"))
             try:
-                broadcaster_id = int(broadcaster)
+                broadcaster_id = int(condition.get("broadcaster_user_id"))
             except (TypeError, ValueError):
-                # The sibling helper already guards this. Raising here would be
-                # worse than useless: the Twitch DELETE above has already
-                # succeeded, so `_drop_one` would never pop `_actual` and the
-                # reconciler would re-issue the same delete every pass for ever.
-                return
-            slot = self._slots.get(broadcaster_id)
-            if slot is not None:
-                self._forget_slot(slot)
-                self._forget_library_subscription(connection, slot.subscription_id)
-            return
+                broadcaster_id = None
+            return connection, broadcaster_id, coverage_type
+        return None
 
     def _live_subscription_ids(
         self, connection: Optional[_Connection], slot: _Slot
     ) -> List[str]:
-        """The ids Twitch currently holds for this channel on this connection.
+        """The ids Twitch currently holds for this channel AND type here.
 
         The library re-subscribes everything after a reconnect and gets fresh
         ids, so the id recorded at create time can be stale. Its own
         `_active_subscriptions` map is the only record of the current one; it
         is private, but the alternative is deleting an id Twitch has already
         collected and leaving the live subscription delivering into nothing.
+
+        Matched on the type as well as the channel: a rotated pair has one new
+        id per coverage type, and resolving by broadcaster alone would return
+        both -- deleting one of them twice and leaking the other.
         """
         if connection is None:
             return [slot.subscription_id]
@@ -1336,7 +2193,8 @@ class EventSubPoolTransport(SubscriptionTransport):
         matches = [
             subscription_id
             for subscription_id, subscription in active.items()
-            if (subscription.get("condition") or {}).get("broadcaster_user_id")
+            if subscription.get("sub_type") == slot.coverage_type.subscription_type
+            and (subscription.get("condition") or {}).get("broadcaster_user_id")
             == str(slot.broadcaster_id)
         ]
         if matches and slot.subscription_id not in matches:
@@ -1344,6 +2202,7 @@ class EventSubPoolTransport(SubscriptionTransport):
                 "Subscription id rotated by a reconnect, deleting the live one",
                 extra={
                     "broadcaster_id": slot.broadcaster_id,
+                    "coverage_type": slot.coverage_type.value,
                     "recorded": slot.subscription_id,
                     "live": matches,
                 },
@@ -1462,17 +2321,30 @@ class EventSubPoolTransport(SubscriptionTransport):
         self._connections = [
             live for live in self._connections if live.connection_id != connection.connection_id
         ]
+        # Every slot on this connection goes, of either type -- and NOTHING
+        # else does. A pair split across two connections keeps the half that
+        # lives elsewhere, which leaves the channel in a partial state the
+        # ordinary repair path already converges (R2).
+        affected: Set[int] = set()
         for subscription_id in list(connection.subscription_ids):
             slot = self._by_subscription.pop(subscription_id, None)
             if slot is not None:
-                self._slots.pop(slot.broadcaster_id, None)
+                self._slots.pop((slot.broadcaster_id, slot.coverage_type), None)
+                affected.add(slot.broadcaster_id)
         # A slot can outlive its id if a reconnect rotated it; clear anything
         # still pointing at this connection.
-        for broadcaster_id, slot in list(self._slots.items()):
+        for key, slot in list(self._slots.items()):
             if slot.connection_id == connection.connection_id:
-                self._slots.pop(broadcaster_id, None)
+                self._slots.pop(key, None)
                 self._by_subscription.pop(slot.subscription_id, None)
+                affected.add(slot.broadcaster_id)
         connection.subscription_ids.clear()
+        for broadcaster_id in affected:
+            # Retirement is a free opportunity to retest a refusal that may
+            # have been specific to the session that has just gone (I17), so
+            # the channel becomes repairable at once rather than at the
+            # hold-off's own deadline.
+            self._clear_auxiliary_refusal(broadcaster_id, "connection retired")
 
     # -- small helpers ----------------------------------------------------
 

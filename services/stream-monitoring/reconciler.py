@@ -43,6 +43,18 @@ Phase 1 ships `StubTransport`, an in-memory implementation. Phase 2 replaces it
 with the real EventSub connection pool (`eventsub_pool.py`) and changes nothing
 here. Per-channel routing and per-connection occupancy live behind the
 interface, because they are transport concerns.
+
+Units (FR-015)
+--------------
+The reconciler is channel-keyed: `_actual` maps a broadcaster to the handle
+the transport gave back, one entry per CHANNEL. A monitored channel is two
+SUBSCRIPTIONS on the Phase 2 pool, so the two numbers differ by a factor of
+two and neither is derived from the other. Everything counted in
+subscriptions -- `eventsub_subscription_count`,
+`eventsub_connection_occupancy` -- is read from the transport, which is the
+only thing that holds them. Everything counted in channels --
+`eventsub_channel_coverage`, `active_stream_count` -- comes from the
+channel-keyed side.
 """
 
 import asyncio
@@ -73,12 +85,33 @@ ADOPTABLE_STATUSES = frozenset({"enabled"})
 # that fixes its settings comes back on both paths at the same rate.
 REFUSAL_RECHECK_DAYS = 7
 
-# Prometheus metrics (FR-012). These live here, not in the service module,
-# because the reconciler owns the values. The service starts the HTTP server
-# and both modules share the default registry.
+# The channel-level coverage states a transport may report, and the complete
+# label set of `eventsub_channel_coverage`. Bounded on purpose: the label is a
+# state, never a channel. `absent` is not among them -- a channel with no slot
+# at all is in no index, so counting it would mean counting every channel that
+# has ever existed. `eventsub_pool.COVERAGE_STATES` is this tuple, imported,
+# so the gauge's labels and the pool's classification cannot drift apart.
+CHANNEL_COVERAGE_STATES = (
+    "complete",
+    "chat_only",
+    "notification_only",
+    "degraded_chat_only",
+)
+
+# Prometheus metrics (FR-012, FR-015). These live here, not in the service
+# module, because the reconciler owns the values. The service starts the HTTP
+# server and both modules share the default registry.
+#
+# Units are the thing to keep straight (FR-015). A monitored channel needs two
+# subscriptions -- `channel.chat.message` and `channel.chat.notification` --
+# so 400 channels are 800 subscriptions. Every gauge below answers in
+# SUBSCRIPTIONS except `eventsub_channel_coverage`, which answers in CHANNELS,
+# and `active_stream_count` in the service module, which does too. Mixing them
+# is how a healthy 400-channel pool reads as double its ceiling.
 eventsub_subscription_count = Gauge(
     "eventsub_subscription_count",
-    "Live chat subscriptions the reconciler currently holds",
+    "Live EventSub subscriptions held across every transport connection "
+    "(both coverage types, so a fully covered channel counts twice)",
 )
 reconcile_duration_seconds = Histogram(
     "reconcile_duration_seconds",
@@ -98,6 +131,12 @@ eventsub_connection_occupancy = Gauge(
     "eventsub_connection_occupancy",
     "Subscriptions held per transport connection",
     ["connection"],
+)
+eventsub_channel_coverage = Gauge(
+    "eventsub_channel_coverage",
+    "Monitored channels by coverage state, counted in channels not "
+    "subscriptions (FR-015)",
+    ["state"],
 )
 reconcile_last_success_timestamp = Gauge(
     "reconcile_last_success_timestamp",
@@ -286,8 +325,38 @@ class SubscriptionTransport(ABC):
     def occupancy(self) -> Dict[str, int]:
         """Report subscriptions held per connection, for the FR-012 gauge.
 
-        The default suits a transport with one connection. The Phase 2 pool
-        overrides it with real per-socket counts.
+        SUBSCRIPTIONS, not channels: the values sum to every live subscription
+        the transport holds, which is what `eventsub_subscription_count`
+        publishes. The default suits a transport with one connection. The
+        Phase 2 pool overrides it with real per-socket counts.
+        """
+        return {}
+
+    def coverage_counts(self) -> Dict[str, int]:
+        """Report monitored CHANNELS by coverage state, for the FR-015 gauge.
+
+        The counterpart of `occupancy()` in the other unit. Keys outside
+        `CHANNEL_COVERAGE_STATES` are ignored by the publisher, so a transport
+        may return `absent` or any other private state without growing the
+        gauge's label set. The default is for transports that have no notion
+        of split coverage.
+        """
+        return {}
+
+    def partial_channel_handles(self) -> Dict[int, str]:
+        """Report channels covered by ONE type only, with a delete handle each.
+
+        DROP-ONLY, and never a second actual set. A channel here is NOT
+        covered: it holds one of its two coverage types and is deliberately
+        withheld from `list()`, which is what makes the ordinary create path
+        repair the missing half while the channel is still wanted. What this
+        adds is the one thing that path cannot do -- reclaim the survivor once
+        the channel has LEFT the desired set, at which point it is in nothing
+        the reconciler diffs and would otherwise hold a subscription slot for
+        the life of the process (FR-014, NFR-003).
+
+        A transport with no notion of split coverage has no such channels, so
+        the default is empty and the reclamation is a no-op.
         """
         return {}
 
@@ -539,6 +608,13 @@ class Reconciler:
         # broadcaster id -> subscription id. This is the actual set. It is
         # rebuilt from the transport at start-up and kept in memory after that.
         self._actual: Dict[int, str] = {}
+        # broadcaster id -> delete handle, for THIS pass only: channels the
+        # transport covers with one subscription type instead of two and that
+        # nobody wants any more. Kept out of `_actual` on purpose -- they are
+        # not covered, they must stay repairable by the ordinary create path
+        # while they are still desired, and `active_stream_count` counts
+        # covered channels (FR-015).
+        self._partial_handles: Dict[int, str] = {}
         # False until one enumeration finishes. While it is False the
         # reconciler knows its view of the world has holes.
         self._adoption_complete = False
@@ -546,13 +622,6 @@ class Reconciler:
         # and after its enumeration so a loss that lands mid-walk is not
         # thrown away by the completion that follows it.
         self._invalidations = 0
-        # Subscriptions the transport has reported lost that no enumeration has
-        # accounted for yet. `_actual` cannot be pruned on a loss -- the
-        # transport reports a count, not which channels -- so this is what
-        # keeps `eventsub_subscription_count` from going on reporting them. It
-        # accumulates, because several revocations can land between two passes,
-        # and it is cleared only by a clean walk.
-        self._unreconciled_losses = 0
         # When the actual set was last rebuilt from Twitch, for the periodic
         # re-check. -inf so the first pass always adopts.
         self._last_adopt = float("-inf")
@@ -581,38 +650,44 @@ class Reconciler:
 
     @property
     def subscription_count(self) -> int:
+        """Channels in the actual set. NOT subscriptions (FR-015).
+
+        The reconciler is channel-keyed and stays that way: on the two-slot
+        pool each of these channels is two subscriptions. The subscription
+        total lives on the transport and is published from there.
+        """
         return len(self._actual)
 
     def invalidate_actual_set(self, lost_subscriptions: int = 0):
         """Rebuild the actual set from the transport on the next pass.
 
-        The transport calls this when it loses a connection (T023). Everything
-        that socket held is gone, but only the transport can know that. This
-        does not repair anything itself: the next pass re-enumerates, the lost
-        subscriptions are simply absent, `eventsub_subscription_count` drops --
-        which is the alert path (FR-012) -- and the ordinary diff re-creates
-        those channels on a surviving or new connection.
+        The transport calls this when it loses a connection (T023) or a
+        subscription is revoked. Everything that socket held is gone, but only
+        the transport can know that. This does not repair anything itself: the
+        next pass re-enumerates, the lost subscriptions are simply absent,
+        `eventsub_subscription_count` drops -- which is the alert path
+        (FR-012) -- and the ordinary diff re-creates those channels on a
+        surviving or new connection.
 
-        `lost_subscriptions` is how many went with the loss, and it is what
-        makes that drop real. `_actual` cannot be pruned here -- the transport
-        reports a count, not which channels -- so the count is carried in
-        `_unreconciled_losses` and subtracted until a clean walk settles it.
-        Without this the dip did not exist to be alerted on: the gauge was
-        written once, at the END of a pass, so a loss followed by a successful
-        re-create moved it from a value back to the same value and no scrape
-        could see it. Worse, if the re-enumeration then failed -- and a blip
-        that kills a socket is exactly what fails a walk -- `_adopt`
-        deliberately merges the stale entries back in, so the healthy-looking
-        count survived pass after pass.
+        `lost_subscriptions` is how many went, for the caller's own logging.
+        It is not arithmetic here any more: the gauges are republished from the
+        transport itself, which has already forgotten the lost slots, so the
+        dip is an observation rather than a running subtraction that a failed
+        enumeration could get out of step with. `_actual` is deliberately not
+        pruned -- the transport reports a count, not which channels -- and it
+        no longer feeds any subscription-unit gauge, so it cannot re-inflate
+        one when `_adopt` merges stale entries back after a failed walk.
 
         Drops stay switched off until an enumeration succeeds, so a failure to
         re-enumerate cannot turn into a mass delete.
         """
         self._adoption_complete = False
         self._invalidations += 1
-        if lost_subscriptions > 0:
-            self._unreconciled_losses += lost_subscriptions
-            self._publish_subscription_count()
+        # Publish before returning, so the loss is on the very next scrape
+        # instead of at the end of the next pass -- by which time a successful
+        # re-create would have moved the gauge from a value back to the same
+        # value and no scrape could have seen it move.
+        self._publish_transport_metrics()
         # Clear any failed-enumeration backoff. Round 7 added that backoff and
         # claimed in a comment that a socket loss "does not come through here"
         # -- it does: the gate in `reconcile_once` covers every adoption path.
@@ -726,6 +801,8 @@ class Reconciler:
             )
             to_drop = []
 
+        to_drop = to_drop + self._partial_channels_to_reclaim()
+
         if to_create or to_drop:
             logger.info(
                 "Reconciling",
@@ -741,8 +818,7 @@ class Reconciler:
         await self._drop_all(to_drop)
         await self._create_all(to_create)
 
-        self._publish_subscription_count()
-        self._publish_occupancy()
+        self._publish_transport_metrics()
         reconcile_duration_seconds.observe(time.monotonic() - started)
         # "Ran to completion", not "had no failures". A pass where individual
         # creates refused or errored still reached here, and that is on
@@ -753,6 +829,9 @@ class Reconciler:
         # Per-channel failures are `subscription_create_failures_total`.
         reconcile_last_success_timestamp.set(time.time())
         if self.on_pass_complete is not None:
+            # CHANNELS. `active_stream_count` is a channel gauge and the actual
+            # set is channel-keyed, so this is the one place the two units meet
+            # correctly (FR-015).
             self.on_pass_complete(len(self._actual))
 
         self._wake_if_generation_moved()
@@ -853,9 +932,6 @@ class Reconciler:
         if complete and not invalidated_during:
             self._actual = adopted
             self._adoption_complete = True
-            # A clean walk IS the reconciliation: `adopted` is what Twitch says
-            # exists on a session this pool holds, so nothing is outstanding.
-            self._unreconciled_losses = 0
         elif complete:
             # A connection was lost while this enumeration ran. What it saw is
             # still the freshest view available, so keep it -- but leave the
@@ -879,10 +955,10 @@ class Reconciler:
             # here with it True.
             self._adoption_complete = False
 
-        # The freshest count there is, and available before the creates below
+        # The freshest picture there is, and available before the creates below
         # start: a loss is now visible as soon as the walk that confirms it
         # finishes, rather than at the end of the whole pass.
-        self._publish_subscription_count()
+        self._publish_transport_metrics()
 
         logger.info(
             "Adopted existing subscriptions",
@@ -957,7 +1033,7 @@ class Reconciler:
             return
         subscription_id = await self.transport.create(broadcaster_id)
         self._actual[broadcaster_id] = subscription_id
-        self._publish_subscription_count()
+        self._publish_transport_metrics()
         if broadcaster_id in self._rechecking_refusals:
             # The channel refused more than REFUSAL_RECHECK_DAYS ago and has
             # just accepted. Clear the mark so it is a normal channel again.
@@ -970,11 +1046,73 @@ class Reconciler:
 
     async def _drop_one(self, broadcaster_id: int):
         subscription_id = self._actual.get(broadcaster_id)
+        # A partially covered channel is never in `_actual`, so its handle
+        # comes from this pass's reclamation view instead. One or the other,
+        # never both: the reclamation view excludes anything already actual,
+        # so no channel can be dropped twice.
+        reclaimed = subscription_id is None
+        if reclaimed:
+            subscription_id = self._partial_handles.get(broadcaster_id)
         if subscription_id is None:
             return
         await self.transport.delete(subscription_id)
-        self._actual.pop(broadcaster_id, None)
-        self._publish_subscription_count()
+        if reclaimed:
+            self._partial_handles.pop(broadcaster_id, None)
+        else:
+            self._actual.pop(broadcaster_id, None)
+        self._publish_transport_metrics()
+
+    def _partial_channels_to_reclaim(self) -> List[int]:
+        """Undesired channels the transport covers with ONE type, not two.
+
+        A create that lands one half and fails the other, or a revocation that
+        takes one half, leaves a channel partially covered. That is a
+        convergent state while the channel is DESIRED: it is deliberately not
+        reported as actual, so the next pass creates the missing half. It
+        stops converging the moment the channel leaves the desired set,
+        because it is then in nothing this pass diffs -- not in `_actual`, so
+        never dropped; not in `desired`, so never created -- and the surviving
+        subscription holds one of the transport's slots for good (NFR-003,
+        FR-014).
+
+        Reclaiming it is a drop, so it carries a drop's safety gate: nothing
+        here runs until one enumeration has completed. "Extra" only means
+        extra when the whole picture was seen, and a partial channel is the
+        case where the picture is least trustworthy -- a walk that died before
+        the auxiliary half would make every complete channel look partial.
+
+        A DESIRED partial channel is never touched. It stays out of `_actual`
+        and is repaired by `to_create` in the ordinary way.
+        """
+        self._partial_handles = {}
+        if not self._adoption_complete:
+            return []
+        try:
+            handles = self.transport.partial_channel_handles()
+        except Exception as e:
+            # A transport that cannot answer is not grounds for deleting
+            # anything. Reclamation waits for the next pass.
+            logger.warning(
+                "Could not read partially covered channels, skipping reclamation",
+                extra={"error": str(e), "error_type": type(e).__name__},
+            )
+            return []
+
+        self._partial_handles = {
+            broadcaster_id: handle
+            for broadcaster_id, handle in handles.items()
+            if broadcaster_id not in self._desired_ids
+            and broadcaster_id not in self._actual
+        }
+        if self._partial_handles:
+            logger.info(
+                "Reclaiming partially covered channels that left the desired set",
+                extra={
+                    "count": len(self._partial_handles),
+                    "sample": sorted(self._partial_handles)[:5],
+                },
+            )
+        return list(self._partial_handles)
 
     async def _run_batch(self, broadcaster_ids: Iterable[int], handler, operation: str):
         """Run `handler` over the ids on a fixed pool of workers.
@@ -1150,29 +1288,61 @@ class Reconciler:
         self.refusal_store.clear_refusal(broadcaster_id)
 
     def _publish_subscription_count(self):
-        """The FR-012 gauge, from every place the live count can change.
+        """The subscription-unit gauges, from one occupancy read (FR-015).
 
-        `len(self._actual)` alone is not the live count between a reported loss
-        and the walk that confirms it: those subscriptions are gone from Twitch
-        but still in `_actual`, because the transport reports how many went,
-        not which. Subtracting the unreconciled losses is what makes the dip
-        the runbook alerts on real -- and it survives a failed enumeration,
-        where `_adopt` deliberately merges the stale entries back and would
-        otherwise re-inflate the gauge to the value the loss just corrected.
+        Both of them are subscriptions: `eventsub_subscription_count` is the
+        total the transport holds, and `eventsub_connection_occupancy` is the
+        same total split by connection, so the two agree by construction.
+
+        It is NOT `len(self._actual)`. That is a count of CHANNELS the
+        reconciler believes in, so on the two-slot pool it reads half the truth
+        (400 channels, 800 subscriptions), and it is a belief rather than an
+        observation between a loss and the walk that confirms it -- which is
+        precisely the window the FR-012 dip has to be visible in.
         """
-        eventsub_subscription_count.set(
-            max(0, len(self._actual) - self._unreconciled_losses)
-        )
-
-    def _publish_occupancy(self):
         try:
             occupancy = self.transport.occupancy()
-            # Drop the previous labels first. A connection that is retired
-            # keeps its last value forever otherwise, so a pool that lost a
-            # socket goes on reporting the 300 subscriptions it no longer has
-            # -- which is precisely the number the FR-012 alert watches.
-            eventsub_connection_occupancy.clear()
-            for connection, count in occupancy.items():
-                eventsub_connection_occupancy.labels(connection=connection).set(count)
         except Exception as e:
+            # Observability must never break reconciliation. Report and move on
+            # with the last published values.
             logger.warning("Could not read transport occupancy", extra={"error": str(e)})
+            return
+        eventsub_subscription_count.set(sum(occupancy.values()))
+        # Drop the previous labels first. A connection that is retired keeps
+        # its last value forever otherwise, so a pool that lost a socket goes
+        # on reporting the 300 subscriptions it no longer has -- which is
+        # precisely the number the FR-012 alert watches.
+        eventsub_connection_occupancy.clear()
+        for connection, count in occupancy.items():
+            eventsub_connection_occupancy.labels(connection=connection).set(count)
+
+    def _publish_channel_coverage(self):
+        """The channel-unit gauge: which channels have which halves (FR-015).
+
+        Every known state is written on every publication, zero included, so a
+        state that empties reads as 0 rather than keeping its last value.
+        States the transport reports that are not in `CHANNEL_COVERAGE_STATES`
+        -- `absent`, above all -- are dropped rather than labelled, because the
+        label set has to stay bounded (NFR-004).
+        """
+        try:
+            counts = self.transport.coverage_counts()
+        except Exception as e:
+            logger.warning("Could not read transport coverage", extra={"error": str(e)})
+            return
+        for state in CHANNEL_COVERAGE_STATES:
+            eventsub_channel_coverage.labels(state=state).set(
+                float(counts.get(state, 0))
+            )
+
+    def _publish_transport_metrics(self):
+        """Republish everything the transport can be asked for.
+
+        Called from every point where the live picture can have changed --
+        each create, each drop, the end of an enumeration, the end of a pass,
+        and a reported loss -- so a revocation or a retired socket shows up on
+        the next scrape rather than at the end of the next pass, by which time
+        a successful re-create would have hidden the dip entirely.
+        """
+        self._publish_subscription_count()
+        self._publish_channel_coverage()

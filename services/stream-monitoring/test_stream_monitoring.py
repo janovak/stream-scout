@@ -1163,6 +1163,16 @@ def counter_value(reason):
     )._value.get()
 
 
+def gauge_label_values(metric, label_name):
+    """Read a labelled Gauge without creating labels as a side effect."""
+    return {
+        sample.labels[label_name]: sample.value
+        for family in metric.collect()
+        for sample in family.samples
+        if sample.name == metric._name and label_name in sample.labels
+    }
+
+
 class TestDesiredSetHysteresis:
     """T011 / FR-011 -- the hysteresis band survives the move.
 
@@ -4133,7 +4143,85 @@ class TestReconcilerMetrics:
     """T015 and T016 -- FR-012. A stalled reconciler must be visible while the
     polls keep succeeding (US2 acceptance scenario 2)."""
 
-    def test_subscription_count_tracks_the_actual_set(self):
+    class ReportingTransport(StubTransport):
+        def __init__(self, occupancy, coverage=None):
+            super().__init__()
+            self.reported_occupancy = dict(occupancy)
+            self.reported_coverage = dict(coverage or {})
+
+        def occupancy(self):
+            return dict(self.reported_occupancy)
+
+        def coverage_counts(self):
+            return dict(self.reported_coverage)
+
+    @pytest.fixture(autouse=True)
+    def reset_reconciler_gauges(self):
+        reconciler_module.eventsub_subscription_count.set(0)
+        reconciler_module.eventsub_connection_occupancy.clear()
+        stream_monitoring_service.active_stream_count.set(0)
+        coverage_metric = getattr(
+            reconciler_module, "eventsub_channel_coverage", None
+        )
+        if coverage_metric is not None:
+            coverage_metric.clear()
+        yield
+        reconciler_module.eventsub_subscription_count.set(0)
+        reconciler_module.eventsub_connection_occupancy.clear()
+        stream_monitoring_service.active_stream_count.set(0)
+        if coverage_metric is not None:
+            coverage_metric.clear()
+
+    @pytest.mark.parametrize(
+        ("channels", "coverage_state", "occupancy", "expected_subscriptions"),
+        [
+            (1, "complete", {"connection-0": 2}, 2),
+            (1, "chat_only", {"connection-0": 1}, 1),
+            (1, "notification_only", {"connection-0": 1}, 1),
+            (
+                400,
+                "complete",
+                {
+                    "connection-0": 300,
+                    "connection-1": 300,
+                    "connection-2": 200,
+                },
+                800,
+            ),
+        ],
+        ids=[
+            "complete",
+            "chat-only",
+            "notification-only",
+            "four-hundred-complete",
+        ],
+    )
+    def test_subscription_count_is_the_sum_of_transport_occupancy(
+        self, channels, coverage_state, occupancy, expected_subscriptions
+    ):
+        """FR-015: this gauge counts subscription slots, never channels."""
+        coverage = {
+            "complete": 0,
+            "chat_only": 0,
+            "notification_only": 0,
+            "degraded_chat_only": 0,
+        }
+        coverage[coverage_state] = channels
+        transport = self.ReportingTransport(occupancy, coverage)
+        reconciler = make_reconciler(transport, FakeRedis())
+        reconciler._actual = {
+            broadcaster_id: f"chat-{broadcaster_id}"
+            for broadcaster_id in range(channels)
+        }
+
+        reconciler._publish_subscription_count()
+
+        assert (
+            reconciler_module.eventsub_subscription_count._value.get()
+            == expected_subscriptions
+        )
+
+    def test_subscription_count_tracks_the_transport_not_the_actual_set(self):
         fake_redis = FakeRedis()
         seed_desired(fake_redis, [("a", 1), ("b", 2)])
         reconciler = make_reconciler(StubTransport(), fake_redis)
@@ -4155,12 +4243,16 @@ class TestReconcilerMetrics:
         """
         fake_redis = FakeRedis()
         seed_desired(fake_redis, [(f"c{i}", i) for i in range(1, 6)])
-        reconciler = make_reconciler(StubTransport(), fake_redis)
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
 
         asyncio.run(reconciler.reconcile_once())
         assert reconciler_module.eventsub_subscription_count._value.get() == 5
 
         # The socket went, and took three of them with it.
+        for broadcaster_id in (1, 2, 3):
+            transport.subscriptions.pop(broadcaster_id)
+            transport.statuses.pop(broadcaster_id)
         reconciler.invalidate_actual_set(3)
 
         assert reconciler_module.eventsub_subscription_count._value.get() == 2, (
@@ -4198,10 +4290,13 @@ class TestReconcilerMetrics:
         says how many went, not which -- so three losses looked like one."""
         fake_redis = FakeRedis()
         seed_desired(fake_redis, [(f"c{i}", i) for i in range(1, 6)])
-        reconciler = make_reconciler(StubTransport(), fake_redis)
+        transport = StubTransport()
+        reconciler = make_reconciler(transport, fake_redis)
 
         asyncio.run(reconciler.reconcile_once())
-        for _ in range(3):
+        for broadcaster_id in (1, 2, 3):
+            transport.subscriptions.pop(broadcaster_id)
+            transport.statuses.pop(broadcaster_id)
             reconciler.invalidate_actual_set(1)
 
         assert reconciler_module.eventsub_subscription_count._value.get() == 2
@@ -4218,6 +4313,9 @@ class TestReconcilerMetrics:
         reconciler = make_reconciler(transport, fake_redis)
 
         asyncio.run(reconciler.reconcile_once())
+        for broadcaster_id in (1, 2, 3):
+            transport.subscriptions.pop(broadcaster_id)
+            transport.statuses.pop(broadcaster_id)
         reconciler.invalidate_actual_set(3)
         transport.list_fails_after = 0
         asyncio.run(reconciler.reconcile_once())
@@ -4286,17 +4384,79 @@ class TestReconcilerMetrics:
         asyncio.run(run())
 
     def test_connection_occupancy_is_published(self):
-        fake_redis = FakeRedis()
-        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3)])
-        reconciler = make_reconciler(StubTransport(connections=2), fake_redis)
+        transport = self.ReportingTransport(
+            {"retired": 3, "survivor": 2}
+        )
+        reconciler = make_reconciler(transport, FakeRedis())
 
         asyncio.run(reconciler.reconcile_once())
 
-        total = sum(
-            reconciler_module.eventsub_connection_occupancy.labels(connection=str(i))._value.get()
-            for i in range(2)
+        assert gauge_label_values(
+            reconciler_module.eventsub_connection_occupancy, "connection"
+        ) == {"retired": 3, "survivor": 2}
+
+        transport.reported_occupancy = {"survivor": 1, "replacement": 4}
+        asyncio.run(reconciler.reconcile_once())
+
+        assert gauge_label_values(
+            reconciler_module.eventsub_connection_occupancy, "connection"
+        ) == {"survivor": 1, "replacement": 4}, (
+            "a retired connection retained its stale occupancy label"
         )
-        assert total == 3
+
+    def test_channel_coverage_is_bounded_channel_state_accounting(self):
+        transport = self.ReportingTransport(
+            {"connection-0": 5},
+            {
+                "complete": 1,
+                "chat_only": 1,
+                "notification_only": 1,
+                "degraded_chat_only": 1,
+            },
+        )
+        reconciler = make_reconciler(transport, FakeRedis())
+
+        asyncio.run(reconciler.reconcile_once())
+
+        coverage_metric = getattr(
+            reconciler_module, "eventsub_channel_coverage", None
+        )
+        assert coverage_metric is not None
+        assert tuple(coverage_metric._labelnames) == ("state",)
+        assert gauge_label_values(coverage_metric, "state") == {
+            "complete": 1,
+            "chat_only": 1,
+            "notification_only": 1,
+            "degraded_chat_only": 1,
+        }
+
+        transport.reported_coverage = {
+            "complete": 0,
+            "chat_only": 0,
+            "notification_only": 2,
+            "degraded_chat_only": 0,
+        }
+        asyncio.run(reconciler.reconcile_once())
+
+        assert gauge_label_values(coverage_metric, "state") == {
+            "complete": 0,
+            "chat_only": 0,
+            "notification_only": 2,
+            "degraded_chat_only": 0,
+        }, "coverage states were not deterministically replaced"
+
+    def test_loss_republishes_live_transport_occupancy_immediately(self):
+        """The loss dip remains visible, but no channel/subscription arithmetic."""
+        transport = self.ReportingTransport({"connection-0": 4})
+        reconciler = make_reconciler(transport, FakeRedis())
+        reconciler._actual = {1: "chat-1", 2: "chat-2"}
+        reconciler._publish_subscription_count()
+        assert reconciler_module.eventsub_subscription_count._value.get() == 4
+
+        transport.reported_occupancy = {"connection-0": 1}
+        reconciler.invalidate_actual_set(3)
+
+        assert reconciler_module.eventsub_subscription_count._value.get() == 1
 
     def test_reconcile_duration_is_observed(self):
         fake_redis = FakeRedis()
@@ -4308,22 +4468,35 @@ class TestReconcilerMetrics:
 
         assert reconciler_module.reconcile_duration_seconds._sum.get() >= before
 
-    def test_active_stream_count_follows_the_reconciler_not_joined_channels(self):
+    def test_active_stream_count_remains_channel_based_with_dual_coverage(self):
         """joined_channels is no longer maintained, so the old gauge would sit
-        at zero forever. It has to follow the subscriptions that exist."""
+        at zero forever. It follows actual channels, not subscription slots."""
         fake_redis = FakeRedis()
-        seed_desired(fake_redis, [("a", 1), ("b", 2), ("c", 3)])
-        observed = []
+        seed_desired(fake_redis, [("a", 1)])
+        on_pass_complete = MagicMock(
+            side_effect=stream_monitoring_service.active_stream_count.set
+        )
+        transport = self.ReportingTransport(
+            {"connection-0": 2},
+            {
+                "complete": 1,
+                "chat_only": 0,
+                "notification_only": 0,
+                "degraded_chat_only": 0,
+            },
+        )
         reconciler = Reconciler(
-            transport=StubTransport(),
+            transport=transport,
             desired_store=RedisDesiredSetStore(fake_redis),
             config=ReconcilerConfig(concurrency=4, idle_timeout_seconds=0.01),
-            on_pass_complete=observed.append,
+            on_pass_complete=on_pass_complete,
         )
 
         asyncio.run(reconciler.reconcile_once())
 
-        assert observed == [3]
+        on_pass_complete.assert_called_once_with(1)
+        assert stream_monitoring_service.active_stream_count._value.get() == 1
+        assert reconciler_module.eventsub_subscription_count._value.get() == 2
 
 
 class TestReconcilerLifecycle:
@@ -4606,6 +4779,13 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 
+# The two EventSub coverage types, spelled out here rather than imported so a
+# missing constant fails the Feature 007 tests alone instead of the whole
+# module. `TestCoverageTypeContract` asserts the module agrees with them.
+CHAT_TYPE = "channel.chat.message"
+NOTIFICATION_TYPE = "channel.chat.notification"
+
+
 class FakeTask:
     """One of the library's socket tasks. Done means the socket is finished."""
 
@@ -4645,6 +4825,16 @@ class FakeWebsocket:
         self.stopped = False
         self.fail_start = fail_start
         self.raise_on_subscribe = None
+        # Feature 007. The two coverage types fail independently on the real
+        # thing -- a channel can refuse `channel.chat.notification` while its
+        # `channel.chat.message` subscription is live -- so the double has to
+        # be able to model that. `raise_on_subscribe` stays the both-types
+        # fallback the pre-007 tests set.
+        self.raise_on_subscribe_by_type = {}
+        # (subscription_type, broadcaster_user_id, user_id) per listen call, so
+        # a test can prove that a repair created ONLY the missing type and did
+        # not duplicate the surviving one (FR-002).
+        self.listen_calls = []
 
     def start(self):
         if self.fail_start:
@@ -4654,29 +4844,71 @@ class FakeWebsocket:
     async def stop(self):
         self.stopped = True
 
-    async def listen_channel_chat_message(self, broadcaster_user_id, user_id, callback):
-        if self.raise_on_subscribe is not None:
-            raise self.raise_on_subscribe
+    def _mint_id(self, subscription_type):
+        """A fresh id, distinguishable by type.
+
+        Separate id spaces per type are the point: nothing in the pool may
+        infer one half of a channel's pair from the other's id.
+        """
         self._next_id += 1
-        subscription_id = f"{self.session_id}-sub-{self._next_id}"
+        suffix = "notice" if subscription_type == NOTIFICATION_TYPE else "sub"
+        return f"{self.session_id}-{suffix}-{self._next_id}"
+
+    def _listen(self, subscription_type, broadcaster_user_id, user_id, callback):
+        failure = self.raise_on_subscribe_by_type.get(subscription_type)
+        if failure is None:
+            failure = self.raise_on_subscribe
+        if failure is not None:
+            raise failure
+        self.listen_calls.append((subscription_type, broadcaster_user_id, user_id))
+        subscription_id = self._mint_id(subscription_type)
         self._active_subscriptions[subscription_id] = {
-            "sub_type": "channel.chat.message",
+            "sub_type": subscription_type,
             "condition": {"broadcaster_user_id": broadcaster_user_id, "user_id": user_id},
             "callback": callback,
         }
         self._callbacks[subscription_id] = {"callback": callback}
         return subscription_id
 
+    async def listen_channel_chat_message(self, broadcaster_user_id, user_id, callback):
+        return self._listen(CHAT_TYPE, broadcaster_user_id, user_id, callback)
+
+    async def listen_channel_chat_notification(
+        self, broadcaster_user_id, user_id, callback
+    ):
+        """The auxiliary half. Same shape as the chat listener in 4.5.0."""
+        return self._listen(NOTIFICATION_TYPE, broadcaster_user_id, user_id, callback)
+
+    def subscriptions_of_type(self, subscription_type):
+        return {
+            subscription_id
+            for subscription_id, subscription in self._active_subscriptions.items()
+            if subscription.get("sub_type") == subscription_type
+        }
+
     def die(self):
         """What a socket that cannot reconnect looks like: the receive task ends."""
         self._tasks = [FakeTask(finished=True), FakeTask()]
 
+    def reconnect(self, session_id=None):
+        """A new session on the same connection, which is what a reconnect is.
+
+        Everything Twitch held on the old session is gone with it, whatever
+        the library's own registry still claims.
+        """
+        self.session_id = session_id or f"session-reconnected-{id(self)}"
+        self.active_session = type("Session", (), {"id": self.session_id})()
+        return self.session_id
+
     def rotate_ids(self):
-        """What a keepalive-loss reconnect does: same channels, new ids."""
+        """What a keepalive-loss reconnect does: same channels, new ids.
+
+        Each subscription keeps its own type, so a rotated pair still has one
+        id per coverage type and neither can be resolved from the other.
+        """
         rotated = {}
         for subscription in self._active_subscriptions.values():
-            self._next_id += 1
-            rotated[f"{self.session_id}-sub-{self._next_id}"] = subscription
+            rotated[self._mint_id(subscription.get("sub_type"))] = subscription
         self._active_subscriptions = rotated
         self._callbacks = {key: {"callback": None} for key in rotated}
 
@@ -4689,6 +4921,14 @@ class FakePoolTwitch:
         self.subscriptions = list(subscriptions or [])
         self.deleted = []
         self.not_found = set()
+        # Feature 007. Enumeration is two type-filtered Helix walks, so the
+        # double has to filter by `sub_type`, record which walks ran, and be
+        # able to fail exactly one of them (R1).
+        self.listed_types = []
+        self.list_errors = {}
+        self.list_errors_after = {}
+        # subscription id -> exception, for a one-sided delete failure.
+        self.delete_errors = {}
 
     def get_users(self):
         async def pages():
@@ -4697,14 +4937,29 @@ class FakePoolTwitch:
         return pages()
 
     async def get_eventsub_subscriptions(self, sub_type=None, target_token=None):
-        rows = list(self.subscriptions)
+        self.listed_types.append(sub_type)
+        error = self.list_errors.get(sub_type)
+        if error is not None:
+            raise error
+        rows = [
+            row
+            for row in self.subscriptions
+            if sub_type is None
+            or getattr(row, "type", None) is None
+            or getattr(row, "type", None) == sub_type
+        ]
+        fail_after = self.list_errors_after.get(sub_type)
 
         class Result:
             total = 10 ** 6  # Deliberately a lie. Nothing may read it.
 
             def __aiter__(self):
                 async def gen():
-                    for row in rows:
+                    for index, row in enumerate(rows):
+                        if fail_after is not None and index >= fail_after:
+                            raise eventsub_pool.TwitchAPIException(
+                                f"helix walk for {sub_type} failed part way"
+                            )
                         yield row
 
                 return gen()
@@ -4717,6 +4972,9 @@ class FakePoolTwitch:
     async def delete_eventsub_subscription(self, subscription_id, target_token=None):
         if subscription_id in self.not_found:
             raise eventsub_pool.TwitchResourceNotFound("subscription not found")
+        error = self.delete_errors.get(subscription_id)
+        if error is not None:
+            raise error
         self.deleted.append(subscription_id)
 
 
@@ -4732,15 +4990,195 @@ def make_pool(cap=SUBSCRIPTIONS_PER_CONNECTION, twitch=None, handler=None, **kwa
     )
 
 
-def existing_subscription(subscription_id, broadcaster_id, session_id, status="enabled"):
+def existing_subscription(
+    subscription_id,
+    broadcaster_id,
+    session_id,
+    status="enabled",
+    subscription_type=CHAT_TYPE,
+):
+    """One row as Helix reports it, for either coverage type.
+
+    `type` is what makes the two `list()` walks separable: a chat row must
+    never satisfy the notification walk, or a channel with only half its pair
+    would enumerate as complete.
+    """
     return type(
         "Sub",
         (),
         {
             "id": subscription_id,
             "status": status,
+            "type": subscription_type,
             "condition": {"broadcaster_user_id": str(broadcaster_id)},
             "transport": {"method": "websocket", "session_id": session_id},
+        },
+    )()
+
+
+def notification_subscription(subscription_id, broadcaster_id, session_id, status="enabled"):
+    """The auxiliary half of a pair, as Helix reports it."""
+    return existing_subscription(
+        subscription_id,
+        broadcaster_id,
+        session_id,
+        status,
+        subscription_type=NOTIFICATION_TYPE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Feature 007 -- dual-coverage helpers (T001)
+# ---------------------------------------------------------------------------
+
+
+def make_dual_pool(
+    cap=SUBSCRIPTIONS_PER_CONNECTION,
+    twitch=None,
+    handler=None,
+    notification_handler=None,
+    **kwargs,
+):
+    """A pool wired the way Feature 007 wires it: both coverage types.
+
+    The notification handler is only a SINK for `channel.chat.notification`
+    events. Dual coverage itself is not conditional on it -- every monitored
+    channel gets both subscriptions (FR-001) whether or not anything is
+    listening -- so passing it here is about being able to assert which
+    handler an event reached, not about switching the second type on.
+    """
+    return EventSubPoolTransport(
+        twitch or FakePoolTwitch(),
+        handler or AsyncMock(),
+        notification_handler=notification_handler or AsyncMock(),
+        user_id="99",
+        cap=cap,
+        connection_factory=FakeWebsocket,
+        **kwargs,
+    )
+
+
+class FakeMonotonicMs:
+    """An injectable monotonic clock, in milliseconds.
+
+    The auxiliary-refusal hold-off is an hour long. It cannot be tested
+    against the real clock, and sleeping through it is not a test -- so the
+    pool takes its monotonic reading from here instead.
+    """
+
+    def __init__(self, now_ms=1_000_000):
+        self.now_ms = now_ms
+
+    def __call__(self):
+        return self.now_ms
+
+    def advance_seconds(self, seconds):
+        self.now_ms += int(seconds * 1000)
+        return self.now_ms
+
+
+def chat_slot(pool, broadcaster_id):
+    """The channel's `channel.chat.message` slot, or None."""
+    return pool._slots.get((broadcaster_id, eventsub_pool.CoverageType.CHAT))
+
+
+def notification_slot(pool, broadcaster_id):
+    """The channel's `channel.chat.notification` slot, or None."""
+    return pool._slots.get((broadcaster_id, eventsub_pool.CoverageType.NOTIFICATION))
+
+
+def coverage_state(pool, broadcaster_id):
+    return pool.channel_coverage(broadcaster_id).state
+
+
+def listen_calls_of(websocket, subscription_type):
+    return [call for call in websocket.listen_calls if call[0] == subscription_type]
+
+
+def refusal_error():
+    """The 403 wording `_classify` already maps to a refusal."""
+    return eventsub_pool.EventSubSubscriptionError(
+        "subscription missing proper authorization"
+    )
+
+
+async def make_chat_only(pool, broadcaster_id, connection=None):
+    """Leave a channel with live chat and no notification coverage.
+
+    Twitch's own 500 on the auxiliary type, which is retryable and therefore
+    starts no hold-off -- the plain `chat_only` state, not the degraded one.
+    """
+    connection = connection or (
+        pool._connections[0] if pool._connections else await pool._grow()
+    )
+    websocket = connection.websocket
+    websocket.raise_on_subscribe_by_type[NOTIFICATION_TYPE] = (
+        eventsub_pool.TwitchBackendException("twitch 500")
+    )
+    try:
+        with pytest.raises(TransportError):
+            await pool.create(broadcaster_id)
+    finally:
+        websocket.raise_on_subscribe_by_type.pop(NOTIFICATION_TYPE, None)
+    return connection
+
+
+async def make_degraded(pool, broadcaster_id, connection=None):
+    """Drive D2's exact case: chat live, Twitch refuses the notification."""
+    connection = connection or (
+        pool._connections[0] if pool._connections else await pool._grow()
+    )
+    websocket = connection.websocket
+    websocket.raise_on_subscribe_by_type[NOTIFICATION_TYPE] = refusal_error()
+    try:
+        return await pool.create(broadcaster_id)
+    finally:
+        websocket.raise_on_subscribe_by_type.pop(NOTIFICATION_TYPE, None)
+
+
+def make_notification_event(
+    broadcaster_id=123,
+    notice_type="raid",
+    message_id="notice-uuid",
+    occurred_at=None,
+    viewer_count=None,
+    total=None,
+):
+    """A stand-in for `ChannelChatNotificationEvent`, shaped like the real one.
+
+    `TwitchObject.__init__` skips any field the payload omits, so only the
+    sub-object that matches `notice_type` is present at all -- an absent one
+    is a missing attribute, not a None. The envelope timestamp is already a
+    tz-aware datetime by the time a callback runs, exactly as on the chat path.
+    """
+    data = {
+        "broadcaster_user_id": str(broadcaster_id),
+        "broadcaster_user_login": "a_streamer",
+        "chatter_user_id": "456",
+        "notice_type": notice_type,
+        "message_id": message_id,
+    }
+    if notice_type == "raid":
+        data["raid"] = type("Raid", (), {"viewer_count": viewer_count or 0})()
+    elif notice_type == "sub_gift":
+        data["sub_gift"] = type("SubGift", (), {"cumulative_total": total})()
+    elif notice_type == "community_sub_gift":
+        data["community_sub_gift"] = type("CommunitySubGift", (), {"total": total or 1})()
+
+    return type(
+        "NotificationEvent",
+        (),
+        {
+            "metadata": type(
+                "Meta",
+                (),
+                {
+                    "subscription_type": NOTIFICATION_TYPE,
+                    "message_timestamp": occurred_at
+                    or datetime(2026, 9, 4, 12, 0, 0, 250000, tzinfo=timezone.utc),
+                },
+            )(),
+            "event": type("NotificationData", (), data)(),
         },
     )()
 
@@ -4755,9 +5193,15 @@ class TestPoolRouting:
         force a reshuffle of the entire pool instead of costing only the
         subscriptions that were actually on the dead socket.
 
+        Placement is compared per (channel, coverage type), because that is
+        what a slot is now: a channel is stable only when BOTH of its
+        subscriptions come back to where they were.
+
         The pool is given its two connections up front, so this measures
         routing and not the order the channels happened to arrive in -- see
         `test_a_growing_pool_does_not_move_what_it_already_placed` for that.
+        The channel count stays well inside the 600 subscriptions two sessions
+        hold, so capacity never binds and what is measured is routing alone.
         """
 
         async def run():
@@ -4768,18 +5212,30 @@ class TestPoolRouting:
             async def fill(order):
                 for broadcaster_id in order:
                     await pool.create(broadcaster_id)
-                placed = {bid: slot.connection_id for bid, slot in pool._slots.items()}
-                for slot in list(pool._slots.values()):
-                    await pool.delete(slot.subscription_id)
+                placed = {key: slot.connection_id for key, slot in pool._slots.items()}
+                # One delete per CHANNEL: the chat id is the handle the
+                # reconciler holds, and it takes both halves with it.
+                for broadcaster_id in sorted({key[0] for key in pool._slots}):
+                    await pool.delete(chat_slot(pool, broadcaster_id).subscription_id)
                 assert pool._slots == {}
                 return placed
 
-            first = await fill(range(1, 401))
-            second = await fill(reversed(range(1, 401)))
+            channels = range(1, 201)
+            first = await fill(channels)
+            second = await fill(reversed(channels))
             assert second == first
+            assert len(first) == 2 * len(channels), "a channel lost half its pair"
             # And both connections are actually used, so "stable" is not just
             # "everything landed on connection 0".
             assert len(set(first.values())) == 2
+            # With room on the connection the pair is kept together, so a
+            # socket death costs whole channels rather than half of twice as
+            # many (R2 allows a split; it must not happen with room to spare).
+            for broadcaster_id in channels:
+                assert (
+                    first[(broadcaster_id, eventsub_pool.CoverageType.CHAT)]
+                    == first[(broadcaster_id, eventsub_pool.CoverageType.NOTIFICATION)]
+                )
 
         asyncio.run(run())
 
@@ -4791,20 +5247,27 @@ class TestPoolRouting:
         are dropped for their own reasons. That is the deliberate trade: an
         even split would mean moving -- and so re-creating -- subscriptions
         that are working, every time the pool grows.
+
+        The cap is in subscriptions, so the first session is full at 150
+        channels, and every slot already placed is checked by its own
+        (channel, coverage type) key.
         """
 
         async def run():
             pool = make_pool()
-            for broadcaster_id in range(1, SUBSCRIPTIONS_PER_CONNECTION + 1):
+            channels_per_connection = SUBSCRIPTIONS_PER_CONNECTION // 2
+            for broadcaster_id in range(1, channels_per_connection + 1):
                 await pool.create(broadcaster_id)
-            before = {bid: slot.connection_id for bid, slot in pool._slots.items()}
+            assert len(pool._connections) == 1
+            assert pool.occupancy() == {"0": SUBSCRIPTIONS_PER_CONNECTION}
+            before = {key: slot.connection_id for key, slot in pool._slots.items()}
 
-            for broadcaster_id in range(SUBSCRIPTIONS_PER_CONNECTION + 1, 401):
+            for broadcaster_id in range(channels_per_connection + 1, 251):
                 await pool.create(broadcaster_id)
 
             assert len(pool._connections) == 2
-            for broadcaster_id, connection_id in before.items():
-                assert pool._slots[broadcaster_id].connection_id == connection_id
+            for key, connection_id in before.items():
+                assert pool._slots[key].connection_id == connection_id
 
         asyncio.run(run())
 
@@ -4853,46 +5316,67 @@ class TestPoolOccupancy:
     """T019a / T019 -- the cap holds and the count is the pool's own."""
 
     def test_occupancy_never_exceeds_the_cap(self):
+        """The cap is in SUBSCRIPTIONS, and a channel now costs two of them.
+
+        The channel count is derived from that, not chosen: 350 channels are
+        700 subscriptions, which the three sessions Twitch allows can hold.
+        """
+
         async def run():
             pool = make_pool()
-            for broadcaster_id in range(1, 700):
+            channels = 350
+            for broadcaster_id in range(1, channels + 1):
                 await pool.create(broadcaster_id)
             counts = pool.occupancy()
-            assert sum(counts.values()) == 699
+            assert sum(counts.values()) == channels * 2
             assert all(count <= SUBSCRIPTIONS_PER_CONNECTION for count in counts.values())
+            assert pool.coverage_counts().get("complete") == channels, (
+                "channels were counted in subscriptions, or a pair went missing"
+            )
 
         asyncio.run(run())
 
     def test_concurrent_creates_do_not_oversubscribe(self):
-        """Ten workers routing at once must not overfill one session.
+        """Workers routing at once must not overfill one session.
 
         Occupancy is only visible after a create returns, so without a
         reservation the last few creates of a filling connection all see room
-        and all take it.
+        and all take it -- and each create now takes TWO subscriptions, so a
+        reservation counted in channels would overfill it just as surely.
         """
 
         async def run():
             pool = make_pool(cap=10)
-            await asyncio.gather(*(pool.create(bid) for bid in range(1, 26)))
+            await asyncio.gather(*(pool.create(bid) for bid in range(1, 13)))
             counts = pool.occupancy()
-            assert sum(counts.values()) == 25
+            assert sum(counts.values()) == 24
             assert all(count <= 10 for count in counts.values())
+            assert all(connection.reserved == 0 for connection in pool._connections)
+            assert all(coverage_state(pool, bid) == "complete" for bid in range(1, 13))
 
         asyncio.run(run())
 
     def test_pool_grows_at_the_cap_boundary(self):
-        """One connection up to 300, a second at 301 (T018)."""
+        """One connection up to 300 SUBSCRIPTIONS, a second at 301 (T018).
+
+        Which is 150 channels and then the 151st, because the boundary the
+        pool grows at has never been a channel count.
+        """
 
         async def run():
             pool = make_pool()
-            for broadcaster_id in range(1, SUBSCRIPTIONS_PER_CONNECTION + 1):
+            channels_per_connection = SUBSCRIPTIONS_PER_CONNECTION // 2
+            for broadcaster_id in range(1, channels_per_connection + 1):
                 await pool.create(broadcaster_id)
             assert len(pool._connections) == 1
             assert pool.occupancy() == {"0": SUBSCRIPTIONS_PER_CONNECTION}
 
-            await pool.create(SUBSCRIPTIONS_PER_CONNECTION + 1)
+            await pool.create(channels_per_connection + 1)
             assert len(pool._connections) == 2
-            assert sum(pool.occupancy().values()) == SUBSCRIPTIONS_PER_CONNECTION + 1
+            assert sum(pool.occupancy().values()) == SUBSCRIPTIONS_PER_CONNECTION + 2
+            # The whole pair moved on: a connection with room for one
+            # subscription is not a connection with room for a channel.
+            assert pool.occupancy() == {"0": SUBSCRIPTIONS_PER_CONNECTION, "1": 2}
 
         asyncio.run(run())
 
@@ -4917,7 +5401,9 @@ class TestPoolOccupancy:
             # Corrupt the library's view the way the spike saw it corrupted.
             pool._connections[0]._active_subscriptions = {}
             pool._connections[0].websocket._active_subscriptions = {}
-            assert pool.occupancy() == {"0": 5}
+            # Five channels, ten subscriptions -- occupancy answers in the
+            # second unit and takes it from its own bookkeeping.
+            assert pool.occupancy() == {"0": 10}
 
         asyncio.run(run())
 
@@ -4945,23 +5431,38 @@ class TestPoolDeletes:
         """A reconnect re-subscribes everything and every id changes.
 
         Deleting the id recorded at create time would answer "not found" while
-        the real subscription kept delivering into a channel nobody wants.
+        the real subscription kept delivering into a channel nobody wants --
+        and it is now one rotated id per coverage type, so each half has to be
+        followed to its own new id.
         """
 
         async def run():
             twitch = FakePoolTwitch()
             pool = make_pool(twitch=twitch)
             recorded = await pool.create(7)
+            recorded_ids = {
+                chat_slot(pool, 7).subscription_id,
+                notification_slot(pool, 7).subscription_id,
+            }
             websocket = pool._connections[0].websocket
             websocket.rotate_ids()
-            live = next(iter(websocket._active_subscriptions))
-            assert live != recorded
+            live = set(websocket._active_subscriptions)
+            assert len(live) == 2
+            assert live.isdisjoint(recorded_ids)
 
             await pool.delete(recorded)
-            assert twitch.deleted == [live]
-            # And the library must not resubscribe it on its next reconnect.
+            assert set(twitch.deleted) == live
+            assert len(twitch.deleted) == 2, "a half was deleted twice, or leaked"
+            assert recorded not in twitch.deleted, (
+                "the delete followed the recorded id, so the live subscription "
+                "went on delivering"
+            )
+            # And the library must not resubscribe either half on its next
+            # reconnect.
             assert websocket._active_subscriptions == {}
             assert websocket._callbacks == {}
+            assert pool._slots == {}
+            assert pool.occupancy() == {"0": 0}
 
         asyncio.run(run())
 
@@ -4993,14 +5494,22 @@ class TestPoolEnumeration:
             await pool.create(1)
             await pool.create(2)
             session = pool._connections[0].websocket.session_id
+            # Both types for both channels: a channel is only complete when
+            # each of its two walks reports it.
             twitch.subscriptions = [
                 existing_subscription("a", 1, session),
+                notification_subscription("a-notice", 1, session),
                 existing_subscription("b", 2, session),
+                notification_subscription("b-notice", 2, session),
             ]
             seen = [sub async for sub in pool.list()]
             assert {sub.broadcaster_id for sub in seen} == {1, 2}
-            # `total` on the result object claims a million.
+            # `total` on the result object claims a million, and four rows
+            # joined into two channels.
             assert len(seen) == 2
+            assert {sub.subscription_id for sub in seen} == {"a", "b"}, (
+                "the auxiliary id was handed back as the channel's handle"
+            )
 
         asyncio.run(run())
 
@@ -5008,7 +5517,9 @@ class TestPoolEnumeration:
         """A dead session's subscriptions can never deliver to this process.
 
         Counting one in the actual set would make the reconciler believe a
-        channel is covered while it is silently dark.
+        channel is covered while it is silently dark. The foreign channel is
+        given BOTH halves, so what is rejected is the session and not merely
+        an incomplete pair.
         """
 
         async def run():
@@ -5018,7 +5529,9 @@ class TestPoolEnumeration:
             session = pool._connections[0].websocket.session_id
             twitch.subscriptions = [
                 existing_subscription("a", 1, session),
+                notification_subscription("a-notice", 1, session),
                 existing_subscription("b", 2, "a-session-from-a-dead-process"),
+                notification_subscription("b-notice", 2, "a-session-from-a-dead-process"),
             ]
             seen = [sub async for sub in pool.list()]
             assert [sub.broadcaster_id for sub in seen] == [1]
@@ -5124,23 +5637,26 @@ class TestPoolErrorClassification:
             pool = make_pool()
             await pool._grow()
             connection = pool._connections[0]
-            # Three channels land, then Twitch calls the session full.
+            # Three channels land -- six subscriptions, which is the unit the
+            # session is full in -- then Twitch calls the session full.
             for broadcaster_id in range(3):
                 await pool.create(broadcaster_id)
+            assert connection.occupancy == 6
             connection.websocket.raise_on_subscribe = (
                 eventsub_pool.EventSubSubscriptionError("subscription limit reached")
             )
             with pytest.raises(TransportError):
                 await pool.create(99)
-            assert connection.full_at == 3
-            assert pool.route(99) is not connection
+            assert connection.full_at == 6
+            assert connection.reserved == 0, "the refused pair kept its reservation"
+            assert pool.route(99, slots=2) is not connection
 
-            # Deleting one takes it back under the level it refused at.
+            # Dropping one channel frees the two subscriptions that takes it
+            # back under the level it refused at.
             connection.websocket.raise_on_subscribe = None
-            subscription_id = next(iter(connection.subscription_ids))
-            await pool.delete(subscription_id)
-            assert connection.occupancy == 2
-            assert pool.route(99) is connection
+            await pool.delete(chat_slot(pool, 0).subscription_id)
+            assert connection.occupancy == 4
+            assert pool.route(99, slots=2) is connection
 
         asyncio.run(run())
 
@@ -5223,13 +5739,18 @@ class TestPoolErrorClassification:
         The dip is what makes that possible, so the dip is what this asserts.
         Sampling at every lock release covers the whole create, including the
         window between the two acquisitions the old code left open.
+
+        The cap holds a channel and a half now, so the second create stays on
+        the same connection and the samples are of the connection under test.
+        With a pair reserved, `load` sits at 4 from the reservation until both
+        halves are recorded, and every release in between must see that.
         """
 
         async def run():
-            pool = make_pool(cap=2)
+            pool = make_pool(cap=4)
             await pool._grow()
             connection = pool._connections[0]
-            await pool.create(1)          # one recorded, so load starts at 1
+            await pool.create(1)          # a pair recorded, so load starts at 2
 
             samples = []
             real_lock = pool._lock
@@ -5246,11 +5767,15 @@ class TestPoolErrorClassification:
             await pool.create(2)
 
             assert samples, "the create took no lock at all"
-            assert min(samples) == 2, (
+            assert len(samples) >= 3, (
+                f"the pair took {len(samples)} critical sections; the reserve "
+                "and both records are the windows this samples"
+            )
+            assert min(samples) == 4, (
                 f"load dipped to {min(samples)} mid-create (samples {samples}); "
                 "a worker routing in that window would oversubscribe the session"
             )
-            assert (connection.occupancy, connection.reserved) == (2, 0)
+            assert (connection.occupancy, connection.reserved) == (4, 0)
 
         asyncio.run(run())
 
@@ -5259,18 +5784,25 @@ class TestPoolSocketDeath:
     """T023 / R4 -- a dead socket's channels go back to "not subscribed"."""
 
     def test_a_dead_connection_is_dropped_and_reported(self):
+        """The loss is reported in SUBSCRIPTIONS: five channels are ten."""
+
         async def run():
             lost = []
             pool = make_pool(on_subscriptions_lost=lost.append)
             for broadcaster_id in range(1, 6):
                 await pool.create(broadcaster_id)
+            assert pool.occupancy() == {"0": 10}
             pool._connections[0].websocket.die()
 
-            assert pool.reap_dead_connections() == 5
-            assert lost == [5]
+            assert pool.reap_dead_connections() == 10
+            assert lost == [10]
             assert pool._connections == []
             assert pool.occupancy() == {}
             assert pool._slots == {}
+            assert all(
+                coverage_state(pool, broadcaster_id) == "absent"
+                for broadcaster_id in range(1, 6)
+            )
 
         asyncio.run(run())
 
@@ -5291,6 +5823,10 @@ class TestPoolSocketDeath:
         Twitch revokes when the broadcaster withdraws authorization or the
         channel goes away. Without this the channel is silently dark and the
         subscription gauge never moves.
+
+        Twitch revokes ONE subscription, so the payload carries its type and
+        the sibling half must survive: what the channel loses is coverage of
+        that type, not its place in the pool.
         """
 
         async def run():
@@ -5298,15 +5834,23 @@ class TestPoolSocketDeath:
             pool = make_pool(on_subscriptions_lost=lost.append)
             await pool.start()
             subscription_id = await pool.create(7)
+            notification_id = notification_slot(pool, 7).subscription_id
 
-            await pool._on_revocation(
-                {"subscription": {"id": subscription_id, "status": "authorization_revoked"}}
-            )
+            await pool._on_revocation({
+                "subscription": {
+                    "id": subscription_id,
+                    "type": CHAT_TYPE,
+                    "status": "authorization_revoked",
+                    "condition": {"broadcaster_user_id": "7"},
+                }
+            })
             await asyncio.sleep(0)  # let the threadsafe hop run
 
-            assert lost == [1]
-            assert pool._slots == {}
-            assert pool.occupancy() == {"0": 0}
+            assert lost == [1], "the pair was reported lost, not the subscription"
+            assert chat_slot(pool, 7) is None
+            assert notification_slot(pool, 7).subscription_id == notification_id
+            assert coverage_state(pool, 7) == "notification_only"
+            assert pool.occupancy() == {"0": 1}
 
         asyncio.run(run())
 
@@ -5322,6 +5866,10 @@ class TestPoolSocketDeath:
         to miss -- this test models that by emptying the registry, which is
         the state the handler really runs in. An earlier version of this test
         re-inserted the rotated id by hand and so proved nothing.
+
+        Both the channel AND the type come out of the payload: a rotated pair
+        has one new id per type, so the channel alone would not say which half
+        Twitch withdrew.
         """
 
         async def run():
@@ -5330,15 +5878,17 @@ class TestPoolSocketDeath:
             await pool.start()
             await pool.create(7)
             websocket = pool._connections[0].websocket
+            notification_id = notification_slot(pool, 7).subscription_id
 
-            # The reconnect rotated the id; the library has already forgotten
-            # it by the time the revocation reaches us.
+            # The reconnect rotated the ids; the library has already forgotten
+            # them by the time the revocation reaches us.
             websocket._active_subscriptions.clear()
             websocket._callbacks.clear()
 
             await pool._on_revocation({
                 "subscription": {
                     "id": "rotated-sub-1",
+                    "type": CHAT_TYPE,
                     "status": "authorization_revoked",
                     "condition": {"broadcaster_user_id": "7"},
                 }
@@ -5346,8 +5896,12 @@ class TestPoolSocketDeath:
             await asyncio.sleep(0)
 
             assert lost == [1], "the revocation was dropped, leaving the channel dark"
-            assert 7 not in pool._slots
-            assert pool.occupancy() == {"0": 0}
+            assert chat_slot(pool, 7) is None
+            assert notification_slot(pool, 7).subscription_id == notification_id, (
+                "the rotated id resolved to the wrong half of the pair"
+            )
+            assert coverage_state(pool, 7) == "notification_only"
+            assert pool.occupancy() == {"0": 1}
 
         asyncio.run(run())
 
@@ -5407,13 +5961,16 @@ class TestPoolSocketDeath:
         Handing the recorded id back made no Twitch call, so the periodic
         re-adoption would drop the channel, ask for it again, be given the
         ghost straight back, and count it as covered for ever -- defeating the
-        re-adoption that exists to catch exactly this.
+        re-adoption that exists to catch exactly this. Each coverage type is
+        judged on its own registry entry, so a ghost of either half has to be
+        re-created rather than handed back.
         """
 
         async def run():
             pool = make_pool()
             await pool.start()
             first_id = await pool.create(7)
+            first_notification_id = notification_slot(pool, 7).subscription_id
             websocket = pool._connections[0].websocket
 
             # The reconnect dropped this channel and never restored it.
@@ -5426,7 +5983,12 @@ class TestPoolSocketDeath:
                 "create() handed back the id of a subscription that no longer "
                 "exists, without contacting Twitch"
             )
-            assert pool.occupancy() == {"0": 1}
+            assert notification_slot(pool, 7).subscription_id != first_notification_id, (
+                "the auxiliary ghost was handed back, so the channel is "
+                "counted as covered while nothing delivers its notices"
+            )
+            assert coverage_state(pool, 7) == "complete"
+            assert pool.occupancy() == {"0": 2}
 
         asyncio.run(run())
 
@@ -5434,7 +5996,9 @@ class TestPoolSocketDeath:
         """End to end: the loss reaches the reconciler and the next pass heals.
 
         The pool reports; the reconciler drives. The subscription count drops
-        first -- that dip is the FR-012 alert -- and then recovers.
+        first -- that dip is the FR-012 alert -- and then recovers. The
+        reconciler stays channel-keyed, so its own count is five channels
+        while the pool holds their ten subscriptions.
         """
 
         async def run():
@@ -5448,12 +6012,18 @@ class TestPoolSocketDeath:
             seed_desired(fake_redis, logins)
             await reconciler.reconcile_once()
             assert reconciler.subscription_count == 5
+            assert sum(pool.occupancy().values()) == 10
+            assert pool.coverage_counts().get("complete") == 5
             first_connection = pool._connections[0]
 
-            # The socket dies. Everything it held is gone.
+            # The socket dies. Everything it held is gone -- both halves of
+            # every channel that was on it.
             first_connection.websocket.die()
             pool.reap_dead_connections()
             assert pool.occupancy() == {}
+            assert pool.coverage_counts() == {
+                state: 0 for state in eventsub_pool.COVERAGE_STATES
+            }
             assert reconciler_module.eventsub_subscription_count._value.get() == 0, (
                 "the dip this alert is built on never reached the gauge"
             )
@@ -5463,9 +6033,10 @@ class TestPoolSocketDeath:
             await reconciler.reconcile_once()
 
             assert reconciler.subscription_count == 5
-            assert reconciler_module.eventsub_subscription_count._value.get() == 5
+            assert reconciler_module.eventsub_subscription_count._value.get() == 10
             assert pool._connections[0].connection_id != first_connection.connection_id
-            assert sum(pool.occupancy().values()) == 5
+            assert sum(pool.occupancy().values()) == 10
+            assert pool.coverage_counts().get("complete") == 5
 
         asyncio.run(run())
 
@@ -5504,18 +6075,30 @@ class TestPoolRaces:
         asyncio.run(run())
 
     def test_a_slot_on_a_retired_connection_is_not_handed_back(self):
-        """The early return must check the connection, not just the slot."""
+        """The early return must check the connection, not just the slot.
+
+        And it must do so per coverage type: a stale chat slot and a stale
+        notification slot are two independent records, and either one handed
+        back would leave the channel counted as covered while nothing
+        delivers for it.
+        """
 
         async def run():
             pool = make_pool()
             subscription_id = await pool.create(7)
+            stale_notification_id = notification_slot(pool, 7).subscription_id
             # Retire without going through _retire, the way a stale slot could
             # survive a bookkeeping slip.
             pool._connections = []
 
             recreated = await pool.create(7)
             assert recreated != subscription_id
-            assert pool._slots[7].connection_id == pool._connections[0].connection_id
+            assert notification_slot(pool, 7).subscription_id != stale_notification_id
+            live_connection_id = pool._connections[0].connection_id
+            assert chat_slot(pool, 7).connection_id == live_connection_id
+            assert notification_slot(pool, 7).connection_id == live_connection_id
+            assert coverage_state(pool, 7) == "complete"
+            assert pool.occupancy() == {str(live_connection_id): 2}
 
         asyncio.run(run())
 
@@ -5525,6 +6108,10 @@ class TestPoolRaces:
         Deleting the reported id and stopping there would leave the library's
         own registry intact, so the socket re-creates the channel on its next
         reconnect -- exactly the resurrection this cleanup exists to prevent.
+
+        The reconciler drops a CHANNEL with the chat handle returned by
+        `list()`, so that one call must also remove the sibling notification
+        subscription.
         """
 
         async def run():
@@ -5533,13 +6120,19 @@ class TestPoolRaces:
             await pool.create(7)
             websocket = pool._connections[0].websocket
             websocket.rotate_ids()
-            rotated = next(iter(websocket._active_subscriptions))
+            rotated_chat = next(iter(websocket.subscriptions_of_type(CHAT_TYPE)))
+            rotated_notification = next(
+                iter(websocket.subscriptions_of_type(NOTIFICATION_TYPE))
+            )
 
             # The reconciler asks for the id Twitch reports, which the pool
             # has never seen.
-            await pool.delete(rotated)
+            await pool.delete(rotated_chat)
 
-            assert twitch.deleted == [rotated]
+            assert set(twitch.deleted) == {rotated_chat, rotated_notification}
+            assert rotated_chat not in websocket._active_subscriptions
+            assert rotated_chat not in websocket._callbacks
+            assert chat_slot(pool, 7) is None
             assert websocket._active_subscriptions == {}
             assert websocket._callbacks == {}
             assert pool._slots == {}
@@ -5638,15 +6231,21 @@ class TestPoolRaces:
                 "a subscription made on a closed session was recorded as current"
             )
             assert connection.occupancy == 0
-            assert connection.reserved == 0, "the reservation outlived the create"
+            assert connection.reserved == 0, (
+                "the reservation outlived the create -- both the chat slot's "
+                "and the notification slot's, which was never attempted"
+            )
             assert websocket._active_subscriptions == {}, (
                 "the library would resurrect the dead id on its next reconnect"
             )
 
-            # And the channel is simply retried, on the live session.
+            # And the channel is simply retried, on the live session. Each
+            # half carries its own honest stamp, read before its own listen.
             websocket.listen_channel_chat_message = original_listen
             assert await pool.create(7)
-            assert pool._slots[7].session_id == "session-after-reconnect"
+            assert chat_slot(pool, 7).session_id == "session-after-reconnect"
+            assert notification_slot(pool, 7).session_id == "session-after-reconnect"
+            assert coverage_state(pool, 7) == "complete"
 
         asyncio.run(run())
 
@@ -5748,11 +6347,17 @@ class TestPoolRaces:
         """The subscription may still exist on Twitch for the length of that
         round trip. Releasing the slot first counted it in neither `reserved`
         nor `subscription_ids`, so another worker could route a channel into a
-        slot that was not really free and push the session past its cap."""
+        slot that was not really free and push the session past its cap.
+
+        The reservation is pair-sized -- a new channel is two subscriptions --
+        and the WHOLE of it has to survive the delete. The cap is one more
+        than a pair, so a session that gave up even one of the two reads as
+        having room for a channel it cannot take.
+        """
 
         async def run():
             twitch = FakePoolTwitch()
-            pool = make_pool(cap=1, twitch=twitch)
+            pool = make_pool(cap=3, twitch=twitch)
             await pool.start()
             await pool._grow()
             connection = pool._connections[0]
@@ -5773,7 +6378,7 @@ class TestPoolRaces:
             during_delete = []
 
             async def slow_delete(subscription_id, target_token=None):
-                during_delete.append(pool.route(7))
+                during_delete.append((pool.route(7, slots=2), connection.reserved))
                 await asyncio.sleep(0)
 
             twitch.delete_eventsub_subscription = slow_delete
@@ -5781,9 +6386,10 @@ class TestPoolRaces:
             with pytest.raises(TransportError):
                 await pool.create(7)
 
-            assert during_delete == [None], (
-                "the slot looked free while the subscription might still exist, "
-                "so another worker could oversubscribe the session"
+            assert during_delete == [(None, 2)], (
+                f"saw {during_delete}: the slot looked free while the "
+                "subscription might still exist, so another worker could "
+                "oversubscribe the session"
             )
             assert connection.reserved == 0, "the reservation was never released"
 
@@ -5936,7 +6542,2114 @@ class TestPoolRaces:
             # The lock is free, so the pool still works once that window ends.
             pool._growth_blocked_until = 0.0
             assert await pool.create(7)
+            assert pool.occupancy() == {"0": 2}
+            assert coverage_state(pool, 7) == "complete"
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Feature 007 -- two coverage types per channel
+# ---------------------------------------------------------------------------
+
+
+class TestCoverageTypeContract:
+    """T006 -- the closed set of coverage types, and what each maps to."""
+
+    def test_there_are_exactly_two_coverage_types(self):
+        """A third type would change every capacity number in the plan."""
+        assert {member.value for member in eventsub_pool.CoverageType} == {
+            "chat",
+            "notification",
+        }
+
+    def test_each_type_names_its_twitch_subscription_type(self):
+        assert eventsub_pool.CHAT_MESSAGE_SUBSCRIPTION_TYPE == CHAT_TYPE
+        assert eventsub_pool.CHAT_NOTIFICATION_SUBSCRIPTION_TYPE == NOTIFICATION_TYPE
+        assert eventsub_pool.CoverageType.CHAT.subscription_type == CHAT_TYPE
+        assert (
+            eventsub_pool.CoverageType.NOTIFICATION.subscription_type
+            == NOTIFICATION_TYPE
+        )
+
+
+class TestPoolCoverageModel:
+    """T006 / FR-001, FR-002 -- one slot per (broadcaster, coverage type)."""
+
+    def test_a_channel_gets_one_slot_of_each_type(self):
+        async def run():
+            pool = make_dual_pool()
+            await pool.create(7)
+
+            assert chat_slot(pool, 7) is not None
+            assert notification_slot(pool, 7) is not None
+            assert (
+                chat_slot(pool, 7).subscription_id
+                != notification_slot(pool, 7).subscription_id
+            ), "the two halves shared an id, so neither can be resolved alone"
+            assert chat_slot(pool, 7).coverage_type is eventsub_pool.CoverageType.CHAT
+            assert (
+                notification_slot(pool, 7).coverage_type
+                is eventsub_pool.CoverageType.NOTIFICATION
+            )
+            # Occupancy is a SUBSCRIPTION count, so one channel is two.
+            assert pool.occupancy() == {"0": 2}
+
+        asyncio.run(run())
+
+    def test_create_returns_the_channel_s_chat_subscription_id(self):
+        """The reconciler keys `_actual` by channel and hands this id back to
+        `delete()`. The chat half is the channel's handle; the auxiliary half
+        is resolved from the channel, never from the id."""
+
+        async def run():
+            pool = make_dual_pool()
+            returned = await pool.create(7)
+            assert returned == chat_slot(pool, 7).subscription_id
+
+        asyncio.run(run())
+
+    def test_the_subscription_index_resolves_each_id_to_its_own_slot(self):
+        async def run():
+            pool = make_dual_pool()
+            await pool.create(7)
+            chat = chat_slot(pool, 7)
+            notification = notification_slot(pool, 7)
+
+            assert pool._by_subscription[chat.subscription_id] is chat
+            assert pool._by_subscription[notification.subscription_id] is notification
+
+        asyncio.run(run())
+
+    def test_an_unknown_channel_is_absent(self):
+        async def run():
+            pool = make_dual_pool()
+            assert coverage_state(pool, 7) == "absent"
+            assert pool.channel_coverage(7).chat_slot is None
+            assert pool.channel_coverage(7).notification_slot is None
+
+        asyncio.run(run())
+
+    def test_both_slots_present_is_complete(self):
+        async def run():
+            pool = make_dual_pool()
+            await pool.create(7)
+            assert coverage_state(pool, 7) == "complete"
+
+        asyncio.run(run())
+
+    def test_chat_without_notification_is_chat_only(self):
+        """Not `complete`, so the reconciler re-creates the missing half.
+
+        With no hold-off in force this is the ordinary, repairable partial
+        state -- the channel is NOT in the actual set.
+        """
+
+        async def run():
+            pool = make_dual_pool()
+            await pool._grow()
+            await make_chat_only(pool, 7)
+
+            assert chat_slot(pool, 7) is not None
+            assert notification_slot(pool, 7) is None
+            assert coverage_state(pool, 7) == "chat_only"
             assert pool.occupancy() == {"0": 1}
+
+        asyncio.run(run())
+
+    def test_notification_without_chat_is_notification_only(self):
+        """The channel produces no chat at all, so it is equally incomplete."""
+
+        async def run():
+            pool = make_dual_pool()
+            await pool.start()
+            await pool.create(7)
+            chat_id = chat_slot(pool, 7).subscription_id
+
+            await pool._on_revocation({
+                "subscription": {
+                    "id": chat_id,
+                    "type": CHAT_TYPE,
+                    "status": "authorization_revoked",
+                    "condition": {"broadcaster_user_id": "7"},
+                }
+            })
+            await asyncio.sleep(0)
+
+            assert chat_slot(pool, 7) is None
+            assert notification_slot(pool, 7) is not None
+            assert coverage_state(pool, 7) == "notification_only"
+
+        asyncio.run(run())
+
+    def test_a_refused_notification_with_live_chat_is_degraded_chat_only(self):
+        """The one state where a channel is reported actual without both
+        halves, and it exists only to stop an auxiliary refusal from evicting
+        the channel's chat (D2)."""
+
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            await pool._grow()
+            await make_degraded(pool, 7)
+
+            assert coverage_state(pool, 7) == "degraded_chat_only"
+            assert pool.channel_coverage(7).auxiliary_refused_until_ms == (
+                clock.now_ms + eventsub_pool.AUXILIARY_REFUSAL_RETRY_SECONDS * 1000
+            )
+
+        asyncio.run(run())
+
+    def test_the_two_indexes_are_independent(self):
+        """Dropping one type must leave the other's slot and id untouched."""
+
+        async def run():
+            pool = make_dual_pool()
+            await pool.start()
+            await pool.create(7)
+            await pool.create(8)
+            notification_id = notification_slot(pool, 7).subscription_id
+            survivor = chat_slot(pool, 7).subscription_id
+
+            await pool._on_revocation({
+                "subscription": {
+                    "id": notification_id,
+                    "type": NOTIFICATION_TYPE,
+                    "status": "authorization_revoked",
+                    "condition": {"broadcaster_user_id": "7"},
+                }
+            })
+            await asyncio.sleep(0)
+
+            assert notification_id not in pool._by_subscription
+            assert pool._by_subscription[survivor].broadcaster_id == 7
+            assert coverage_state(pool, 7) == "chat_only"
+            assert coverage_state(pool, 8) == "complete", "an unrelated channel moved"
+
+        asyncio.run(run())
+
+
+class TestPoolPairRouting:
+    """T008 / R2 -- placement and reservation in subscription units."""
+
+    def test_a_new_channel_needs_room_for_two_subscriptions(self):
+        async def run():
+            pool = make_dual_pool(cap=3)
+            connection = await pool._grow()
+            assert pool.route(9, slots=2) is connection
+
+            await pool.create(8)  # two subscriptions, so one slot is left
+            assert connection.load == 2
+            assert pool.route(9, slots=2) is None, (
+                "a pair was routed onto a connection with room for one"
+            )
+            assert pool.route(9, slots=1) is connection
+
+        asyncio.run(run())
+
+    def test_a_reservation_holds_the_number_of_subscriptions_it_will_create(self):
+        async def run():
+            pool = make_dual_pool(cap=10)
+            connection = await pool._grow()
+
+            reserved = await pool._reserve(9, slots=2)
+            assert reserved is connection
+            assert connection.reserved == 2
+            assert connection.load == 2, "the cap was compared against one slot"
+
+            await pool._release(connection, slots=2)
+            assert connection.reserved == 0
+
+        asyncio.run(run())
+
+    def test_a_repair_prefers_the_connection_that_already_holds_the_channel(self):
+        """Locality: keep a channel's pair together when there is room, even
+        when rendezvous order would send the second half elsewhere."""
+
+        async def run():
+            pool = make_dual_pool(cap=10)
+            first = await pool._grow()
+            target = next(
+                bid
+                for bid in range(1, 5000)
+                if eventsub_pool._score(bid, 1) > eventsub_pool._score(bid, 0)
+            )
+            await make_chat_only(pool, target, connection=first)
+            second = await pool._grow()
+
+            assert eventsub_pool._score(target, 1) > eventsub_pool._score(target, 0), (
+                "the fixture no longer sets up the case it is testing"
+            )
+            assert pool.route(target, slots=1) is first, (
+                "the repair was routed away from the connection holding the pair"
+            )
+            # And a channel with no slots still routes by rendezvous.
+            untouched = next(
+                bid
+                for bid in range(5000, 10000)
+                if eventsub_pool._score(bid, 1) > eventsub_pool._score(bid, 0)
+            )
+            assert pool.route(untouched, slots=2) is second
+
+        asyncio.run(run())
+
+    def test_a_pair_may_split_across_two_connections(self):
+        """Legal and modelled (R2). A socket death then leaves the channel in
+        a partial state, which is already convergent."""
+
+        async def run():
+            pool = make_dual_pool(cap=3)
+            first = await pool._grow()
+            await make_chat_only(pool, 7, connection=first)
+            await pool.create(8)  # fills the connection: 1 + 2 == cap
+            assert first.load == 3
+
+            await pool.create(7)  # the repair has nowhere local to go
+
+            assert chat_slot(pool, 7).connection_id == first.connection_id
+            assert notification_slot(pool, 7).connection_id != first.connection_id
+            assert coverage_state(pool, 7) == "complete"
+            assert pool.occupancy() == {"0": 3, "1": 1}
+            assert all(c.reserved == 0 for c in pool._connections)
+
+        asyncio.run(run())
+
+    def test_load_is_counted_in_subscriptions_not_channels(self):
+        async def run():
+            pool = make_dual_pool(cap=6)
+            connection = await pool._grow()
+            for broadcaster_id in (1, 2, 3):
+                await pool.create(broadcaster_id)
+
+            assert connection.occupancy == 6
+            assert connection.load == 6
+            assert pool.route(4, slots=2) is None, (
+                "the cap was compared in channels, so the session went to 8 "
+                "subscriptions against a 6-subscription limit"
+            )
+
+        asyncio.run(run())
+
+    def test_concurrent_pair_creates_do_not_oversubscribe(self):
+        """Ten workers reserve at once, and each now takes TWO slots.
+
+        Reserving one and creating two is the way this overfills a session
+        without any single create ever looking wrong.
+        """
+
+        async def run():
+            pool = make_dual_pool(cap=10, max_connections=6)
+            await asyncio.gather(*(pool.create(bid) for bid in range(1, 26)))
+
+            counts = pool.occupancy()
+            assert sum(counts.values()) == 50
+            assert all(count <= 10 for count in counts.values())
+            assert all(connection.reserved == 0 for connection in pool._connections)
+            assert all(coverage_state(pool, bid) == "complete" for bid in range(1, 26))
+
+        asyncio.run(run())
+
+    def test_the_three_connection_limit_binds_in_subscription_units(self):
+        async def run():
+            pool = make_dual_pool(cap=2)
+            await pool.start()
+            for broadcaster_id in (1, 2, 3):
+                await pool.create(broadcaster_id)
+            assert len(pool._connections) == 3
+            assert sum(pool.occupancy().values()) == 6
+
+            with pytest.raises(TransportError) as caught:
+                await pool.create(4)
+            assert "connection limit" in str(caught.value)
+            assert len(pool._connections) == 3
+
+        asyncio.run(run())
+
+
+class TestPoolPairCreation:
+    """T010 / FR-002 -- create the missing types, and only those."""
+
+    def test_an_absent_channel_creates_exactly_one_of_each_type(self):
+        async def run():
+            pool = make_dual_pool()
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+
+            assert listen_calls_of(websocket, CHAT_TYPE) == [(CHAT_TYPE, "7", "99")]
+            assert listen_calls_of(websocket, NOTIFICATION_TYPE) == [
+                (NOTIFICATION_TYPE, "7", "99")
+            ]
+
+        asyncio.run(run())
+
+    def test_both_types_use_the_existing_operator_user_id(self):
+        """FR-016: `user:read:chat` already covers both, so nothing reseeds."""
+
+        async def run():
+            pool = make_dual_pool()
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+            assert {call[2] for call in websocket.listen_calls} == {"99"}
+
+        asyncio.run(run())
+
+    def test_each_type_gets_its_own_callback(self):
+        async def run():
+            chat_events = []
+            notification_events = []
+
+            async def on_chat(event):
+                chat_events.append(event)
+
+            async def on_notification(event):
+                notification_events.append(event)
+
+            pool = make_dual_pool(handler=on_chat, notification_handler=on_notification)
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+
+            notification_id = notification_slot(pool, 7).subscription_id
+            chat_id = chat_slot(pool, 7).subscription_id
+            assert (
+                websocket._callbacks[notification_id]["callback"]
+                != websocket._callbacks[chat_id]["callback"]
+            ), "both types were registered against the chat handler"
+
+            await websocket._callbacks[notification_id]["callback"](
+                make_notification_event(broadcaster_id=7)
+            )
+            assert len(notification_events) == 1
+            assert chat_events == [], "a notification reached the chat publisher"
+
+        asyncio.run(run())
+
+    def test_repairing_chat_only_creates_only_the_notification(self):
+        async def run():
+            pool = make_dual_pool()
+            await pool._grow()
+            await make_chat_only(pool, 7)
+            websocket = pool._connections[0].websocket
+            surviving_id = chat_slot(pool, 7).subscription_id
+            calls_before = len(websocket.listen_calls)
+
+            await pool.create(7)
+
+            assert len(listen_calls_of(websocket, CHAT_TYPE)) == 1, (
+                "the surviving chat subscription was duplicated"
+            )
+            assert chat_slot(pool, 7).subscription_id == surviving_id
+            assert len(websocket.listen_calls) == calls_before + 1
+            assert websocket.listen_calls[-1][0] == NOTIFICATION_TYPE
+            assert coverage_state(pool, 7) == "complete"
+            assert pool.occupancy() == {"0": 2}
+
+        asyncio.run(run())
+
+    def test_repairing_notification_only_creates_only_the_chat(self):
+        async def run():
+            pool = make_dual_pool()
+            await pool.start()
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+            surviving_id = notification_slot(pool, 7).subscription_id
+
+            await pool._on_revocation({
+                "subscription": {
+                    "id": chat_slot(pool, 7).subscription_id,
+                    "type": CHAT_TYPE,
+                    "status": "authorization_revoked",
+                    "condition": {"broadcaster_user_id": "7"},
+                }
+            })
+            await asyncio.sleep(0)
+            assert coverage_state(pool, 7) == "notification_only"
+
+            await pool.create(7)
+
+            assert notification_slot(pool, 7).subscription_id == surviving_id
+            assert len(listen_calls_of(websocket, NOTIFICATION_TYPE)) == 1
+            assert len(listen_calls_of(websocket, CHAT_TYPE)) == 2
+            assert coverage_state(pool, 7) == "complete"
+
+        asyncio.run(run())
+
+    def test_both_slots_are_stamped_with_the_session_they_were_made_on(self):
+        async def run():
+            pool = make_dual_pool()
+            await pool.create(7)
+            session = pool._connections[0].websocket.session_id
+
+            assert chat_slot(pool, 7).session_id == session
+            assert notification_slot(pool, 7).session_id == session
+
+        asyncio.run(run())
+
+    def test_each_call_keeps_the_session_read_before_that_call(self):
+        """The stamp is per subscription, not per channel.
+
+        The library builds each POST's transport from whatever session is
+        current when THAT request goes out, so a reconnect between the two
+        listen calls makes one half honest and the other a lie. Stamping both
+        from a single reading -- before or after -- records a subscription on
+        a session it was never made on, and `_slot_is_current` then agrees
+        with itself for ever while the channel is dark.
+        """
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            await pool.start()
+            connection = await pool._grow()
+            websocket = connection.websocket
+            first_session = websocket.session_id
+            original = websocket.listen_channel_chat_notification
+
+            async def reconnect_during_notification(broadcaster_user_id, user_id, callback):
+                subscription_id = await original(broadcaster_user_id, user_id, callback)
+                websocket.reconnect("session-after-reconnect")
+                return subscription_id
+
+            websocket.listen_channel_chat_notification = reconnect_during_notification
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+
+            assert notification_slot(pool, 7) is None, (
+                "a subscription whose session changed under it was recorded"
+            )
+            assert twitch.deleted, "the discarded auxiliary was never deleted"
+            chat = chat_slot(pool, 7)
+            # Whether the chat half is kept for the next pass or dropped with
+            # its sibling is the implementation's call. What it may NEVER do
+            # is relabel it with a session it was not made on: that stamp is
+            # the only check `_slot_is_current` cannot be talked out of.
+            assert chat is None or chat.session_id == first_session
+            assert connection.reserved == 0
+
+        asyncio.run(run())
+
+
+class TestPoolPairEnumeration:
+    """T011 / R1 -- `list()` joins two walks, and either failure is a hole."""
+
+    @staticmethod
+    async def _complete_pair_rows(pool, broadcaster_ids):
+        session = pool._connections[0].websocket.session_id
+        rows = []
+        for broadcaster_id in broadcaster_ids:
+            rows.append(
+                existing_subscription(
+                    chat_slot(pool, broadcaster_id).subscription_id,
+                    broadcaster_id,
+                    session,
+                )
+            )
+            rows.append(
+                notification_subscription(
+                    notification_slot(pool, broadcaster_id).subscription_id,
+                    broadcaster_id,
+                    session,
+                )
+            )
+        return rows
+
+    def test_list_walks_both_types_and_joins_them_per_channel(self):
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            await pool.create(1)
+            await pool.create(2)
+            twitch.subscriptions = await self._complete_pair_rows(pool, [1, 2])
+
+            seen = [sub async for sub in pool.list()]
+
+            assert {CHAT_TYPE, NOTIFICATION_TYPE} <= set(twitch.listed_types)
+            assert {sub.broadcaster_id for sub in seen} == {1, 2}
+            assert len(seen) == 2, "a channel was yielded once per subscription"
+            assert {sub.subscription_id for sub in seen} == {
+                chat_slot(pool, 1).subscription_id,
+                chat_slot(pool, 2).subscription_id,
+            }
+
+        asyncio.run(run())
+
+    def test_a_channel_with_only_one_type_is_not_complete(self):
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            await pool.create(1)
+            await pool.create(2)
+            rows = await self._complete_pair_rows(pool, [1, 2])
+            # Channel 2 lost its auxiliary half on Twitch's side.
+            twitch.subscriptions = [
+                row
+                for row in rows
+                if not (
+                    row.condition["broadcaster_user_id"] == "2"
+                    and row.type == NOTIFICATION_TYPE
+                )
+            ]
+
+            seen = [sub async for sub in pool.list()]
+
+            assert [sub.broadcaster_id for sub in seen] == [1]
+
+        asyncio.run(run())
+
+    def test_a_type_that_is_not_enabled_does_not_complete_a_pair(self):
+        """`ADOPTABLE_STATUSES` is `enabled` only, and it has to hold for
+        BOTH halves or a revoked auxiliary reads as covered."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            await pool.create(1)
+            session = pool._connections[0].websocket.session_id
+            twitch.subscriptions = [
+                existing_subscription(
+                    chat_slot(pool, 1).subscription_id, 1, session
+                ),
+                notification_subscription(
+                    notification_slot(pool, 1).subscription_id,
+                    1,
+                    session,
+                    status="authorization_revoked",
+                ),
+            ]
+
+            seen = [sub async for sub in pool.list()]
+            assert seen == [], (
+                "a pair whose auxiliary half is revoked was reported as adoptable"
+            )
+
+        asyncio.run(run())
+
+    def test_a_half_on_a_foreign_session_does_not_complete_a_pair(self):
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            await pool.create(1)
+            session = pool._connections[0].websocket.session_id
+            twitch.subscriptions = [
+                existing_subscription(chat_slot(pool, 1).subscription_id, 1, session),
+                notification_subscription("n-1", 1, "a-session-from-a-dead-process"),
+            ]
+
+            seen = [sub async for sub in pool.list()]
+            assert seen == []
+
+        asyncio.run(run())
+
+    def test_a_degraded_channel_is_reported_as_actual(self):
+        """Otherwise the reconciler drops it from `_actual` every pass and
+        re-creates a subscription Twitch has just refused -- the hot loop the
+        bounded hold-off exists to stop."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(twitch=twitch, monotonic_ms=clock)
+            await pool._grow()
+            await make_degraded(pool, 7)
+            session = pool._connections[0].websocket.session_id
+            twitch.subscriptions = [
+                existing_subscription(chat_slot(pool, 7).subscription_id, 7, session)
+            ]
+
+            seen = [sub async for sub in pool.list()]
+
+            assert [sub.broadcaster_id for sub in seen] == [7]
+            assert seen[0].subscription_id == chat_slot(pool, 7).subscription_id
+            assert coverage_state(pool, 7) == "degraded_chat_only"
+
+        asyncio.run(run())
+
+    def test_a_plain_partial_channel_is_not_reported_as_actual(self):
+        """`chat_only` without a hold-off must stay out, so ordinary repair
+        runs on the next pass."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            await pool._grow()
+            await make_chat_only(pool, 7)
+            session = pool._connections[0].websocket.session_id
+            twitch.subscriptions = [
+                existing_subscription(chat_slot(pool, 7).subscription_id, 7, session)
+            ]
+
+            assert [sub async for sub in pool.list()] == []
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize("failing_type", [CHAT_TYPE, NOTIFICATION_TYPE])
+    def test_either_walk_failing_makes_the_enumeration_incomplete(self, failing_type):
+        """R1. "Clean" must mean BOTH walks finished, or the reconciler deletes
+        live subscriptions it merely failed to see."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            await pool.create(1)
+            twitch.subscriptions = await self._complete_pair_rows(pool, [1])
+            twitch.list_errors[failing_type] = eventsub_pool.TwitchAPIException(
+                "helix 500"
+            )
+
+            with pytest.raises(Exception):
+                [sub async for sub in pool.list()]
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize("failing_type", [CHAT_TYPE, NOTIFICATION_TYPE])
+    def test_a_failed_walk_holds_the_reconciler_s_drops_back(self, failing_type):
+        async def run():
+            fake_redis = FakeRedis()
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            reconciler = make_reconciler(pool, fake_redis, readopt_interval_seconds=0)
+            seed_desired(fake_redis, [("c1", 1)])
+
+            await reconciler.reconcile_once()
+            assert reconciler._adoption_complete is True
+
+            twitch.subscriptions = await self._complete_pair_rows(pool, [1])
+            twitch.list_errors[failing_type] = eventsub_pool.TwitchAPIException(
+                "helix 500"
+            )
+            # The channel leaves the desired set: without a clean walk the
+            # reconciler must NOT act on that.
+            seed_desired(fake_redis, [])
+            await reconciler.reconcile_once()
+
+            assert reconciler._adoption_complete is False
+            assert twitch.deleted == [], (
+                "a live pair was deleted on the strength of a half-finished walk"
+            )
+
+        asyncio.run(run())
+
+    def test_a_walk_that_fails_part_way_keeps_what_it_saw(self):
+        """The channels seen before the failure are still real. What must not
+        happen is the enumeration reporting itself clean."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            await pool.create(1)
+            await pool.create(2)
+            twitch.subscriptions = await self._complete_pair_rows(pool, [1, 2])
+            twitch.list_errors_after[NOTIFICATION_TYPE] = 1
+
+            seen = []
+            with pytest.raises(Exception):
+                async for subscription in pool.list():
+                    seen.append(subscription)
+
+            assert {sub.broadcaster_id for sub in seen} <= {1}, (
+                "a channel was completed from a walk that never reached its "
+                "auxiliary half"
+            )
+
+        asyncio.run(run())
+
+
+class TestPoolPairAdoption:
+    """T012 / FR-005 -- a 409 adopts the matching (type, broadcaster) only."""
+
+    def test_a_chat_conflict_adopts_the_chat_subscription(self):
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            connection = await pool._grow()
+            session = connection.websocket.session_id
+            twitch.subscriptions = [
+                existing_subscription("adopted-chat", 7, session),
+                notification_subscription("someone-elses-notice", 8, session),
+            ]
+            connection.websocket.raise_on_subscribe_by_type[CHAT_TYPE] = (
+                eventsub_pool.EventSubSubscriptionConflict("409 conflict")
+            )
+
+            await pool.create(7)
+
+            assert chat_slot(pool, 7).subscription_id == "adopted-chat"
+            assert notification_slot(pool, 7) is not None
+            assert notification_slot(pool, 7).subscription_id != "someone-elses-notice"
+            assert coverage_state(pool, 7) == "complete"
+
+        asyncio.run(run())
+
+    def test_a_notification_conflict_adopts_the_notification_subscription(self):
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            connection = await pool._grow()
+            session = connection.websocket.session_id
+            twitch.subscriptions = [
+                notification_subscription("adopted-notice", 7, session),
+                existing_subscription("a-chat-row-for-7", 7, session),
+            ]
+            connection.websocket.raise_on_subscribe_by_type[NOTIFICATION_TYPE] = (
+                eventsub_pool.EventSubSubscriptionConflict("409 conflict")
+            )
+
+            await pool.create(7)
+
+            assert notification_slot(pool, 7).subscription_id == "adopted-notice"
+            assert chat_slot(pool, 7).subscription_id != "a-chat-row-for-7", (
+                "the 409 for the auxiliary type adopted a chat subscription"
+            )
+            assert coverage_state(pool, 7) == "complete"
+
+        asyncio.run(run())
+
+    def test_a_conflict_never_adopts_the_other_type(self):
+        """Only a chat row exists, and the auxiliary create conflicted. There
+        is nothing legitimate to adopt, so the channel stays incomplete."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            connection = await pool._grow()
+            session = connection.websocket.session_id
+            twitch.subscriptions = [existing_subscription("chat-only-row", 7, session)]
+            connection.websocket.raise_on_subscribe_by_type[NOTIFICATION_TYPE] = (
+                eventsub_pool.EventSubSubscriptionConflict("409 conflict")
+            )
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+
+            assert notification_slot(pool, 7) is None
+            assert coverage_state(pool, 7) == "chat_only"
+
+        asyncio.run(run())
+
+    def test_a_conflict_never_adopts_another_broadcaster(self):
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            connection = await pool._grow()
+            session = connection.websocket.session_id
+            twitch.subscriptions = [notification_subscription("notice-for-8", 8, session)]
+            connection.websocket.raise_on_subscribe_by_type[NOTIFICATION_TYPE] = (
+                eventsub_pool.EventSubSubscriptionConflict("409 conflict")
+            )
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+            assert notification_slot(pool, 7) is None
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize("conflicting_type", [CHAT_TYPE, NOTIFICATION_TYPE])
+    def test_a_conflict_refuses_a_subscription_on_a_session_we_do_not_hold(
+        self, conflicting_type
+    ):
+        """A websocket session dies with the process that opened it. Claiming
+        one this pool does not hold counts a dark channel as covered."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            connection = await pool._grow()
+            builder = (
+                existing_subscription
+                if conflicting_type == CHAT_TYPE
+                else notification_subscription
+            )
+            twitch.subscriptions = [builder("ghost", 7, "a-session-from-a-dead-process")]
+            connection.websocket.raise_on_subscribe_by_type[conflicting_type] = (
+                eventsub_pool.EventSubSubscriptionConflict("409 conflict")
+            )
+
+            with pytest.raises(TransportError):
+                await pool.create(7)
+
+            assert "ghost" not in pool._by_subscription
+            assert coverage_state(pool, 7) != "complete"
+
+        asyncio.run(run())
+
+
+class TestPoolPairDeletes:
+    """T013 -- dropping a channel means dropping both of its subscriptions."""
+
+    def test_dropping_a_channel_deletes_both_types(self):
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            handle = await pool.create(7)
+            expected = {
+                chat_slot(pool, 7).subscription_id,
+                notification_slot(pool, 7).subscription_id,
+            }
+
+            await pool.delete(handle)
+
+            assert set(twitch.deleted) == expected
+            assert pool._slots == {}
+            assert pool._by_subscription == {}
+            assert pool.occupancy() == {"0": 0}
+            assert coverage_state(pool, 7) == "absent"
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize("gone_type", [CHAT_TYPE, NOTIFICATION_TYPE])
+    def test_an_already_gone_half_is_success(self, gone_type):
+        """A `websocket_disconnected` leftover answers "not found" on DELETE.
+        That is success for either half, not a failure that strands the other."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            handle = await pool.create(7)
+            slot = (
+                chat_slot(pool, 7)
+                if gone_type == CHAT_TYPE
+                else notification_slot(pool, 7)
+            )
+            twitch.not_found.add(slot.subscription_id)
+
+            await pool.delete(handle)  # must not raise
+
+            assert pool._slots == {}
+            assert pool.occupancy() == {"0": 0}
+
+        asyncio.run(run())
+
+    def test_delete_follows_the_ids_a_reconnect_rotated_per_type(self):
+        """Both ids change, and each type's delete must follow its OWN new id
+        -- resolving by broadcaster alone deletes one twice and leaks the other."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            handle = await pool.create(7)
+            websocket = pool._connections[0].websocket
+            websocket.rotate_ids()
+            live = set(websocket._active_subscriptions)
+            assert len(live) == 2
+            assert len(websocket.subscriptions_of_type(CHAT_TYPE)) == 1
+            assert len(websocket.subscriptions_of_type(NOTIFICATION_TYPE)) == 1
+
+            await pool.delete(handle)
+
+            assert set(twitch.deleted) == live
+            assert len(twitch.deleted) == 2
+            assert websocket._active_subscriptions == {}
+            assert websocket._callbacks == {}
+            assert pool.occupancy() == {"0": 0}
+
+        asyncio.run(run())
+
+    def test_a_one_sided_delete_failure_leaves_the_survivor_retryable(self):
+        """Both halves are attempted. The one that failed keeps its slot and
+        its place in the occupancy count, so the next pass retries exactly it."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            handle = await pool.create(7)
+            chat_id = chat_slot(pool, 7).subscription_id
+            notification_id = notification_slot(pool, 7).subscription_id
+            twitch.delete_errors[notification_id] = eventsub_pool.TwitchAPIException(
+                "twitch 503"
+            )
+
+            with pytest.raises(TransportError):
+                await pool.delete(handle)
+
+            assert chat_id in twitch.deleted, "one failure aborted the other delete"
+            assert chat_slot(pool, 7) is None
+            assert notification_slot(pool, 7) is not None
+            assert notification_slot(pool, 7).subscription_id == notification_id
+            assert coverage_state(pool, 7) == "notification_only"
+            assert pool.occupancy() == {"0": 1}
+
+            # And the retry finishes the job.
+            twitch.delete_errors.clear()
+            await pool.delete(notification_id)
+            assert pool._slots == {}
+            assert pool.occupancy() == {"0": 0}
+
+        asyncio.run(run())
+
+    def test_deleting_one_channel_does_not_touch_another(self):
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            handle = await pool.create(7)
+            await pool.create(8)
+
+            await pool.delete(handle)
+
+            assert coverage_state(pool, 8) == "complete"
+            assert pool.occupancy() == {"0": 2}
+
+        asyncio.run(run())
+
+
+class TestPoolPairRevocation:
+    """T014 -- a revocation costs one subscription, never the pair."""
+
+    @staticmethod
+    async def _revoke(pool, subscription_id, subscription_type, broadcaster_id):
+        await pool._on_revocation({
+            "subscription": {
+                "id": subscription_id,
+                "type": subscription_type,
+                "status": "authorization_revoked",
+                "condition": {"broadcaster_user_id": str(broadcaster_id)},
+            }
+        })
+        await asyncio.sleep(0)
+
+    def test_a_revoked_notification_leaves_the_chat_slot(self):
+        async def run():
+            lost = []
+            pool = make_dual_pool(on_subscriptions_lost=lost.append)
+            await pool.start()
+            await pool.create(7)
+            chat_id = chat_slot(pool, 7).subscription_id
+
+            await self._revoke(
+                pool, notification_slot(pool, 7).subscription_id, NOTIFICATION_TYPE, 7
+            )
+
+            assert lost == [1], "the pair was reported lost, not the subscription"
+            assert chat_slot(pool, 7).subscription_id == chat_id
+            assert notification_slot(pool, 7) is None
+            assert coverage_state(pool, 7) == "chat_only"
+            assert pool.occupancy() == {"0": 1}
+
+        asyncio.run(run())
+
+    def test_a_revoked_chat_leaves_the_notification_slot(self):
+        async def run():
+            lost = []
+            pool = make_dual_pool(on_subscriptions_lost=lost.append)
+            await pool.start()
+            await pool.create(7)
+            notification_id = notification_slot(pool, 7).subscription_id
+
+            await self._revoke(pool, chat_slot(pool, 7).subscription_id, CHAT_TYPE, 7)
+
+            assert lost == [1]
+            assert notification_slot(pool, 7).subscription_id == notification_id
+            assert chat_slot(pool, 7) is None
+            assert coverage_state(pool, 7) == "notification_only"
+            assert pool.occupancy() == {"0": 1}
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize(
+        "revoked_type,survivor_getter",
+        [
+            (NOTIFICATION_TYPE, chat_slot),
+            (CHAT_TYPE, notification_slot),
+        ],
+    )
+    def test_a_rotated_unknown_id_still_resolves_channel_and_type(
+        self, revoked_type, survivor_getter
+    ):
+        """`_handle_revocation` empties the library registries before calling
+        us, and a reconnect has already rotated both ids, so the channel AND
+        the type have to come out of the payload."""
+
+        async def run():
+            lost = []
+            pool = make_dual_pool(on_subscriptions_lost=lost.append)
+            await pool.start()
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+            survivor = survivor_getter(pool, 7).subscription_id
+            websocket._active_subscriptions.clear()
+            websocket._callbacks.clear()
+
+            await self._revoke(pool, "an-id-we-never-recorded", revoked_type, 7)
+
+            assert lost == [1]
+            assert survivor_getter(pool, 7).subscription_id == survivor, (
+                "the revocation removed the wrong half of the pair"
+            )
+            assert pool.occupancy() == {"0": 1}
+
+        asyncio.run(run())
+
+    def test_the_partial_state_a_revocation_leaves_is_repairable(self):
+        async def run():
+            pool = make_dual_pool()
+            await pool.start()
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+            chat_id = chat_slot(pool, 7).subscription_id
+
+            await self._revoke(
+                pool, notification_slot(pool, 7).subscription_id, NOTIFICATION_TYPE, 7
+            )
+            await pool.create(7)
+
+            assert coverage_state(pool, 7) == "complete"
+            assert chat_slot(pool, 7).subscription_id == chat_id
+            assert len(listen_calls_of(websocket, CHAT_TYPE)) == 1
+            assert len(listen_calls_of(websocket, NOTIFICATION_TYPE)) == 2
+
+        asyncio.run(run())
+
+
+class TestPoolPairReconnect:
+    """T015 -- staleness, socket death and retirement, per type."""
+
+    def test_chat_only_does_not_satisfy_the_notification_type(self):
+        """The false positive that makes everything else look healthy: match
+        on `broadcaster_user_id` alone and a channel that holds only chat
+        reads as "current" for the auxiliary type, so it is never repaired."""
+
+        async def run():
+            pool = make_dual_pool()
+            connection = await pool._grow()
+            await make_chat_only(pool, 7, connection=connection)
+
+            assert (
+                pool._connection_holds(connection, 7, eventsub_pool.CoverageType.CHAT)
+                is True
+            )
+            assert (
+                pool._connection_holds(
+                    connection, 7, eventsub_pool.CoverageType.NOTIFICATION
+                )
+                is False
+            ), "a chat subscription answered for the notification type"
+
+        asyncio.run(run())
+
+    def test_a_registry_that_lost_only_one_type_recreates_only_that_type(self):
+        """`_resubscribe()` can give up part way, leaving one half real and
+        the other a ghost. Each half is checked on its own."""
+
+        async def run():
+            pool = make_dual_pool()
+            await pool.start()
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+            chat_id = chat_slot(pool, 7).subscription_id
+            ghost = notification_slot(pool, 7).subscription_id
+            websocket._active_subscriptions.pop(ghost)
+            websocket._callbacks.pop(ghost)
+
+            await pool.create(7)
+
+            assert chat_slot(pool, 7).subscription_id == chat_id
+            assert notification_slot(pool, 7).subscription_id != ghost
+            assert len(listen_calls_of(websocket, CHAT_TYPE)) == 1
+            assert len(listen_calls_of(websocket, NOTIFICATION_TYPE)) == 2
+            assert pool.occupancy() == {"0": 2}
+
+        asyncio.run(run())
+
+    def test_a_reconnect_makes_both_stamps_stale(self):
+        """A new session means Twitch holds nothing from the old one, whatever
+        either registry still claims."""
+
+        async def run():
+            pool = make_dual_pool()
+            await pool.start()
+            await pool.create(7)
+            websocket = pool._connections[0].websocket
+            before = {
+                chat_slot(pool, 7).subscription_id,
+                notification_slot(pool, 7).subscription_id,
+            }
+            websocket.reconnect("session-after-reconnect")
+
+            await pool.create(7)
+
+            after = {
+                chat_slot(pool, 7).subscription_id,
+                notification_slot(pool, 7).subscription_id,
+            }
+            assert after.isdisjoint(before), "a pre-reconnect id was handed back"
+            assert len(listen_calls_of(websocket, CHAT_TYPE)) == 2
+            assert len(listen_calls_of(websocket, NOTIFICATION_TYPE)) == 2
+            assert pool.occupancy() == {"0": 2}
+
+        asyncio.run(run())
+
+    def test_a_dead_socket_takes_both_halves_of_a_co_located_pair(self):
+        async def run():
+            lost = []
+            pool = make_dual_pool(on_subscriptions_lost=lost.append)
+            for broadcaster_id in (1, 2, 3):
+                await pool.create(broadcaster_id)
+            pool._connections[0].websocket.die()
+
+            assert pool.reap_dead_connections() == 6, (
+                "the loss was counted in channels, not subscriptions"
+            )
+            assert lost == [6]
+            assert pool._slots == {}
+            assert pool.occupancy() == {}
+            assert coverage_state(pool, 1) == "absent"
+
+        asyncio.run(run())
+
+    def test_a_dead_socket_takes_only_its_own_half_of_a_split_pair(self):
+        """R2's residual, made explicit: the surviving half stays, and the
+        channel converges through the ordinary partial-state repair."""
+
+        async def run():
+            lost = []
+            pool = make_dual_pool(cap=3, on_subscriptions_lost=lost.append)
+            first = await pool._grow()
+            await make_chat_only(pool, 7, connection=first)
+            await pool.create(8)
+            await pool.create(7)  # the auxiliary half splits onto connection 1
+            second = pool._connections[1]
+            assert notification_slot(pool, 7).connection_id == second.connection_id
+
+            second.websocket.die()
+            assert pool.reap_dead_connections() == 1
+            assert lost == [1]
+
+            assert chat_slot(pool, 7) is not None
+            assert notification_slot(pool, 7) is None
+            assert coverage_state(pool, 7) == "chat_only"
+            assert coverage_state(pool, 8) == "complete"
+
+        asyncio.run(run())
+
+    def test_retirement_clears_both_halves_on_that_connection_only(self):
+        async def run():
+            pool = make_dual_pool(cap=3)
+            first = await pool._grow()
+            await make_chat_only(pool, 7, connection=first)
+            await pool.create(8)
+            await pool.create(7)
+            second = pool._connections[1]
+
+            pool._retire(first)
+
+            assert chat_slot(pool, 7) is None
+            assert coverage_state(pool, 8) == "absent"
+            assert notification_slot(pool, 7) is not None, (
+                "_retire deleted a slot that lives on another connection"
+            )
+            assert coverage_state(pool, 7) == "notification_only"
+            assert pool.occupancy() == {str(second.connection_id): 1}
+
+        asyncio.run(run())
+
+    def test_a_mid_ramp_reconnect_never_oversubscribes(self):
+        """The repair after a reconnect re-creates real subscriptions, so it
+        has to be routed and reserved like any other create."""
+
+        async def run():
+            pool = make_dual_pool(cap=6, max_connections=6)
+            for broadcaster_id in range(1, 13):
+                await pool.create(broadcaster_id)
+            assert sum(pool.occupancy().values()) == 24
+
+            pool._connections[0].websocket.reconnect("session-mid-ramp")
+            for broadcaster_id in range(1, 13):
+                await pool.create(broadcaster_id)
+
+            counts = pool.occupancy()
+            assert all(count <= 6 for count in counts.values()), (
+                f"a session went past its cap during the repair: {counts}"
+            )
+            assert sum(counts.values()) == 24
+            assert all(
+                coverage_state(pool, broadcaster_id) == "complete"
+                for broadcaster_id in range(1, 13)
+            )
+            assert all(connection.reserved == 0 for connection in pool._connections)
+
+        asyncio.run(run())
+
+
+class TestPoolAuxiliaryRefusal:
+    """T016 / D2 -- a bounded, pool-local hold-off, and nothing wider."""
+
+    def test_the_hold_off_is_an_hour(self):
+        assert eventsub_pool.AUXILIARY_REFUSAL_RETRY_SECONDS == 3600
+
+    def test_a_notification_refusal_does_not_refuse_the_channel(self):
+        """`streamers.eventsub_refused_at` is per CHANNEL and lasts seven
+        days. Letting an auxiliary 403 reach the reconciler as a refusal would
+        kill that channel's chat for a week to protect a suppression signal."""
+
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            await pool._grow()
+
+            handle = await make_degraded(pool, 7)  # must not raise
+
+            assert handle == chat_slot(pool, 7).subscription_id
+            assert coverage_state(pool, 7) == "degraded_chat_only"
+            assert pool.occupancy() == {"0": 1}
+
+        asyncio.run(run())
+
+    def test_a_chat_refusal_is_still_a_channel_refusal(self):
+        """The distinction has to survive: chat is the data path."""
+
+        async def run():
+            pool = make_dual_pool()
+            connection = await pool._grow()
+            connection.websocket.raise_on_subscribe_by_type[CHAT_TYPE] = refusal_error()
+
+            with pytest.raises(SubscriptionRefusedError):
+                await pool.create(7)
+
+        asyncio.run(run())
+
+    def test_the_hold_off_suppresses_further_notification_creates(self):
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            connection = await pool._grow()
+            await make_degraded(pool, 7)
+            websocket = connection.websocket
+            attempts = len(listen_calls_of(websocket, NOTIFICATION_TYPE))
+
+            clock.advance_seconds(1800)
+            for _ in range(10):
+                await pool.create(7)
+
+            assert len(listen_calls_of(websocket, NOTIFICATION_TYPE)) == attempts, (
+                "the reconciler hot-looped on a refusal it cannot fix"
+            )
+            assert len(listen_calls_of(websocket, CHAT_TYPE)) == 1
+            assert coverage_state(pool, 7) == "degraded_chat_only"
+
+        asyncio.run(run())
+
+    def test_the_hold_off_lasts_exactly_the_configured_hour(self):
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            connection = await pool._grow()
+            await make_degraded(pool, 7)
+            websocket = connection.websocket
+
+            clock.advance_seconds(eventsub_pool.AUXILIARY_REFUSAL_RETRY_SECONDS - 1)
+            await pool.create(7)
+            assert len(listen_calls_of(websocket, NOTIFICATION_TYPE)) == 0, (
+                "the hold-off expired early"
+            )
+            assert coverage_state(pool, 7) == "degraded_chat_only"
+
+            clock.advance_seconds(1)
+            assert coverage_state(pool, 7) == "chat_only", (
+                "an expired hold-off still reported the channel as actual"
+            )
+            await pool.create(7)
+
+            assert len(listen_calls_of(websocket, NOTIFICATION_TYPE)) == 1
+            assert coverage_state(pool, 7) == "complete"
+            assert pool.channel_coverage(7).auxiliary_refused_until_ms is None
+
+        asyncio.run(run())
+
+    def test_a_reconnect_makes_the_channel_repairable_at_once(self):
+        """The refusal may have been specific to that session, and a reconnect
+        is a free opportunity to retest it."""
+
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            connection = await pool._grow()
+            await make_degraded(pool, 7)
+
+            connection.websocket.reconnect("session-after-reconnect")
+            clock.advance_seconds(5)
+            await pool.create(7)
+
+            assert coverage_state(pool, 7) == "complete"
+            assert pool.channel_coverage(7).auxiliary_refused_until_ms is None
+
+        asyncio.run(run())
+
+    def test_retiring_the_connection_makes_the_channel_repairable_at_once(self):
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            connection = await pool._grow()
+            await make_degraded(pool, 7)
+
+            pool._retire(connection)
+
+            assert pool.channel_coverage(7).auxiliary_refused_until_ms is None
+            clock.advance_seconds(5)
+            await pool.create(7)
+            assert coverage_state(pool, 7) == "complete"
+
+        asyncio.run(run())
+
+    def test_a_successful_creation_clears_the_state(self):
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            await pool._grow()
+            await make_degraded(pool, 7)
+
+            clock.advance_seconds(eventsub_pool.AUXILIARY_REFUSAL_RETRY_SECONDS)
+            await pool.create(7)
+
+            assert pool.channel_coverage(7).auxiliary_refused_until_ms is None
+            assert coverage_state(pool, 7) == "complete"
+
+        asyncio.run(run())
+
+    def test_a_409_adoption_clears_the_state(self):
+        async def run():
+            clock = FakeMonotonicMs()
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch, monotonic_ms=clock)
+            connection = await pool._grow()
+            await make_degraded(pool, 7)
+
+            clock.advance_seconds(eventsub_pool.AUXILIARY_REFUSAL_RETRY_SECONDS)
+            twitch.subscriptions = [
+                notification_subscription(
+                    "adopted-notice", 7, connection.websocket.session_id
+                )
+            ]
+            connection.websocket.raise_on_subscribe_by_type[NOTIFICATION_TYPE] = (
+                eventsub_pool.EventSubSubscriptionConflict("409 conflict")
+            )
+
+            await pool.create(7)
+
+            assert notification_slot(pool, 7).subscription_id == "adopted-notice"
+            assert pool.channel_coverage(7).auxiliary_refused_until_ms is None
+            assert coverage_state(pool, 7) == "complete"
+
+        asyncio.run(run())
+
+    def test_a_refusal_after_expiry_starts_one_more_bounded_period(self):
+        """Never permanent: each refusal buys exactly one more hour."""
+
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            await pool._grow()
+            await make_degraded(pool, 7)
+
+            clock.advance_seconds(eventsub_pool.AUXILIARY_REFUSAL_RETRY_SECONDS)
+            await make_degraded(pool, 7)
+
+            assert coverage_state(pool, 7) == "degraded_chat_only"
+            assert pool.channel_coverage(7).auxiliary_refused_until_ms == (
+                clock.now_ms + eventsub_pool.AUXILIARY_REFUSAL_RETRY_SECONDS * 1000
+            )
+
+        asyncio.run(run())
+
+    def test_a_refusal_on_one_channel_does_not_hold_off_another(self):
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            await pool._grow()
+            await make_degraded(pool, 7)
+
+            await pool.create(8)
+
+            assert coverage_state(pool, 8) == "complete"
+            assert pool.channel_coverage(8).auxiliary_refused_until_ms is None
+
+        asyncio.run(run())
+
+    def test_a_refused_channel_keeps_its_chat_subscription(self):
+        """The whole point of D2: no eviction, no data loss."""
+
+        async def run():
+            clock = FakeMonotonicMs()
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch, monotonic_ms=clock)
+            await pool._grow()
+            await make_degraded(pool, 7)
+
+            assert chat_slot(pool, 7) is not None
+            assert twitch.deleted == [], "the auxiliary refusal evicted live chat"
+
+        asyncio.run(run())
+
+
+async def revoke_subscription(pool, subscription_id, subscription_type, broadcaster_id):
+    """Deliver one Twitch revocation exactly as the library delivers it.
+
+    Shared by the pair-revocation tests and the reclamation tests below: the
+    payload carries the subscription object, condition and type included,
+    because the library has already emptied its own registries by the time the
+    handler runs.
+    """
+    await pool._on_revocation({
+        "subscription": {
+            "id": subscription_id,
+            "type": subscription_type,
+            "status": "authorization_revoked",
+            "condition": {"broadcaster_user_id": str(broadcaster_id)},
+        }
+    })
+    # `_on_revocation` hops to the service loop with `call_soon_threadsafe`.
+    await asyncio.sleep(0)
+
+
+def rotated_id_of(websocket, subscription_type):
+    """The single live id the library now holds for one coverage type."""
+    ids = websocket.subscriptions_of_type(subscription_type)
+    assert len(ids) == 1, f"expected one live {subscription_type}, got {ids}"
+    return next(iter(ids))
+
+
+class TestPoolRotatedHandleDeletes:
+    """T013 / T021 / FR-002, I3 -- a drop whose handle is a ROTATED id.
+
+    `delete()` resolves the channel through `_by_subscription`, and that index
+    holds the ids recorded at CREATE time. A library reconnect resubscribes
+    the whole socket and rotates BOTH ids, and the very next enumeration hands
+    the reconciler the rotated CHAT id -- so `_drop_one` calls `delete()` with
+    an id the pool's own indexes have never seen. That is the unrecognised-id
+    branch, and it deletes exactly ONE subscription: the sibling's rotated id
+    stays live on Twitch, in the library's registry and in the occupancy
+    count, and the channel is left as a `notification_only` orphan that
+    nothing will ever drop -- the channel is gone from the desired set, so no
+    later pass creates it, and `list()` never yields a partial channel, so no
+    later pass drops it either.
+
+    `test_delete_follows_the_ids_a_reconnect_rotated_per_type` above covers
+    the case where the handle is still one the pool recorded. This is the case
+    where it is not, which is the one the reconciler actually produces.
+    """
+
+    def test_deleting_a_rotated_handle_drops_both_halves(self):
+        """One `delete()` call, with the id the reconciler would be holding."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            handle = await pool.create(7)
+            websocket = pool._connections[0].websocket
+
+            # The reconnect the library performs on its own: same channels,
+            # new ids, and the pool's indexes are not told.
+            websocket.rotate_ids()
+            rotated = set(websocket._active_subscriptions)
+            rotated_chat = rotated_id_of(websocket, CHAT_TYPE)
+            rotated_notification = rotated_id_of(websocket, NOTIFICATION_TYPE)
+            assert handle not in rotated, "the handle was not actually rotated"
+            assert pool._by_subscription.keys().isdisjoint(rotated), (
+                "the pool's indexes were refreshed, so this is not the case "
+                "under test"
+            )
+
+            # Exactly what `Reconciler._drop_one` does: one call, with the
+            # handle the last enumeration reported.
+            await pool.delete(rotated_chat)
+
+            assert set(twitch.deleted) == {rotated_chat, rotated_notification}, (
+                "the rotated sibling was left live on Twitch"
+            )
+            assert len(twitch.deleted) == 2, "a subscription was deleted twice"
+            assert websocket._active_subscriptions == {}, (
+                "the library will resubscribe the orphan on its next reconnect"
+            )
+            assert websocket._callbacks == {}
+            assert chat_slot(pool, 7) is None
+            assert notification_slot(pool, 7) is None
+            assert pool._slots == {}
+            assert pool._by_subscription == {}
+            assert pool.occupancy() == {"0": 0}
+            assert coverage_state(pool, 7) == "absent"
+            assert pool.coverage_counts() == {
+                state: 0 for state in eventsub_pool.COVERAGE_STATES
+            }
+
+        asyncio.run(run())
+
+    def test_a_reconciler_drop_after_a_reconnect_leaves_no_orphan(self):
+        """The same defect through the deployed control flow.
+
+        The reconciler re-enumerates, so `_actual` holds the ROTATED chat id;
+        the pool's indexes still hold the pre-reconnect pair. The drop then
+        goes down the unrecognised-id branch.
+        """
+
+        async def run():
+            fake_redis = FakeRedis()
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            reconciler = make_reconciler(pool, fake_redis, readopt_interval_seconds=0)
+
+            seed_desired(fake_redis, [("c7", 7)])
+            await reconciler.reconcile_once()
+            assert coverage_state(pool, 7) == "complete"
+
+            websocket = pool._connections[0].websocket
+            websocket.rotate_ids()
+            rotated_chat = rotated_id_of(websocket, CHAT_TYPE)
+            rotated_notification = rotated_id_of(websocket, NOTIFICATION_TYPE)
+            session = websocket.session_id
+            twitch.subscriptions = [
+                existing_subscription(rotated_chat, 7, session),
+                notification_subscription(rotated_notification, 7, session),
+            ]
+
+            seed_desired(fake_redis, [])
+            await reconciler.reconcile_once()
+
+            assert reconciler._actual == {}
+            assert set(twitch.deleted) == {rotated_chat, rotated_notification}, (
+                "the reconciler's drop left the auxiliary half live"
+            )
+            assert len(twitch.deleted) == 2
+            assert websocket._active_subscriptions == {}
+            assert websocket._callbacks == {}
+            assert pool._slots == {}
+            assert pool._by_subscription == {}
+            assert pool.occupancy() == {"0": 0}
+            assert coverage_state(pool, 7) == "absent"
+            assert pool.coverage_counts()["notification_only"] == 0, (
+                "the drop left a notification_only orphan behind"
+            )
+
+        asyncio.run(run())
+
+
+class TestUndesiredPartialChannelReclamation:
+    """T013 / T021 / FR-001, NFR-003 -- a partial channel nobody wants.
+
+    A create that lands one half and fails the other raises, so the channel
+    never enters the reconciler's `_actual`. `list()` deliberately does not
+    yield a partial channel -- that is what makes the next pass repair the
+    missing half -- so while the channel is still DESIRED the state converges.
+
+    It does not converge once the channel leaves the desired set. It is in
+    nothing the reconciler diffs: not in `_actual`, so never in `to_drop`; not
+    in `desired`, so never in `to_create`. The surviving subscription then
+    stays live for the life of the process, holding one of the 300 slots on
+    its session and delivering chat for a channel nobody is monitoring
+    (FR-013/FR-014 capacity, NFR-003 convergence).
+
+    The reclamation needs a handle the transport can be asked for, because
+    `list()` must NOT start reporting partial channels as actual -- that would
+    stop the repair path dead. These tests are written against the minimal
+    explicit API that gives it: `partial_channel_handles()`, drop-only.
+    """
+
+    @staticmethod
+    async def _partial_create(pool, reconciler, fake_redis, broadcaster_id):
+        """Chat succeeds, the auxiliary half hits a transient transport error.
+
+        Driven through `reconcile_once()`, so the channel is left exactly as
+        the deployed path leaves it: covered by chat on Twitch, and unknown to
+        the reconciler because `create()` raised.
+        """
+        connection = pool._connections[0] if pool._connections else await pool._grow()
+        websocket = connection.websocket
+        websocket.raise_on_subscribe_by_type[NOTIFICATION_TYPE] = (
+            eventsub_pool.TwitchBackendException("twitch 500")
+        )
+        try:
+            seed_desired(fake_redis, [(f"c{broadcaster_id}", broadcaster_id)])
+            await reconciler.reconcile_once()
+        finally:
+            websocket.raise_on_subscribe_by_type.pop(NOTIFICATION_TYPE, None)
+        return connection
+
+    def test_an_undesired_chat_only_partial_is_reclaimed_on_a_clean_pass(self):
+        async def run():
+            fake_redis = FakeRedis()
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            reconciler = make_reconciler(pool, fake_redis, readopt_interval_seconds=0)
+
+            connection = await self._partial_create(pool, reconciler, fake_redis, 7)
+            chat_id = chat_slot(pool, 7).subscription_id
+
+            assert coverage_state(pool, 7) == "chat_only"
+            assert reconciler._actual == {}, (
+                "a partial channel entered the actual set, which would stop "
+                "the repair path"
+            )
+            assert connection.reserved == 0
+            assert pool.occupancy() == {"0": 1}
+
+            # The channel leaves the desired set before anything repairs it.
+            seed_desired(fake_redis, [])
+            twitch.subscriptions = [
+                existing_subscription(chat_id, 7, connection.websocket.session_id)
+            ]
+
+            await reconciler.reconcile_once()
+
+            assert reconciler._adoption_complete is True, (
+                "the enumeration was not clean, so this proves nothing"
+            )
+            assert twitch.deleted == [chat_id], (
+                "the surviving chat subscription of an undesired partial "
+                "channel was never reclaimed"
+            )
+            assert pool._slots == {}
+            assert pool._by_subscription == {}
+            assert pool.occupancy() == {"0": 0}
+            assert coverage_state(pool, 7) == "absent"
+            assert pool.coverage_counts()["chat_only"] == 0
+
+        asyncio.run(run())
+
+    def test_an_undesired_notification_only_partial_is_reclaimed_too(self):
+        """The symmetric half. §5.4 produces it: Twitch revokes the chat
+        subscription and the auxiliary one survives, so the channel is not
+        actual and cannot be dropped by the ordinary diff either."""
+
+        async def run():
+            fake_redis = FakeRedis()
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            reconciler = make_reconciler(pool, fake_redis, readopt_interval_seconds=0)
+            await pool.start()
+            pool.on_subscriptions_lost = reconciler.invalidate_actual_set
+
+            seed_desired(fake_redis, [("c7", 7)])
+            await reconciler.reconcile_once()
+            connection = pool._connections[0]
+            chat_id = chat_slot(pool, 7).subscription_id
+            notification_id = notification_slot(pool, 7).subscription_id
+
+            await revoke_subscription(pool, chat_id, CHAT_TYPE, 7)
+            assert coverage_state(pool, 7) == "notification_only"
+
+            seed_desired(fake_redis, [])
+            twitch.subscriptions = [
+                notification_subscription(
+                    notification_id, 7, connection.websocket.session_id
+                )
+            ]
+
+            await reconciler.reconcile_once()
+
+            assert reconciler._adoption_complete is True
+            assert twitch.deleted == [notification_id], (
+                "the surviving auxiliary subscription of an undesired partial "
+                "channel was never reclaimed"
+            )
+            assert pool._slots == {}
+            assert pool.occupancy() == {"0": 0}
+            assert coverage_state(pool, 7) == "absent"
+            assert pool.coverage_counts()["notification_only"] == 0
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize("failing_type", [CHAT_TYPE, NOTIFICATION_TYPE])
+    def test_a_partial_channel_is_never_dropped_on_an_incomplete_walk(
+        self, failing_type
+    ):
+        """The safety invariant reclamation must not cost (NFR-003).
+
+        "Extra" only means extra when the whole picture was seen. A half-
+        finished enumeration must hold partial-channel drops back exactly as
+        it holds ordinary drops back.
+        """
+
+        async def run():
+            fake_redis = FakeRedis()
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            reconciler = make_reconciler(pool, fake_redis, readopt_interval_seconds=0)
+
+            connection = await self._partial_create(pool, reconciler, fake_redis, 7)
+            chat_id = chat_slot(pool, 7).subscription_id
+            assert coverage_state(pool, 7) == "chat_only"
+
+            seed_desired(fake_redis, [])
+            twitch.subscriptions = [
+                existing_subscription(chat_id, 7, connection.websocket.session_id)
+            ]
+            twitch.list_errors[failing_type] = eventsub_pool.TwitchAPIException(
+                "helix 500"
+            )
+
+            await reconciler.reconcile_once()
+
+            assert reconciler._adoption_complete is False
+            assert twitch.deleted == [], (
+                "a partial channel was reclaimed on the strength of a "
+                "half-finished walk"
+            )
+            assert chat_slot(pool, 7) is not None
+            assert coverage_state(pool, 7) == "chat_only"
+            assert pool.occupancy() == {"0": 1}
+
+        asyncio.run(run())
+
+    def test_partial_channel_handles_offers_drop_only_handles(self):
+        """The minimal explicit API, and its exact boundary.
+
+        Only the two ordinary partial states are droppable. A `complete`
+        channel and a `degraded_chat_only` one are both ACTUAL -- `list()`
+        yields them, so the ordinary diff already drops them when they leave
+        the desired set, and reporting them here would give the reconciler two
+        routes to the same delete and would evict the live chat of a channel
+        inside its bounded hold-off (I1, I17).
+        """
+
+        async def run():
+            clock = FakeMonotonicMs()
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch, monotonic_ms=clock)
+            await pool.start()
+            connection = await pool._grow()
+            session = connection.websocket.session_id
+
+            await pool.create(1)                                   # complete
+            await make_chat_only(pool, 2, connection=connection)   # chat_only
+            await make_degraded(pool, 3, connection=connection)    # degraded
+            await pool.create(4)
+            notification_id = notification_slot(pool, 4).subscription_id
+            await revoke_subscription(
+                pool, chat_slot(pool, 4).subscription_id, CHAT_TYPE, 4
+            )                                                      # notification_only
+
+            assert coverage_state(pool, 1) == "complete"
+            assert coverage_state(pool, 2) == "chat_only"
+            assert coverage_state(pool, 3) == "degraded_chat_only"
+            assert coverage_state(pool, 4) == "notification_only"
+
+            handles = pool.partial_channel_handles()
+
+            assert handles == {
+                2: chat_slot(pool, 2).subscription_id,
+                4: notification_id,
+            }, "the drop-only handle set is not the two ordinary partial states"
+
+            # And `list()`'s contract is untouched: only complete and
+            # active-degraded channels count as actual for desired coverage.
+            twitch.subscriptions = [
+                existing_subscription(chat_slot(pool, 1).subscription_id, 1, session),
+                notification_subscription(
+                    notification_slot(pool, 1).subscription_id, 1, session
+                ),
+                existing_subscription(chat_slot(pool, 2).subscription_id, 2, session),
+                existing_subscription(chat_slot(pool, 3).subscription_id, 3, session),
+                notification_subscription(notification_id, 4, session),
+            ]
+            actual = {sub.broadcaster_id async for sub in pool.list()}
+
+            assert actual == {1, 3}, (
+                "list() started reporting partial channels as actual, which "
+                "stops the repair path"
+            )
+            assert actual.isdisjoint(handles), (
+                "a channel was both actual and droppable-as-partial"
+            )
+
+        asyncio.run(run())
+
+    def test_a_partial_handle_deletes_the_channel_it_names(self):
+        """Whatever type the handle belongs to, `delete()` already means
+        "drop this CHANNEL", so the reclamation needs no second delete path."""
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            connection = await pool._grow()
+            await make_chat_only(pool, 2, connection=connection)
+            chat_id = chat_slot(pool, 2).subscription_id
+
+            handles = pool.partial_channel_handles()
+            assert handles == {2: chat_id}
+
+            for broadcaster_id, handle in handles.items():
+                await pool.delete(handle)
+                assert coverage_state(pool, broadcaster_id) == "absent"
+
+            assert twitch.deleted == [chat_id]
+            assert pool._slots == {}
+            assert pool.occupancy() == {"0": 0}
+            assert pool.partial_channel_handles() == {}
+
+        asyncio.run(run())
+
+
+class TestAuxiliaryRefusalReconnectOnTheDeployedPath:
+    """T016 / T024 / FR-001, NFR-003, I17 -- "immediately on reconnect".
+
+    `_refresh_slots()` clears the hold-off when it sees a replaced session --
+    but it only runs inside `create()`, and `create()` only runs for a channel
+    the reconciler does NOT already hold. A degraded channel is reported as
+    actual for the whole hold-off, precisely so the reconciler does not
+    hot-loop on it, so the reconciler never calls `create()` for it and
+    nothing on the deployed path ever notices the reconnect.
+
+    The unit tests above prove the clause by calling `pool.create()` directly,
+    which the reconciler will not do for this channel. These drive
+    `Reconciler.reconcile_once()` instead, which is where I17's "immediately"
+    has to hold: otherwise the channel sits degraded for the full hour after a
+    reconnect that has already made it repairable.
+    """
+
+    @staticmethod
+    async def _degrade_through_the_reconciler(pool, reconciler, fake_redis):
+        connection = pool._connections[0] if pool._connections else await pool._grow()
+        websocket = connection.websocket
+        websocket.raise_on_subscribe_by_type[NOTIFICATION_TYPE] = refusal_error()
+        try:
+            seed_desired(fake_redis, [("c7", 7)])
+            await reconciler.reconcile_once()
+        finally:
+            # The refusal was specific to the session that is about to go.
+            websocket.raise_on_subscribe_by_type.pop(NOTIFICATION_TYPE, None)
+        assert coverage_state(pool, 7) == "degraded_chat_only"
+        assert reconciler._actual == {7: chat_slot(pool, 7).subscription_id}, (
+            "the degraded channel was not actual, so this is not the case "
+            "under test"
+        )
+        return connection
+
+    @staticmethod
+    def _reconnect_the_live_half(twitch, connection, session_id):
+        """A websocket reconnect: new session, the library resubscribes.
+
+        No `pool.create()` here on purpose -- the whole point is that the
+        deployed path never calls it for a channel it counts as actual.
+        """
+        websocket = connection.websocket
+        websocket.reconnect(session_id)
+        websocket.rotate_ids()
+        rotated_chat = rotated_id_of(websocket, CHAT_TYPE)
+        twitch.subscriptions = [
+            existing_subscription(rotated_chat, 7, websocket.session_id)
+        ]
+        return rotated_chat
+
+    def test_a_reconnect_clears_the_hold_off_on_the_next_ordinary_pass(self):
+        async def run():
+            fake_redis = FakeRedis()
+            twitch = FakePoolTwitch()
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(twitch=twitch, monotonic_ms=clock)
+            reconciler = make_reconciler(pool, fake_redis, readopt_interval_seconds=0)
+
+            connection = await self._degrade_through_the_reconciler(
+                pool, reconciler, fake_redis
+            )
+            self._reconnect_the_live_half(
+                twitch, connection, "session-after-reconnect"
+            )
+            clock.advance_seconds(5)
+
+            await reconciler.reconcile_once()
+
+            assert pool.channel_coverage(7).auxiliary_refused_until_ms is None, (
+                "the reconnect did not clear the hold-off, so the channel "
+                "stays degraded for the rest of the hour"
+            )
+            assert coverage_state(pool, 7) != "degraded_chat_only"
+
+        asyncio.run(run())
+
+    def test_the_reconnected_channel_is_repaired_without_waiting_out_the_hour(self):
+        async def run():
+            fake_redis = FakeRedis()
+            twitch = FakePoolTwitch()
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(twitch=twitch, monotonic_ms=clock)
+            reconciler = make_reconciler(pool, fake_redis, readopt_interval_seconds=0)
+
+            connection = await self._degrade_through_the_reconciler(
+                pool, reconciler, fake_redis
+            )
+            websocket = connection.websocket
+            started_ms = clock.now_ms
+            assert listen_calls_of(websocket, NOTIFICATION_TYPE) == [], (
+                "the refused create should have left no successful listen"
+            )
+
+            self._reconnect_the_live_half(
+                twitch, connection, "session-after-reconnect"
+            )
+            clock.advance_seconds(5)
+
+            await reconciler.reconcile_once()
+
+            assert len(listen_calls_of(websocket, NOTIFICATION_TYPE)) == 1, (
+                "the notification create was not attempted on the pass after "
+                "the reconnect"
+            )
+            assert coverage_state(pool, 7) == "complete"
+            assert pool.channel_coverage(7).auxiliary_refused_until_ms is None
+            assert reconciler._actual[7] == chat_slot(pool, 7).subscription_id
+            assert clock.now_ms - started_ms < (
+                eventsub_pool.AUXILIARY_REFUSAL_RETRY_SECONDS * 1000
+            ), "the repair only happened because the hour ran out"
+
+        asyncio.run(run())
+
+    def test_without_a_reconnect_the_hold_off_still_holds_the_pass_off(self):
+        """The control. Nothing above may be achieved by weakening the
+        hold-off itself: an untouched degraded channel must still suppress
+        auxiliary creates and stay actual (D2, I17)."""
+
+        async def run():
+            fake_redis = FakeRedis()
+            twitch = FakePoolTwitch()
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(twitch=twitch, monotonic_ms=clock)
+            reconciler = make_reconciler(pool, fake_redis, readopt_interval_seconds=0)
+
+            connection = await self._degrade_through_the_reconciler(
+                pool, reconciler, fake_redis
+            )
+            twitch.subscriptions = [
+                existing_subscription(
+                    chat_slot(pool, 7).subscription_id,
+                    7,
+                    connection.websocket.session_id,
+                )
+            ]
+            clock.advance_seconds(60)
+
+            await reconciler.reconcile_once()
+
+            assert coverage_state(pool, 7) == "degraded_chat_only"
+            assert listen_calls_of(connection.websocket, NOTIFICATION_TYPE) == [], (
+                "the reconciler hot-looped on a refusal it cannot fix"
+            )
+            assert reconciler._actual == {7: chat_slot(pool, 7).subscription_id}
+            assert twitch.deleted == [], "a degraded channel lost its live chat"
+
+        asyncio.run(run())
+
+
+class TestPoolCapacityUnits:
+    """T017 / FR-014, FR-015 -- subscriptions and channels are not the same unit."""
+
+    def test_one_session_holds_a_hundred_and_fifty_complete_channels(self):
+        async def run():
+            pool = make_dual_pool()
+            for broadcaster_id in range(1, 151):
+                await pool.create(broadcaster_id)
+
+            assert len(pool._connections) == 1
+            assert pool.occupancy() == {"0": SUBSCRIPTIONS_PER_CONNECTION}
+            assert pool.coverage_counts().get("complete") == 150
+
+        asyncio.run(run())
+
+    def test_the_hundred_and_fifty_first_channel_routes_onward(self):
+        async def run():
+            pool = make_dual_pool()
+            for broadcaster_id in range(1, 152):
+                await pool.create(broadcaster_id)
+
+            assert len(pool._connections) == 2
+            assert sum(pool.occupancy().values()) == 302
+            assert all(
+                count <= SUBSCRIPTIONS_PER_CONNECTION
+                for count in pool.occupancy().values()
+            )
+
+        asyncio.run(run())
+
+    def test_four_hundred_channels_use_eight_hundred_of_nine_hundred(self):
+        async def run():
+            pool = make_dual_pool()
+            for broadcaster_id in range(1, 401):
+                await pool.create(broadcaster_id)
+
+            subscriptions = sum(pool.occupancy().values())
+            assert subscriptions == 800
+            assert eventsub_pool.MAX_SUBSCRIPTIONS == 900
+            assert eventsub_pool.MAX_SUBSCRIPTIONS - subscriptions == 100, (
+                "the adoption and reconnect headroom is gone"
+            )
+            assert len(pool._connections) <= eventsub_pool.MAX_CONNECTIONS
+            assert all(
+                count <= SUBSCRIPTIONS_PER_CONNECTION
+                for count in pool.occupancy().values()
+            )
+            assert pool.coverage_counts().get("complete") == 400
+
+        asyncio.run(run())
+
+    def test_the_four_hundred_and_first_candidate_is_not_admitted(self):
+        """Refused at the INTENT layer, so the transport is never asked for an
+        801st subscription. With a zero-width band the retained set cannot
+        carry an extra channel either."""
+
+        ranked = [f"c{index}" for index in range(1, 402)]
+
+        fresh = compute_desired_set(ranked, {}, 400, 400)
+        assert len(fresh) == 400
+        assert "c401" not in fresh
+
+        retained = compute_desired_set(ranked, {"c401": 401}, 400, 400)
+        assert len(retained) == 400
+        assert "c401" not in retained, (
+            "the previous set carried a 401st channel past the ceiling, which "
+            "is 802 subscriptions"
+        )
+
+    def test_occupancy_counts_subscriptions_and_coverage_counts_channels(self):
+        async def run():
+            pool = make_dual_pool()
+            for broadcaster_id in range(1, 11):
+                await pool.create(broadcaster_id)
+
+            assert sum(pool.occupancy().values()) == 20
+            counts = pool.coverage_counts()
+            assert counts.get("complete") == 10
+            assert sum(counts.values()) == 10, (
+                "a channel was counted once per subscription"
+            )
+
+        asyncio.run(run())
+
+    def test_a_degraded_channel_is_one_channel_and_one_subscription(self):
+        async def run():
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(monotonic_ms=clock)
+            await pool._grow()
+            await make_degraded(pool, 7)
+            await pool.create(8)
+
+            assert sum(pool.occupancy().values()) == 3
+            counts = pool.coverage_counts()
+            assert counts.get("degraded_chat_only") == 1
+            assert counts.get("complete") == 1
+            assert sum(counts.values()) == 2
+
+        asyncio.run(run())
+
+    def test_coverage_states_are_reported_separately(self):
+        """FR-015's gauge has to say WHICH half is missing, per channel."""
+
+        async def run():
+            pool = make_dual_pool()
+            await pool.start()
+            await pool._grow()
+            await pool.create(1)
+            await make_chat_only(pool, 2)
+            await pool.create(3)
+            await pool._on_revocation({
+                "subscription": {
+                    "id": chat_slot(pool, 3).subscription_id,
+                    "type": CHAT_TYPE,
+                    "status": "authorization_revoked",
+                    "condition": {"broadcaster_user_id": "3"},
+                }
+            })
+            await asyncio.sleep(0)
+
+            counts = pool.coverage_counts()
+            assert counts.get("complete") == 1
+            assert counts.get("chat_only") == 1
+            assert counts.get("notification_only") == 1
 
         asyncio.run(run())
 
