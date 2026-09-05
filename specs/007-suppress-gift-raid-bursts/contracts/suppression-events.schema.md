@@ -21,11 +21,77 @@ records already on the topic.
 | Name | `suppression-events` | New topic; `chat-messages` stays frozen (spec 004 FR-008) |
 | Key | `str(broadcaster_id).encode("utf-8")` | Same keying convention as `chat-messages` and `stream-lifecycle`; keeps a channel's notices in one partition and in order. **Set and verified at the producer**: the Flink consumer deserializes values only and never sees the key (§4.0) |
 | Value | UTF-8 JSON, one object per notice | Matches every other topic in this system |
-| Partitions | **4** | Must equal `FLINK_PARALLELISM` so every source subtask owns exactly one split and split idleness is well defined (research §4.1) |
+| Partitions | **4** | Must equal `FLINK_PARALLELISM` so every source subtask owns exactly one split and split idleness is well defined (research §4.1). Because watermarks and idleness are emitted by the post-source assignment operator (§1.1.1), the assignment operator's parallelism must equal this count as well |
 | Replication factor | 1 | Single-broker development stack, as with the existing topics |
 | Retention | 1 hour (`retention.ms=3600000`) | A notice is actionable for at most 180 s; matching `chat-messages` retention keeps replay debugging possible without storing an operational log indefinitely |
 | Produced by | `stream-monitoring` only | |
 | Consumed by | Flink clip detector, `KafkaOffsetsInitializer.latest()` | Old notices must never be replayed into event time (research D4) |
+
+### 1.1 Source timestamp and watermark rules
+
+`SuppressionTimestampAssigner` runs before `process_element2` and MUST enforce
+the same fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` contract against the
+same injectable/current receipt/source wall-clock basis:
+
+```text
+parsed occurred_at_ms <= source_clock_ms + 30_000
+    => assigned event timestamp = occurred_at_ms
+otherwise
+    => assigned event timestamp = Kafka record_timestamp
+```
+
+The fallback already used for missing or unreadable occurrence time therefore
+also applies to a parsed over-bound value. Equality is trusted; +30,001 ms is
+not. This substitution protects watermark generation only: the deserialized
+record/payload MUST remain unchanged, and no source filter may drop it. The
+operator must still receive and reject the original value under §4 so
+`reason="fields"` and the existing structured warning remain visible.
+
+#### 1.1.1 Where the assigner MUST be attached (PyFlink 1.18)
+
+The rules above are only effective if the assigner actually executes.
+`StreamExecutionEnvironment.from_source()` in PyFlink 1.18 forwards only
+`watermark_strategy._j_watermark_strategy`, so a Python `TimestampAssigner`
+attached with `.with_timestamp_assigner(...)` is **silently discarded** when the
+strategy is passed to `from_source`; event time then degrades to the Kafka
+record timestamp for every record and §1.1 never runs.
+
+The consumer job MUST therefore wire each stream as:
+
+```text
+stream = env.from_source(kafka_source, WatermarkStrategy.no_watermarks(), name)
+stream = stream.assign_timestamps_and_watermarks(real_strategy)
+```
+
+where `real_strategy` carries the bounded out-of-orderness, the idleness
+timeout, and the Python assigner. Requirements:
+
+1. `real_strategy` MUST be built in the exact binding order bounded
+   out-of-orderness → `with_idleness(...)` →
+   `with_timestamp_assigner(...)` last. PyFlink 1.18's `with_idleness()`
+   returns a fresh wrapper and drops a Python `_timestamp_assigner` stored
+   before it.
+2. The `no_watermarks()` placeholder MUST NOT be the effective strategy of any
+   stream: the real strategy is attached immediately and unconditionally.
+3. This applies to **both** the `chat-messages` and `suppression-events`
+   streams. `chat-messages` event time is `sent_at`; `suppression-events` event
+   time is the §1.1 result. The gate compares a chat peak second with a
+   suppression interval, so both MUST be on Twitch's clock; correcting one
+   stream alone is a contract violation, not a partial fix. Symmetrically, the
+   chat assigner accepts only plain-integer (not boolean) `sent_at` through the
+   same fixed +30-second source-clock bound. Missing/null, string, float, bool,
+   and over-bound chat values use Kafka `record_timestamp` without rewriting,
+   rejecting, or dropping the chat payload.
+4. Idleness is consequently generated per assignment subtask, not per Kafka
+   split. That is equivalent to the per-split behaviour §1 relies on **only**
+   while topic partitions = source parallelism = assignment parallelism = 4,
+   chained one-to-one with no repartition between source and assigner. Any
+   partition/parallelism mismatch or rescale MUST be revalidated against
+   research §4.1, §4.1.1 and data-model I15/I16 before it ships.
+5. Post-source attachment creates two Python operator stages at parallelism
+   four. A test may assert wiring and builder order against fakes, but no local
+   test may claim the real chain executes either assigner or establish
+   TaskManager Python process count/RSS; that is E3.
 
 ---
 
@@ -63,7 +129,8 @@ not carried.
 | `received_at_ms` | `int \| null` | Optional ingestion clock at the producer. When present, it can split Twitch-to-producer latency from producer-to-consumer latency | **Diagnostic only.** Never used for delivery-health classification, deadline or gate arithmetic, and no consumer logic may depend on its presence |
 | `viewer_count` | `int \| null` | Present only for `raid`; `null` otherwise. Kept because the operator tuning question "should raid windows scale with audience?" was answered *no* (decision 1) and the data to revisit it must be visible on the topic rather than requiring a producer change | **Must not be read by any consumer logic.** Raid audience size never affects window duration (FR-006). A consumer test asserts that changing it changes nothing |
 
-At `process_element2` receipt, the consumer captures
+The source timestamp assignment in §1.1 occurs first. At `process_element2`
+receipt, the consumer captures
 `consumer_receipt_ms` from its injected clock in tests and the current consumer
 clock at runtime. After schema and field decode, it first enforces the fixed
 contract constant `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS = 30`:
@@ -151,7 +218,8 @@ enforcement point.
 ## 4. Consumer rules
 
 The consumer runs inside `AnomalyDetector.process_element2`, on the keyed
-suppression input.
+suppression input, after §1.1 has assigned a watermark-safe event timestamp.
+Source assignment does not validate or rewrite the payload.
 
 ### 4.0 The consumer cannot see the Kafka key
 
@@ -198,7 +266,9 @@ Three rules follow, and they are binding on the task list:
    `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30`. Reject one millisecond beyond with
    `reason="fields"` and a structured malformed-record log. Do not observe
    delivery age, increment a consumed lag class, read state, or write state for
-   that record. Equality passes; accepted future skew is handled by rule 5.
+   that record. This check reads the original payload occurrence time even when
+   §1.1 assigned Kafka record time upstream; source fallback never turns the
+   record valid. Equality passes; accepted future skew is handled by rule 5.
 5. **Delivery-health classification, on trusted receipt only.** For each
    record that passed rule 4, compute
    `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`, observe
@@ -258,10 +328,30 @@ Three rules follow, and they are binding on the task list:
 7. A record never carries chat message text or a chatter identity.
 8. Version 1 consumers ignore unknown `schema_version` values; a version 2 must
    therefore only ever be introduced alongside a consumer that accepts both.
-9. `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS` is fixed at 30. A field-valid record
-   at the bound is accepted with age zero and a skew diagnostic; one
-   millisecond beyond is rejected as malformed fields before any delivery
-   observation or state access.
+9. `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS` is fixed at 30 and enforced at both
+   source timestamp assignment and operator validation using the same
+   injectable/current receipt/source wall-clock basis. A field-valid record at
+   the bound uses `occurred_at_ms` as event time and is accepted with age zero
+   and a skew diagnostic. One millisecond beyond uses Kafka
+   `record_timestamp` for event time without payload rewriting, then is
+   rejected from the original payload as malformed fields before any delivery
+   observation or state access. Untrusted occurrence time therefore cannot
+   advance the suppression watermark using that value or create state.
+10. Replay applies the source timestamp rule before downstream validation and
+    rejection, and its combined watermark remains monotonic. It must not model
+    an over-bound record as first advancing event time and only later becoming
+    invalid.
+11. The timestamp rules in §1.1 are effective only when the real
+    `WatermarkStrategy` is attached with
+    `DataStream.assign_timestamps_and_watermarks()` after
+    `env.from_source(source, WatermarkStrategy.no_watermarks(), ...)`, on both
+    the chat and suppression streams (§1.1.1). A Python assigner passed to
+    `from_source` is silently ignored by PyFlink 1.18 and event time becomes
+    the Kafka record timestamp, which makes §1.1, the chat `sent_at` contract,
+    and the shared-clock assumption behind the gate all false at once. Before
+    attachment, both real strategies must also be built bounded
+    out-of-orderness → idleness → assigner last; reversing the last two calls
+    lets `with_idleness()` discard the Python assigner.
 
 ---
 

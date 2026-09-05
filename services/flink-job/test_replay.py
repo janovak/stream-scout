@@ -539,6 +539,29 @@ class TestMergedSuppressionReplay:
             for observation in result["delivery_observations"]
         )
 
+    def test_rejected_future_time_cannot_advance_the_source_watermark(self):
+        receipt_ms = 2_000_000
+        poisoned = receipt_ms + (
+            SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        ) + 1
+        result = run_merged(
+            [
+                suppression_delivery(
+                    22,
+                    "raid",
+                    poisoned,
+                    delivered_at_ms=receipt_ms,
+                )
+            ]
+        )
+
+        assert result["suppression_rejections"] == [
+            {"delivery_index": 0, "reason": SUPPRESSION_REJECT_FIELDS}
+        ]
+        assert result["watermark_trace"][0]["suppression_watermark_ms"] == (
+            receipt_ms - WATERMARK_OUT_OF_ORDERNESS_MS - 1
+        )
+
 
 class TestOutputOnlySuppressionReplay:
     def test_gated_and_ungated_runs_have_identical_detector_state(self):

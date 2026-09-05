@@ -8,6 +8,10 @@ questions.
 Decisions 17-21 were taken during a later remediation pass over the artifacts.
 Decisions 22-23 are implementation-review corrections that clarify earlier
 window and timestamp decisions before their code changes landed.
+Decisions 24-25 are final code-review corrections to event-time handling,
+taken before their code changes landed. Decision 26 is final code-review
+hardening after making the Python assigners effective exposed the remaining
+builder-order and chat-watermark risks.
 Where a remediation decision replaces an earlier one, the earlier entry is
 marked **superseded** and left in place with its original text rather than being
 rewritten, so the reasoning that led to the replacement stays readable.
@@ -711,3 +715,186 @@ T046, T047, and T050. Over-bound records increment
 malformed log, fail open, and produce neither a delivery observation nor a
 state write. E4 remains deployed evidence for real timestamp and delivery-age
 behavior.
+
+## 24. Future-time trust before source watermark generation
+
+**Question**: Where must the fixed future-time trust boundary be enforced when
+the source timestamp assigner runs before `process_element2`?
+
+| Option | Description |
+|--------|-------------|
+| A | Clamp to Kafka record timestamp at the source for missing, unreadable, or over-bound occurrence time, retain the original payload, and keep downstream rejection in `process_element2`. |
+| B | Drop or filter an over-bound record upstream before it reaches the operator. |
+| C | Keep downstream-only validation and let the source assign every parsed `occurred_at_ms`. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: Option C is unsafe watermark poisoning.
+`SuppressionTimestampAssigner` sees `occurred_at_ms` before the operator can
+reject it, so a far-future value can irreversibly advance the source watermark.
+After a later chat-idle period, that value can jump the connected operator
+watermark and permanently stall real-time timers when chat resumes. Option B
+protects event time but loses the existing downstream `reason="fields"`
+counter/warning and complicates the source with filtering responsibility.
+Option A applies the existing fixed
+`SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` at both layers using the same
+injectable/current receipt/source wall-clock basis. The source uses Kafka
+`record_timestamp` only for watermark assignment; it does not rewrite or
+validate the payload. `process_element2` therefore still rejects the original
+over-bound value with the existing warning and no delivery observation or
+state access.
+
+The boundary is exact: +30,000 ms uses `occurred_at_ms` as event time and is
+accepted downstream; +30,001 ms uses Kafka record time upstream and is rejected
+downstream. Missing/unreadable occurrence time keeps its existing Kafka-record
+fallback. Replay must perform source assignment before downstream rejection
+and keep the combined watermark monotonic.
+
+**Stage**: Final code review correction.
+
+**Impact**: Clarifies decision 23 without changing the fixed constant or adding
+configuration, dependencies, or a new protocol. Amends FR-017/NFR-005/SC-010,
+research D4/D13 and R3/R12, data-model I21, the contract's source and consumer
+rules, the plan topology, quickstart A3/A4/E3/E4, existing tasks T038/T041/T050/
+T058, checklist CHK020/CHK031/CHK035, and OPERATIONS diagnostics and E3/E4.
+E1-E5 remain pending. Until implementation and deployment apply the source
+check, the currently deployed path remains vulnerable to watermark poisoning.
+
+## 25. Where the Python timestamp assigners actually run
+
+**Question**: Decision 24 places the future-time trust check inside
+`SuppressionTimestampAssigner`, and the chat path has assigned `sent_at`
+through `SentAtTimestampAssigner` since Feature 004. Verification against the
+PyFlink 1.18 source shows neither assigner runs at all as currently wired:
+`StreamExecutionEnvironment.from_source()`
+(`pyflink/datastream/stream_execution_environment.py`) forwards only
+`watermark_strategy._j_watermark_strategy` into the Java `fromSource` call. A
+Python `TimestampAssigner` attached with `.with_timestamp_assigner(...)` is
+held on the Python-side `WatermarkStrategy` object only, and is installed into
+an executable operator solely by
+`DataStream.assign_timestamps_and_watermarks()`
+(`pyflink/datastream/data_stream.py`), which wraps the stream in a Python
+timestamp-assigner/watermark-generator operator. Passed to `from_source` it is
+silently ignored — no error, no warning. Event time on both sources is
+therefore the Kafka record timestamp today, not Twitch's clock. Where must
+assignment be attached so the intended event time is real?
+
+| Option | Description |
+|--------|-------------|
+| A | Build each `KafkaSource` with `WatermarkStrategy.no_watermarks()` in `env.from_source(...)`, then call `.assign_timestamps_and_watermarks(real_strategy)` on the returned `DataStream`, for **both** the chat and suppression sources. |
+| B | Keep source-level assignment and supply a Java `TimestampAssignerSupplier` so the strategy handed to `from_source` carries a working assigner. |
+| C | Leave the current wiring; accept Kafka record time as event time and retire the assigners. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: Option C is the status quo and is a silent contract violation.
+Feature 004 states that the detector buckets on `sent_at`, and Feature 007
+states that suppression intervals are bounded by `occurred_at_ms`; under the
+current wiring both use broker ingestion time, `SuppressionTimestampAssigner`
+is unreachable dead code, and decision 24's entire source-side protection would
+never execute. Option B would work, but it introduces a Java class and a
+JVM-side build surface that this repository does not have, for a problem the
+Python DataStream API already solves in one call; it is a large new surface
+against the "no new module or dependency" constraint.
+
+Option A is the documented PyFlink idiom and keeps every value already fixed by
+D4 and D16: bounded out-of-orderness, `SUPPRESSION_IDLENESS_SECONDS = 5` below
+chat's 10 s, `latest()` offsets, four partitions, and Python assigners carrying
+the +30 s source trust fallback. The strategy handed to `from_source` becomes
+`no_watermarks()` **only** because watermark generation moves one operator
+downstream; it is not the rejected `no_watermarks()` end state D4 forbids,
+because the real strategy is attached immediately and unconditionally to the
+resulting stream. **Amendment by decision 26:** “carrying” the assigner also
+requires an exact builder order. In PyFlink 1.18, `with_idleness()` returns a
+fresh Python `WatermarkStrategy` wrapper and does not copy an assigner already
+stored in `_timestamp_assigner`. Both real strategies must therefore be built
+as bounded out-of-orderness → `with_idleness(...)` →
+`with_timestamp_assigner(...)` **last**. Reversing the final two calls silently
+drops the Python assigner even though the post-source attachment is correct.
+
+The correction is applied to **both** streams, not only to suppression. Feature
+007 requires the peak second and the suppression interval to be compared on
+Twitch's shared clock (research §4.3). Fixing suppression alone would leave
+chat bucketed on Kafka ingestion time and suppression bounded on
+`occurred_at_ms`, i.e. a clock mismatch between the two sides of the very
+comparison the gate performs — worse than the uniform mismatch that exists now.
+
+One property genuinely changes and is re-derived rather than assumed.
+Idleness was previously generated inside the Kafka source, per split; it is now
+generated by the post-source assignment operator, per parallel subtask. The
+safety argument in §4.1 depended on "one split per subtask", so it must be
+restated on subtasks: the checked-in topology has topic partitions = source
+parallelism = assignment/operator parallelism = 4, and the source-to-assigner
+edge is a one-to-one forward chain, so each assignment subtask observes exactly
+the records of exactly one split. Per-subtask idleness is therefore equivalent
+to per-split idleness under the checked-in topology, and the I15/I16 bounds are
+unchanged. This equivalence is conditional: any future partition/parallelism
+mismatch, rescale, or repartition between source and assigner breaks it and
+requires revalidation. E3 remains the deployed proof; nothing here may be
+claimed from local stub tests.
+
+**Stage**: Final code review correction.
+
+**Impact**: Clarifies decisions 23-24 and research D4/D16 without changing any
+fixed constant, threshold, dependency, environment variable, configuration
+value, or file inventory. Amends FR-003/FR-017, research §4.1/§4.5/D4/R3/R12
+and new R13, data-model I15/I21 and new I22, contract §1.1 and §5, the plan
+topology and change table, quickstart A3/A4/B5, existing tasks
+T038/T041/T045/T050/T058, checklist CHK019/CHK020/CHK021/CHK035, and OPERATIONS
+diagnostics, E3/E4, and the deployment invariant. The chat source is touched
+for the same reason, so Feature 004's `sent_at` contract becomes true in
+practice rather than only on paper. E1-E5 remain pending; until this lands and
+is deployed, the running job uses Kafka record time on both inputs and
+decision 24's source-side trust check does not execute.
+
+## 26. Chat event-time trust and strategy-builder order
+
+**Question**: Making `SentAtTimestampAssigner` executable exposes two
+previously non-blocking hazards. PyFlink 1.18's `with_idleness()` returns a
+fresh wrapper without a previously stored Python `_timestamp_assigner`, so
+builder order can silently undo decision 25. The now-live chat assigner would
+also accept Python `bool` as an `int` and trust arbitrary future `sent_at`
+values, allowing one chat record to poison the binding input watermark. How
+must both paths be hardened?
+
+| Option | Description |
+|--------|-------------|
+| A | Build both real strategies in the exact order bounded out-of-orderness → idleness → Python timestamp assigner last; on chat, accept only a plain `int` (not `bool`) at or before `source_clock_ms + 30_000`, otherwise use Kafka `record_timestamp` for event time while preserving the chat record. |
+| B | Preserve post-source attachment but leave chat time unbounded and accept Python's `bool`-is-`int` behavior. |
+| C | Reject or drop chat records with missing, malformed, or over-future `sent_at`. |
+
+**Selection**: Option A — selected autonomously.
+
+**Rationale**: Post-source attachment is necessary but not sufficient:
+`with_idleness()` called after `with_timestamp_assigner()` discards the
+Python-side assigner with no error. Requiring the assigner call last makes both
+chat and suppression strategies effective. Once chat uses payload time, leaving
+it unbounded creates a new active risk because chat is normally the binding
+watermark input; a corrupt far-future `sent_at` can irreversibly advance it.
+The already fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` source-event-time
+bound is symmetric, requires no new configuration, and keeps the two inputs on
+the same trust model. A plain `int` check explicitly excludes `bool`; missing,
+null, string, float, boolean, and over-bound values all fall back to Kafka
+`record_timestamp`. Equality at +30,000 ms is accepted and +30,001 ms falls
+back.
+
+Option C violates the existing chat no-data-loss contract. Unlike suppression,
+the chat payload is never rejected or dropped downstream because of
+`sent_at`; only its assigned event timestamp falls back. This preserves chat
+counting and command handling while preventing the binding chat watermark from
+being poisoned.
+
+The post-source assignment creates two additional Python operator stages, one
+per input, each at parallelism four under the checked-in topology. Their real
+TaskManager Python process-count and RSS impact is deployed evidence only; no
+local test or static job-graph assertion may claim it.
+
+**Stage**: Final code review hardening.
+
+**Impact**: Amends decision 25; research §4.1.2/§4.3, R12-R13 and new R14;
+data-model I22 and new I23; the suppression contract's chat-symmetry
+cross-reference; plan topology; quickstart A3/E3; existing tasks
+T038/T041/T045/T058; existing checklist items; and OPERATIONS E3 clock,
+watermark, Python-process, and RSS checks. No task ID, dependency, environment
+variable, runtime dependency, schema, or payload-drop behavior is added.
+T058 and deployed evidence E1-E5 remain pending.

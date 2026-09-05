@@ -178,8 +178,17 @@ Required assertions:
 5. **Malformed records** — bad JSON, unknown `schema_version`, wrong field
    types, and `occurred_at_ms` one millisecond beyond
    `consumer_receipt_ms + 30_000`: each ignored, counted, and never raised.
-   The over-future case is checked after decode/field validation and produces
-   no delivery observation and no state write.
+   Before watermark generation, the source timestamp assigner uses
+   `occurred_at_ms` at exactly `source_clock_ms + 30_000`, but uses Kafka
+   `record_timestamp` for +30,001 ms and for missing/unreadable values without
+   rewriting the payload. The over-future original payload is then checked
+   after decode/field validation and produces the existing `reason="fields"`
+   warning/count, no delivery observation, and no state access.
+   Separately, the chat timestamp assigner accepts only plain `int` (not
+   `bool`) `sent_at` through `source_clock_ms + 30_000`. Missing/null, string,
+   float, bool, and +30,001 ms values use Kafka `record_timestamp` for event
+   time while the original chat record continues through the pipeline; no chat
+   record is rejected or dropped by this fallback.
 6. **Suppression source settings** — the pure `SuppressionSourceSettings`
    construct in `spike_detector.py` names the `suppression-events` topic,
    `latest()` starting offsets, bounded out-of-orderness equal to
@@ -189,8 +198,9 @@ Required assertions:
    fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30`, and
    `checked_in_gating_enabled=False`. `SuppressionConfig.from_env()` remains
    the runtime reader and its gating code default remains `true`; the future
-   trust bound has no environment variable. Asserted here, with no PyFlink
-   import (research D16).
+   trust bound has no environment variable. The timestamp assigner and
+   operator use the same injectable/current receipt/source wall-clock basis.
+   Asserted here, with no PyFlink import (research D16).
 7. **Delivery classification** — capture `consumer_receipt_ms` from an
    injected clock at `process_element2` receipt and classify
    `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`: at or below
@@ -201,6 +211,20 @@ Required assertions:
    clock-skew diagnostic, and one millisecond beyond rejected as malformed
    before observation/state. Optional `received_at_ms` remains diagnostic-only
    (NFR-005, FR-017, research D13).
+8. **Watermark attachment wiring** — where `apache-flink==1.18.0` is already
+   installed, assert against fakes that `clip_detector_job` passes
+   `WatermarkStrategy.no_watermarks()` to `env.from_source` for **both** the
+   chat and suppression sources and then calls
+   `assign_timestamps_and_watermarks(real_strategy)` on each returned stream,
+   with each real strategy built in the exact binding order bounded
+   out-of-orderness → `with_idleness()` → `with_timestamp_assigner()` last.
+   PyFlink 1.18's `with_idleness()` otherwise returns a fresh wrapper and drops
+   an assigner stored earlier (research §4.1.2, decisions 25-26). This is a wiring assertion
+   only. It does **not** show that PyFlink executed the assigner, that
+   watermarks flowed from the assignment operator, or that idleness applied per
+   subtask, nor measure the two added parallelism-four Python stages'
+   TaskManager process/RSS cost; those are E3, and reporting them from this
+   test is a defect.
 
 ### A4. Emission-gating equivalence (the SC-004 check)
 
@@ -243,8 +267,15 @@ Also assert, in the same file:
   remains eligible when its hold reports after the notice; a peak exactly at
   the notice is suppressed, while a peak exactly at the deadline is eligible.
 - **Future trust bound** — a record exactly 30 seconds ahead is accepted with
-  age zero and the skew diagnostic; one millisecond farther ahead is rejected,
-  counted and logged with no delivery sample or state change.
+  its occurrence time assigned upstream, age zero, and the skew diagnostic;
+  one millisecond farther ahead is assigned Kafka record time upstream without
+  payload mutation, then rejected, counted and logged downstream with no
+  delivery sample or state access. Replay performs assignment before rejection
+  and asserts that the combined watermark is monotonic and never advances from
+  the untrusted occurrence value. The harness models the assigner directly, so
+  it also cannot show that the real job reaches its assigner; that depends on
+  the post-source `assign_timestamps_and_watermarks` wiring (A3 item 8) and is
+  proven only by E3.
 
 Determinism is still a hard requirement: running the harness twice over the
 same input must diff empty.
@@ -303,8 +334,11 @@ Part A **cannot** conclude anything about: real Twitch behaviour with mixed
 subscription types, subscription cost, real convergence at 400 channels, the
 actual desired-set churn rate against NFR-007, PyFlink's actual two-input
 watermark and idleness behaviour — including the idle → active re-entry bound,
-which A4 exercises only in the harness's simplified model — delivery lag, or
-whether the window defaults are well tuned. Those are Part B, and reporting
+which A4 exercises only in the harness's simplified model, whether the
+assigner-last builder order and post-source attachment cause the Python
+assigners to run, and the process/RSS cost of the two Python stages, all of
+which A3 item 8 checks only as wiring — delivery lag,
+or whether the window defaults are well tuned. Those are Part B, and reporting
 them as passed from Part A evidence is a defect.
 
 ---
@@ -392,7 +426,7 @@ departed channels.
 
 ### B5. E3 — the watermark gate
 
-Two measurements, both required:
+Four measurements, all required:
 
 1. **Prolonged silence.** With the suppression topic silent for at least one
    hour, confirm chat detection continues and Flink's source watermark lag on
@@ -406,13 +440,32 @@ Two measurements, both required:
    the source returns to idle. This is the idle → active re-entry case
    (research R10, data-model I16); silence alone does not exercise it, and E3 is
    not complete without it.
+3. **An over-future notice cannot poison event time.** With controlled
+   timestamps, deliver a record beyond `source_clock_ms + 30_000`, then let
+   chat idle and resume. Confirm the suppression stream used Kafka record time,
+   the connected operator watermark did not jump to the untrusted occurrence
+   value, remained monotonic, and real-time timers continue after chat resumes.
+4. **The assigners actually run and remain bound after idleness.** Confirm from the deployed job graph and
+   metrics that watermarks originate from the post-source
+   `assign_timestamps_and_watermarks` operator on **both** streams, that chat
+   event time tracks trusted plain-int `sent_at` rather than broker ingestion
+   time, that suppression event time tracks trusted `occurred_at_ms`, and that
+   each strategy retained its assigner after `with_idleness()` because the
+   assigner was bound last. Exercise chat missing/null/string/float/bool and
+   exact +30,000/+30,001 ms cases, confirming fallback uses Kafka record time
+   without losing chat and cannot poison the combined watermark. Confirm each
+   assignment subtask still corresponds to exactly one topic partition at
+   parallelism 4, and record TaskManager Python process count and RSS for the
+   two added Python assignment stages. Without this, measurements 1-3 describe
+   Kafka record time and prove nothing about the intended contract (research
+   §4.1.2, R13-R14, decisions 25-26).
 
-**Do not enable gating until both pass.**
+**Do not enable gating until all four pass.**
 
 ### B6. Enable gating, then E4
 
 Only after E1, E2 — including the full 24-hour churn observation against
-NFR-007 — and both parts of E3 have passed, change the checked-in compose value
+NFR-007 — and all four parts of E3 have passed, change the checked-in compose value
 to `SUPPRESSION_GATING_ENABLED=true` on both Flink blocks and recreate them.
 Then capture a real gift-bomb and raid slice and confirm:
 
@@ -423,7 +476,9 @@ Then capture a real gift-bomb and raid slice and confirm:
   120 s window and well inside `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS = 30`,
   with trusted records classified healthy rather than lagging; over-bound
   future timestamps, if observed, are visible as rejected malformed fields and
-  never appear in this distribution;
+  never appear in this distribution. Confirm the source first used Kafka
+  record time without rewriting the payload, and that `process_element2`
+  rejected the original value with the existing warning;
 - suppressed would-have-clipped spikes whose peaks fall in the half-open
   notice-bounded interval produce both required signals and no clip;
 - clips outside any window, including pre-notice peaks reported later, are
@@ -468,11 +523,12 @@ The topic may be left in place.
 | Sparse idle → active watermark bound, simplified harness model only | A4 | Yes, as the simplified model; **not** as PyFlink runtime behaviour |
 | Configuration values, checked-in `SUPPRESSION_GATING_ENABLED=false`, topic/partition settings | A5 | Yes (as file assertions, not as deployment) |
 | PyFlink operator/topology wiring against fakes | A3 (`test_clip_detector.py`) | Only when the pinned `apache-flink==1.18.0` is already installed; otherwise it is pending, and it is never a substitute for the A3 pure assertions |
+| Assigner-last strategy construction and post-source `assign_timestamps_and_watermarks` attachment on both streams | A3 item 8 | Only as wiring; **not** as proof that the Python assigners execute, that event time follows trusted payload time, or that the two Python stages have an acceptable deployed process/RSS cost |
 | **E1** mixed types live, subscription cost | B2 | **No** |
 | **E2** 400-channel convergence, 800 subscriptions, headroom (SC-006) | B4 | **No** |
 | **E2 churn** 24-hour desired-set churn against the NFR-007 bound (SC-011) | B4 | **No** |
-| **E3** two-input watermark and idleness under a silent topic, **and** the isolated-notice re-entry bound | B5 | **No** |
-| **E4** trusted-record delivery age, malformed-future visibility, real-burst confirmation for SC-003, and notice-bounded window-default tuning/adequacy for SC-005 | B6 | **No** |
+| **E3** two-input watermark/idleness, isolated-notice bound, both streams' exact/type/future fallback behavior without chat loss, proof that assigner-last strategies run post-source with one partition per subtask, and TaskManager Python process-count/RSS impact for the two parallelism-four stages | B5 | **No** |
+| **E4** trusted-record delivery age, downstream malformed-future visibility after source timestamp fallback, real-burst confirmation for SC-003, and notice-bounded window-default tuning/adequacy for SC-005 | B6 | **No** |
 | **E5** rollback rehearsal in the capacity-safe order | B7 | **No** |
 
 Do not mark any Part B item complete from unit tests, fixtures, replay output,

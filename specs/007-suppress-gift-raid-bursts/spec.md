@@ -7,7 +7,11 @@ pass that added NFR-007 and SC-011, bounded the auxiliary-coverage exception in
 FR-001/NFR-003/SC-001, and defined delivery-lag semantics in NFR-005/SC-010
 (see [autonomous-decisions.md](./autonomous-decisions.md) §17-§21), then by an
 implementation-review correction that made windows notice-bounded and added a
-fixed 30-second future-time trust bound (§22-§23)
+fixed 30-second future-time trust bound (§22-§23), then by final code-review
+corrections that apply that bound before source watermark generation as well
+as in the operator (§24), attach the timestamp assigners after `from_source`
+on both streams so they run at all (§25), and preserve the assigners through
+the required builder order while hardening chat event time (§26)
 **Input**: Suppress gift- and raid-driven chat bursts from clip emission while
 preserving complete chat counting, dual notification coverage for every
 monitored channel, and safe operation within existing account capacity.
@@ -233,10 +237,13 @@ and notices at or after the deadline start a new interval at their occurrence.
   time. It cannot create a guessed suppression deadline; the malformed input
   is made operationally visible.
 - A decoded notice claims an occurrence time at most 30 seconds ahead of the
-  consumer receipt clock. It is accepted, its delivery age is clamped to zero,
-  and the existing clock-skew diagnostic is emitted. A notice even one
-  millisecond farther ahead is rejected as malformed fields, counted and
-  logged, and produces no delivery observation or suppression-state write.
+  source/consumer receipt wall clock. At exactly +30,000 ms the source assigns
+  `occurred_at_ms` as event time and the operator accepts it, clamps delivery
+  age to zero, and emits the existing clock-skew diagnostic. At +30,001 ms the
+  source assigns the Kafka record timestamp for watermark purposes, without
+  rewriting the payload, and the operator rejects the original occurrence time
+  as malformed fields, counted and logged, with no delivery observation or
+  suppression-state write.
 
 ## Requirements *(mandatory)*
 
@@ -257,7 +264,17 @@ and notices at or after the deadline start a new interval at their occurrence.
   type that already exists.
 - **FR-003**: Relevant gift and raid notifications MUST produce a suppression
   signal associated with the correct channel and containing the notice
-  category and trustworthy occurrence time.
+  category and trustworthy occurrence time. That occurrence time MUST be the
+  event time the detector actually uses for the suppression interval, and the
+  chat side MUST likewise use its own message timestamp, so both sides of the
+  suppression comparison are evaluated on Twitch's shared clock rather than on
+  a broker ingestion clock. The chat timestamp assigner MUST apply the fixed
+  `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` source-event-time bound and accept
+  only a plain integer (not boolean) `sent_at` at or before
+  `source_clock_ms + 30_000`; missing, null, string, float, boolean, or
+  +30,001 ms values MUST use Kafka record time for event-time assignment
+  without rewriting, rejecting, or dropping the chat message (autonomous
+  decisions 25-26).
 - **FR-004**: One chat-notification coverage type MUST supply both gift and raid
   notices; the feature MUST NOT require separate raid coverage.
 - **FR-005**: Only `community_sub_gift`, `sub_gift`, and `raid` notifications
@@ -307,13 +324,22 @@ and notices at or after the deadline start a new interval at their occurrence.
 - **FR-017**: A malformed suppression input that lacks a trustworthy channel
   identity or occurrence time MUST NOT create a guessed deadline and MUST be
   operationally visible. `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS` MUST be a fixed
-  contract bound of 30 seconds, not an environment setting. After schema and
-  field decoding, a record is trustworthy only when
-  `occurred_at_ms <= consumer_receipt_ms + 30_000`; a record one millisecond
-  beyond that bound MUST be rejected as malformed fields, counted and logged,
-  with no delivery observation and no state write. Accepted future skew within
-  the bound MUST use delivery age zero and emit the existing clock-skew
-  diagnostic.
+  contract bound of 30 seconds, not an environment setting, and MUST be
+  enforced independently at two layers against the same injected/current
+  receipt/source wall-clock basis. Before source watermark generation, a
+  parsed `occurred_at_ms <= source_clock_ms + 30_000` MUST be assigned as event
+  time; a value beyond that bound MUST use the Kafka `record_timestamp`
+  instead, as missing or unreadable occurrence time already does. This source
+  fallback protects event time only: it MUST NOT rewrite the payload or make
+  the record valid. After schema and field decoding, `process_element2` MUST
+  validate the original payload against
+  `occurred_at_ms <= consumer_receipt_ms + 30_000`; one millisecond beyond
+  MUST be rejected as `reason="fields"`, counted and logged, with no delivery
+  observation, state access, or state write. Equality at +30,000 ms uses
+  `occurred_at_ms` as source event time and is accepted downstream with age
+  zero and the existing clock-skew diagnostic; +30,001 ms uses
+  `record_timestamp` upstream and remains operationally visible through
+  downstream rejection.
 - **FR-018**: A suppression signal received after a clip was emitted MUST NOT
   retroactively retract that clip. If the signal establishes a suppression
   interval that has not expired, it MUST apply only to subsequent clip
@@ -347,9 +373,12 @@ and notices at or after the deadline start a new interval at their occurrence.
   coverage combined with topic silence MUST NOT be reported as proven-healthy
   delivery, and the feature does not claim to detect a stalled delivery path
   during a period in which no relevant notice occurred. The fixed
-  `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` trust check MUST run after decode
-  and field validation but before any delivery-health observation or state
-  mutation; over-bound records are malformed, not healthy clock skew.
+  `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` trust check MUST protect source
+  timestamp assignment before watermark generation and MUST run again after
+  decode and field validation but before any delivery-health observation or
+  state mutation. Untrustworthy occurrence time MUST neither advance
+  suppression event time using that value nor create state; over-bound records
+  are malformed, not healthy clock skew.
 - **NFR-006**: The metric and structured log for each suppressed
   would-have-clipped spike MUST be attributable to the affected channel and
   distinguishable from coverage, delivery, malformed-input, and capacity
@@ -431,9 +460,11 @@ and notices at or after the deadline start a new interval at their occurrence.
   strictly from received-record age against the 30-second default warning
   threshold, and an observation window of legitimate silence is reported as
   idle/unknown rather than as either healthy or lagging. Records at the fixed
-  30-second future-skew boundary are accepted with age zero and a clock-skew
-  diagnostic; records one millisecond beyond are rejected, counted, and logged
-  before any delivery observation or state write.
+  30-second future-skew boundary use occurrence time for source watermark
+  assignment and are accepted with age zero and a clock-skew diagnostic.
+  Records one millisecond beyond use the Kafka record timestamp for source
+  watermark assignment, without payload rewriting, and are rejected, counted,
+  and logged downstream before any delivery observation or state access.
 - **SC-011**: Across a 24-hour deployed observation with the 400/400
   thresholds in force, desired-set entries plus departures attributable to the
   zero-width band average at most 8 membership changes per poll — 2% of the

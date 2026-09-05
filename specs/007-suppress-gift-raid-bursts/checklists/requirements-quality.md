@@ -38,9 +38,9 @@ requirements-quality defect; its `Gap` note is part of the release gate.
 
 ## Requirement Clarity - Sparse Input, Event Time, and Lateness
 
-- [x] CHK019 Is the two-input event-time hazard stated explicitly — the operator watermark is the minimum of both inputs, so a sparse suppression input can stall all chat-time evaluation — **and** is the idle-to-active re-entry case covered, in which one isolated notice after a long silence returns the source to the minimum with a bounded hold of `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` before it is idle again, while sustained traffic advances normally? [Clarity, Research §4.1, §4.1.1, R3, R10; Plan §Summary; Data Model I16; Autonomous Decisions §18; Tasks T050; Quickstart §A4, §B5]
-- [x] CHK020 Are trustworthy event-time requirements defined on the same Twitch clock for chat and suppression, using `occurred_at_ms` rather than ingestion or processing time, with fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` accepting equality and rejecting one millisecond beyond? [Consistency, Spec §FR-003, §FR-017; Contract §2.1, §2.2, §4.1, §5; Research §2.2, §4.3; Autonomous Decision §23]
-- [x] CHK021 Are idleness and partition requirements quantified as a 5-second suppression idleness timeout below chat's 10 seconds, applied with real watermarks, and four partitions matching parallelism so every source subtask has a split, in a form that can be asserted without a Flink runtime? [Measurability, Research §4.1 D4, §4.7 D16; Contract §1; Plan §Structure Decision; Tasks T029, T031, T038]
+- [x] CHK019 Is the two-input event-time hazard stated explicitly — the operator watermark is the minimum of both inputs, so either an untrusted future chat timestamp or a sparse suppression input can stall chat-time evaluation — **and** is the idle-to-active re-entry case covered, with the bounded hold; and is idleness located per assignment subtask under the partitions = source parallelism = assignment parallelism = 4 one-to-one condition, with mismatch/rescale and the two added Python stages' deployed process/RSS impact reserved for E3 revalidation? [Clarity, Research §4.1, §4.1.1, §4.1.2, R3, R10, R12-R14; Plan §Summary; Data Model I15, I16, I22-I23; Autonomous Decisions §18, §25-§26; Tasks T045, T050; Quickstart §A4, §B5]
+- [x] CHK020 Are trustworthy event-time requirements defined symmetrically for chat and suppression — including exact bounded → idleness → assigner-last construction and post-source attachment — with fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30`; suppression's two-layer fallback/rejection; and chat accepting only plain-int/non-bool `sent_at` through +30,000 ms while missing/null/string/float/bool/+30,001 ms uses Kafka record time without rewriting, rejecting, or dropping chat? [Consistency, Spec §FR-003, §FR-017; Contract §1.1-§1.1.1; Research §4.1.2, §4.3, R12-R14; Data Model I21-I23; Autonomous Decisions §23-§26]
+- [x] CHK021 Are idleness and partition requirements quantified as a 5-second suppression idleness timeout below chat's 10 seconds, with both real strategies built bounded out-of-orderness → idleness → assigner last and attached post-source, and four partitions matching source and assignment parallelism in a form assertable without claiming deployed execution? [Measurability, Research §4.1 D4, §4.1.2 R13-R14, §4.7 D16; Contract §1, §1.1.1; Plan §Structure Decision; Tasks T029, T031, T038, T045]
 - [x] CHK022 Are startup and restart requirements explicit about latest offsets, empty suppression state, no replay of old notices, and fail-open operation until a later notice establishes state? [Recovery Coverage, Data Model §5.6; Research §4.1 D4; Contract §1]
 - [x] CHK023 Are late-notice semantics complete: no waiting, retraction, or retroactive change, with later decisions gated only when their peaks lie inside the established notice-bounded interval, so a pre-notice peak reported after delivery remains eligible? [Coverage, Spec §FR-007, §FR-018, User Story 1 scenarios 2 and 6; Contract §4.1 rules 7-8; Data Model §3.2; Autonomous Decision §22]
 - [x] CHK024 Are both interval boundaries and the compared instant unambiguous: the spike peak second is used, `suppress_from_ms <= peak_ms < suppress_until_ms`, a pre-notice peak is eligible, the notice instant is included, and the deadline is excluded? [Clarity, Spec §FR-006-§FR-007, §SC-003; Data Model §3.1-§3.2; Research D5; Tasks T030, T040, T044]
@@ -56,11 +56,11 @@ requirements-quality defect; its `Gap` note is part of the release gate.
 
 ## Non-Functional Quality - Contract, Failure, and Observability
 
-- [x] CHK031 Are fail-open requirements complete for missing notification coverage, auxiliary refusal, delayed or malformed suppression data including over-bound future timestamps, empty/expired state, broker publication failure, and restart without restored state, with rejected future records producing no delivery observation or state write? [Coverage, Spec §FR-011, §FR-017-§FR-018; Contract §3.6, §4; Data Model I9-I12, I21]
+- [x] CHK031 Are fail-open/no-data-loss requirements complete for suppression failures and malformed or over-future chat `sent_at`, with suppression records remaining visible for downstream rejection while chat falls back only for event-time assignment and is never rewritten, rejected, or dropped? [Coverage, Spec §FR-003, §FR-011, §FR-017-§FR-018; Contract §1.1, §1.1.1, §3.6, §4; Data Model I9-I12, I21, I23]
 - [x] CHK032 Are healthy coverage, both partial states, auxiliary refusal, delivery lag, ignored notices, malformed input, rejected records, capacity refusal, and each suppressed spike required to be separately attributable and distinguishable through appropriately bounded metrics/logs, with broadcaster attribution retained where NFR-006 requires it? [Completeness, Spec §NFR-004-§NFR-006; Plan §Design at a glance; Tasks T025, T033, T039-T042]
 - [x] CHK033 Is "lagging suppression delivery" quantified from trusted records using `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`, with the fixed +30-second future boundary checked first, accepted negative-skew clamp/log behavior, over-bound rejection before observation/state, `suppression_delivery_age_seconds`, lag threshold, optional `received_at_ms` diagnostic-only semantics, and silence distinguished as idle/unknown? [Ambiguity resolved, Spec §FR-017, §NFR-005, §SC-010; Research §4.3, §4.6, D13; Contract §2.2, §4.1 rules 4-5; Data Model I19, I21; Autonomous Decisions §20, §23; Tasks T039, T042, T047]
 - [x] CHK034 Is the producer/consumer contract versioned and evolution-safe, with producer/consumer deployment order for incompatible versions, one-hour coexistence, and rules for optional versus required changes? [Completeness, Contract §2.1, §4.2, §6; Research D8]
-- [x] CHK035 Is consumer validation ordering explicit: the producer alone owns key/payload agreement; the payload identity controls routing; schema and field decoding precede the fixed future-time trust check; and malformed/over-future rejection is counted and logged before any delivery observation or state access? [Ambiguity resolved, Contract §1, §3.5, §4.0, §4.1 rules 1-5, §5.1, §5.9; Research D13, D15; Data Model I18, I21; Tasks T033, T037, T039, T041-T042]
+- [x] CHK035 Is every ordering constraint explicit: bounded out-of-orderness → idleness → Python assigner last, post-source attachment on both streams, source-time trust before watermark generation without payload mutation/drop, and then suppression-only decode plus original-value rejection before observation/state; and does the producer alone still own key/payload agreement? [Ambiguity resolved, Contract §1.1, §1.1.1, §3.5, §4.0, §4.1 rules 1-5, §5.1, §5.9, §5.11; Research D4, D13, D15, §4.1.2; Data Model I18, I21-I23; Tasks T033, T038, T041-T042, T045]
 - [x] CHK036 Are identity, time, trigger, and exclusion requirements complete: required trustworthy channel/time fields, keying by broadcaster, exactly three trigger categories, all other categories excluded, diagnostic-only `viewer_count`, and no producer-computed deadline/window? [Completeness, Spec §FR-003-§FR-006, §FR-017; Contract §1-§3; Research D7-D9]
 
 ## Dependencies and Assumptions - Release and Scope Gates
@@ -95,3 +95,25 @@ requirements-quality defect; its `Gap` note is part of the release gate.
   half-open interval and fixed future-time trust boundary. The checklist
   remains exactly 40 checked items; this records artifact quality only and
   does not complete any pending Flink task or deployed evidence E1-E5.
+- Final code-review correction, 2026-09-04: CHK020, CHK031, and CHK035 were
+  strengthened so the same fixed trust boundary protects source watermark
+  assignment before the unchanged original payload is rejected downstream.
+  The checklist remains exactly 40/40 checked; T058 and deployed evidence
+  E1-E5 remain pending.
+- Final code-review correction, 2026-09-05: CHK019, CHK020, CHK021, and CHK035
+  were strengthened for autonomous decision 25 — the Python timestamp assigners
+  must be attached with `assign_timestamps_and_watermarks()` after
+  `from_source` on both the chat and suppression streams, and idleness is now
+  generated per assignment subtask under an explicit
+  partitions = source parallelism = assignment parallelism = 4 one-to-one
+  invariant. The checklist remains exactly 40/40 checked; this records artifact
+  quality only. No Flink task is completed by it, the amended T038/T041/T045/
+  T050 keep their existing marks with the outstanding work carried by T058, and
+  deployed evidence E1-E5 remains pending.
+- Final code-review hardening, 2026-09-05: the same existing items now capture
+  decision 26's bounded → idleness → assigner-last binding invariant, strict
+  plain-int/non-bool chat timestamp rule, symmetric +30-second source bound,
+  chat no-data-loss fallback, and deployed-only process/RSS evidence for the
+  two parallelism-four Python stages. The checklist remains exactly 40/40;
+  T038/T041/T045 retain their existing marks, T058 remains open, and E1-E5
+  remain pending.

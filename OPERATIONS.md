@@ -379,12 +379,40 @@ and the maximum candidate deadline; an earlier/equal candidate is a complete
 no-op, and a notice at or after the old deadline starts a new interval.
 
 The fixed future-time trust bound is 30 seconds, not an environment setting.
-`occurred_at_ms <= consumer_receipt_ms + 30000` is accepted; accepted future
-skew is clamped to delivery age zero and logged. A value even 1 ms farther
-ahead is rejected as `reason="fields"` before delivery observation or
-suppression-state access. Missing, malformed, late, or unavailable suppression
-signals always **fail open**: normal clip eligibility continues, and an
-already-emitted clip is never retracted.
+It is enforced at both source timestamp assignment and operator validation
+using the same receipt/source wall-clock basis. At exactly
+`source_clock_ms + 30_000`, `occurred_at_ms` is assigned as event time; at
++30,001 ms, as for missing/unreadable occurrence time, the assigner uses Kafka
+`record_timestamp` so the untrusted value cannot advance the watermark. This
+does not rewrite or validate the payload. `process_element2` still receives
+the original value and rejects it as `reason="fields"` with the existing
+warning before delivery observation or suppression-state access. Accepted
+future skew is clamped to delivery age zero and logged. Missing, malformed,
+late, or unavailable suppression signals always **fail open**: normal clip
+eligibility continues, and an already-emitted clip is never retracted.
+
+The assigner only runs where the job builds its real `WatermarkStrategy` in
+the exact order bounded out-of-orderness → `with_idleness()` →
+`with_timestamp_assigner()` last, then attaches it with
+`assign_timestamps_and_watermarks()` **after** `from_source`. PyFlink 1.18
+silently ignores a Python timestamp assigner handed to `from_source`, and event
+time then degrades to the Kafka record timestamp on that stream — no error, no
+log line. Its `with_idleness()` also returns a fresh wrapper and drops an
+assigner bound before it. Both the chat stream (`sent_at`) and the suppression
+stream
+(`occurred_at_ms`) depend on this attachment, so a job whose event time tracks
+broker ingestion time rather than Twitch's clock is a defect, not a tuning
+question. The chat assigner accepts only plain integer (not boolean) `sent_at`
+through `source_clock_ms + 30_000`; missing/null, string, float, bool, and
++30,001 ms use Kafka record time for event-time assignment without rewriting,
+rejecting, or dropping the chat record. Because watermarks and idleness are
+then emitted by that assignment operator per subtask rather than per Kafka
+split, the deployment invariant is:
+**topic partitions, source parallelism, and assignment parallelism must all be
+4, chained one-to-one with no repartition between the source and the
+assigner.** Any change to partitions, `FLINK_PARALLELISM`, or the operator
+chain invalidates the idleness reasoning behind the sparse-source design and
+must be revalidated with E3 before gating is enabled.
 
 `docker-compose.yml` deliberately checks in
 `SUPPRESSION_GATING_ENABLED=false` in both Flink blocks. The code default is
@@ -408,7 +436,7 @@ levels; histogram observations are per trusted record.
 | `active_stream_count` | Gauge in **channels** in the reconciler's actual set after a completed pass. It is not a subscription count; read it with desired count and coverage state |
 | `suppression_notices_ignored_total{notice_type}` | Producer counter for deliberately excluded categories; known categories retain their name and unknown/absent categories use bounded `other`. Traffic here is not malformed |
 | `suppression_notices_malformed_total{reason}` | Producer counter for trigger notices dropped without publication: bounded reasons `identity` or `occurred_at`. Any increase is a producer/input fault, not ordinary excluded traffic |
-| `suppression_records_rejected_total{reason}` | Consumer counter for records ignored as `decode`, `schema_version`, or `fields`; over-30-second future timestamps are `fields`. Rejected records create no delivery sample or suppression state |
+| `suppression_records_rejected_total{reason}` | Consumer counter for records ignored as `decode`, `schema_version`, or `fields`; over-30-second future timestamps are `fields`. Source timestamp fallback does not hide them: the unchanged payload reaches `process_element2`, and rejected records create no delivery sample or suppression state |
 | `suppression_records_consumed_total{lag_class}` | Counter for trusted records actually consumed/applied. `healthy` means clamped age ≤30 s; `lagging` means >30 s. There is intentionally no `idle` series |
 | `suppression_delivery_age_seconds` | Histogram, one observation per trusted record, in **seconds**, of `max(0, consumer receipt - occurred_at)`. Use its bucket/rate distribution for percentiles; rejected records and silence add no observation |
 | `desired_set_churn_total` | Unlabelled counter in **channel membership changes**: entered + departed after successful publication. Its release reading is the 24-hour delta divided by successful polls, bounded at ≤8 changes/poll |
@@ -443,7 +471,7 @@ domains:
 | `Chat-notification hold-off cleared, the channel is repairable again` | Recovery; `reason` identifies notification coverage, reconnect, retirement, or channel drop. Confirm transition through `chat_only` to `complete` |
 | `Suppression notice dropped as untrustworthy` | Producer rejected a trigger before Kafka; inspect bounded `reason`, `notice_type`, and `notice_id`, and correlate with `suppression_notices_malformed_total` |
 | `Failed to publish suppression event` / `Kafka delivery failed` | Producer/broker path failed after mapping. Chat remains live and the detector fails open |
-| `Suppression notice refused for broadcaster ...` | Consumer rejected an occurrence beyond the fixed future bound; the line includes channel, type, occurrence, consumer receipt, bound, and `no deadline written`. Correlate with `suppression_records_rejected_total{reason="fields"}` and host clocks |
+| `Suppression notice refused for broadcaster ...` | Consumer rejected the original occurrence beyond the fixed future bound after the assigner used Kafka record time for watermark assignment; the line includes channel, type, occurrence, consumer receipt, bound, and `no deadline written`. Correlate with `suppression_records_rejected_total{reason="fields"}`, source/operator host clocks, and watermark continuity |
 | `Suppression clock skew for broadcaster ...` | Accepted occurrence is ahead by no more than 30 s; age was clamped to zero and the notice was still applied |
 | `Suppression delivery lag for broadcaster ...` | Trusted age exceeded 30 s; the line includes channel, type, and age. The notice is late but still applied |
 | `CLIP SUPPRESSED for broadcaster ...` | Suppression decision; includes channel, notice type, peak, interval bounds, notice time, and intensity. It must pair with one `clips_suppressed_total` increment and no clip yield |
@@ -468,7 +496,18 @@ Troubleshoot in this order:
    Kafka transport. All fail open.
 3. **Consumer rejection:** split `decode`, `schema_version`, and `fields`.
    Future-time `fields` plus the refusal log requires a clock check; the record
-   did not contribute a health sample or state.
+   did not contribute a health sample or state. Verify its source timestamp was
+   Kafka record time, not the untrusted occurrence value; a watermark
+   jump indicates the final-review fix is absent or not deployed. If the
+   assigner appears to have no effect at all — event time tracking broker
+   ingestion rather than `sent_at`/`occurred_at_ms` on either stream — check
+   that the job attaches each strategy with `assign_timestamps_and_watermarks`
+   after `from_source` rather than passing it into `from_source`, and that each
+   strategy was built bounded out-of-orderness → idleness → assigner last.
+   PyFlink 1.18 ignores the former and `with_idleness()` drops an assigner
+   stored before it. For chat, verify invalid-type or over-bound `sent_at`
+   falls back to broker time but the message still reaches counting/command
+   processing.
 4. **Delivery:** apply the three-state Prometheus reading above. Lagging records
    remain applied. Silence is idle/unknown; do not substitute complete coverage
    for delivery evidence.
@@ -503,15 +542,37 @@ Run these gates in order on the configured machine:
    one isolated notice after silence and prove detection resumes and the source
    re-idles within
    `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS`.
+   Next, deliver a controlled record beyond `source_clock_ms + 30000`, let
+   chat idle and resume, and prove the stream uses Kafka record time, the
+   combined watermark does not jump to the untrusted occurrence value,
+   remains monotonic, and real-time timers continue.
+   Finally, prove the timestamp assigners actually run and survive strategy
+   construction: watermarks originate
+   from the post-source `assign_timestamps_and_watermarks` operator on **both**
+   the chat and suppression streams. Verify trusted plain-integer chat
+   `sent_at` and trusted suppression `occurred_at_ms` drive event time; exact
+   +30,000 ms is accepted; +30,001 ms falls back; and chat
+   missing/null/string/float/bool values fall back to Kafka record time without
+   losing the message. Confirm neither stream's fallback advances the combined
+   watermark from an untrusted value. Inspect the deployed graph to confirm
+   `with_timestamp_assigner()` remained last after idleness and each assignment
+   subtask maps to one topic partition at parallelism 4. Record TaskManager
+   Python process count and aggregate/per-process RSS before and after this
+   revision: post-source assignment adds two Python stages at parallelism four,
+   and their worker/process footprint is deployed evidence only. Without these
+   checks, the earlier cases may describe Kafka record time or an unmeasured
+   Python-worker regression.
 6. **Enable, then E4:** only after E1, all of E2 including the 24-hour churn
-   gate, and both E3 cases pass, change
+   gate, and all four E3 cases pass, change
    `SUPPRESSION_GATING_ENABLED=true` in both Flink compose blocks and recreate
    the Flink components using the existing procedure. Capture real gift and
    raid slices and verify mapping, trusted-record age, delivery classification,
    intended suppression, unaffected pre-notice/outside-window peaks, and the
    120/180-second defaults. Check and record NTP/clock synchronization on the
    producer and consumer hosts with approved host tooling: skew over 30 seconds
-   makes notices reject and therefore fail open.
+   makes notices use Kafka record time upstream, then reject downstream and
+   therefore fail open. Confirm the original payload remains visible through
+   `reason="fields"` and the existing refusal warning.
 7. **E5 — rollback rehearsal:** exercise the exact capacity-safe order below.
 
 Evidence remains pending until an operator records it:
@@ -520,8 +581,8 @@ Evidence remains pending until an operator records it:
 |---|---|---|
 | E1 | Live mixed subscription types; cost 0 of 10 | [ ] Pending operator run |
 | E2 | 400/800 convergence, ≤300 per connection, 100 headroom, 401st refusal, and 24-hour churn ≤8/poll | [ ] Pending operator run |
-| E3 | One-hour silence does not stall; isolated-notice hold stays within the documented re-idle bound | [ ] Pending operator run |
-| E4 | Real gift/raid mapping, age and clock behavior, in-window suppression, and unaffected outside/pre-notice peaks | [ ] Pending operator run |
+| E3 | One-hour silence and isolated-notice bounds pass; both assigner-last strategies run post-source; trusted payload time and exact/+1 ms/type fallbacks behave correctly without chat loss or watermark poisoning; one partition maps to each parallelism-four assignment subtask; and TaskManager Python process count/RSS for the two added stages is recorded | [ ] Pending operator run |
+| E4 | Real gift/raid mapping, age and clock behavior, downstream over-future rejection visibility after source fallback, in-window suppression, and unaffected outside/pre-notice peaks, all read on Twitch-clock event time rather than broker ingestion time | [ ] Pending operator run |
 | E5 | Kill switch and capacity-safe rollback rehearsal | [ ] Pending operator run |
 
 ### Capacity-safe rollback

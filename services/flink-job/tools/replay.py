@@ -238,9 +238,9 @@ class EventTimeReplayer:
     def observe_watermark(self, sent_at_ms: int) -> Iterator[Evaluation]:
         """
         For a record that affects the watermark but is never counted -- e.g. a
-        command message. In production, SentAtTimestampAssigner runs on the
-        WatermarkStrategy attached at the Kafka source, upstream of
-        CommandFilter, so a command's sent_at still advances the real
+        command message. In production, SentAtTimestampAssigner runs in the
+        post-source timestamp-assignment operator, upstream of CommandFilter,
+        so a command's sent_at still advances the real
         watermark even though CommandFilter drops it before AnomalyDetector
         ever sees it. Mirror that ordering here rather than silently letting
         the harness's watermark lag behind production on command-heavy chat.
@@ -613,9 +613,18 @@ class EventTimeReplayer:
         explicitly rejected -- the spec asks for fail-open, not a delay.
         """
         # Source-side watermark assignment, upstream of every check below,
-        # mirroring SuppressionTimestampAssigner.
+        # mirroring SuppressionTimestampAssigner. An over-future value falls
+        # back to the source/record clock for event time, but the original
+        # payload continues below and is rejected visibly by operator logic.
         occurred_at_ms = None if payload is None else _plain_int(payload.get("occurred_at_ms"))
-        notice_time_ms = self._processing_time_ms if occurred_at_ms is None else occurred_at_ms
+        notice_time_ms = (
+            occurred_at_ms
+            if occurred_at_ms is not None
+            and is_trustworthy_notice_time(
+                occurred_at_ms, self._processing_time_ms
+            )
+            else self._processing_time_ms
+        )
         self._max_notice_at_ms = (
             notice_time_ms
             if self._max_notice_at_ms is None

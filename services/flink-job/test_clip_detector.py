@@ -5,9 +5,12 @@ Unit tests for Clip Detector Job
 Tests the anomaly detection logic, command filtering, and clip creation flow.
 """
 
+import ast
+import inspect
 import json
 import logging
 import os
+import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1608,15 +1611,33 @@ class TestSuppressionSourceWiring:
 
     @pytest.fixture
     def watermark_fakes(self, monkeypatch):
-        calls = []
+        class WatermarkCalls(list):
+            pass
+
+        calls = WatermarkCalls()
+        calls.strategies = []
 
         class FakeStrategy:
+            def __init__(self, kind, out_of_orderness=None, idleness=None):
+                self.kind = kind
+                self.out_of_orderness = out_of_orderness
+                self.idleness = idleness
+                self.assigner = None
+                calls.strategies.append(self)
+
             def with_idleness(self, duration):
                 calls.append(("idleness", duration))
-                return self
+                # PyFlink 1.18 returns a fresh Python wrapper here and does not
+                # carry a Python timestamp assigner onto that wrapper.
+                return FakeStrategy(
+                    self.kind,
+                    out_of_orderness=self.out_of_orderness,
+                    idleness=duration,
+                )
 
             def with_timestamp_assigner(self, assigner):
                 calls.append(("assigner", assigner))
+                self.assigner = assigner
                 return self
 
         monkeypatch.setattr(
@@ -1626,12 +1647,18 @@ class TestSuppressionSourceWiring:
 
         def for_bounded(duration):
             calls.append(("out_of_orderness", duration))
-            return FakeStrategy()
+            return FakeStrategy("bounded", out_of_orderness=duration)
+
+        def no_watermarks():
+            strategy = FakeStrategy("no_watermarks")
+            calls.append(("no_watermarks", strategy))
+            return strategy
 
         monkeypatch.setattr(
             clip_detector_job, "WatermarkStrategy",
             type("FakeWatermarkStrategy", (), {
-                "for_bounded_out_of_orderness": staticmethod(for_bounded)
+                "for_bounded_out_of_orderness": staticmethod(for_bounded),
+                "no_watermarks": staticmethod(no_watermarks),
             }),
         )
         return calls
@@ -1652,23 +1679,290 @@ class TestSuppressionSourceWiring:
 
     def test_the_watermark_strategy_is_built_from_the_pure_settings(self, watermark_fakes):
         settings = spike_detector.SuppressionSourceSettings()
-        clip_detector_job.build_suppression_watermark_strategy(settings)
-        recorded = dict(watermark_fakes)
-        assert recorded["out_of_orderness"] == ("seconds", settings.out_of_orderness_seconds)
-        assert recorded["idleness"] == ("seconds", settings.idleness_seconds)
+        strategy = clip_detector_job.build_suppression_watermark_strategy(settings)
+        assert strategy.kind == "bounded"
+        assert strategy.out_of_orderness == (
+            "seconds", settings.out_of_orderness_seconds
+        )
+        assert strategy.idleness == ("seconds", settings.idleness_seconds)
         # I15: strictly below the chat stream's, so suppression is never the
         # binding watermark minimum in steady state.
         assert settings.idleness_seconds < spike_detector.WATERMARK_IDLENESS_SECONDS
         assert isinstance(
-            recorded["assigner"], clip_detector_job.SuppressionTimestampAssigner
+            strategy.assigner, clip_detector_job.SuppressionTimestampAssigner
         )
+
+    def test_the_chat_watermark_strategy_keeps_twitch_event_time(self, watermark_fakes):
+        """Decision 25 changes where this strategy is attached, not what it
+        means: chat remains bounded/idled and derives event time from sent_at."""
+        strategy = clip_detector_job.build_chat_watermark_strategy()
+
+        assert strategy.kind == "bounded"
+        assert strategy.out_of_orderness == (
+            "seconds", spike_detector.WATERMARK_OUT_OF_ORDERNESS_SECONDS
+        )
+        assert strategy.idleness == (
+            "seconds", spike_detector.WATERMARK_IDLENESS_SECONDS
+        )
+        assert isinstance(strategy.assigner, clip_detector_job.SentAtTimestampAssigner)
+        assert strategy.assigner.extract_timestamp(chat_record(), 999) == OCCURRED_AT_MS
+        assert strategy.assigner.extract_timestamp(
+            json.dumps({"sent_at": None}), 999
+        ) == 999
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"sent_at": None},
+            {"sent_at": "1772668800123"},
+            {"sent_at": 1_772_668_800_123.0},
+            {"sent_at": True},
+        ],
+    )
+    def test_chat_event_time_requires_a_plain_integer_sent_at(self, payload):
+        assigner = clip_detector_job.SentAtTimestampAssigner(
+            clock_ms=lambda: OCCURRED_AT_MS
+        )
+        assert assigner.extract_timestamp(json.dumps(payload), 999) == 999
+
+    def test_chat_event_time_accepts_the_future_bound_but_not_one_ms_beyond_it(self):
+        source_clock = OCCURRED_AT_MS
+        max_skew_ms = spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        assert max_skew_ms == 30_000
+        assigner = clip_detector_job.SentAtTimestampAssigner(
+            clock_ms=lambda: source_clock
+        )
+        at_bound = chat_record(sent_at=source_clock + max_skew_ms)
+        over_bound = chat_record(sent_at=source_clock + max_skew_ms + 1)
+        original_at_bound = at_bound
+        original_over_bound = over_bound
+        record_timestamp = source_clock + 250
+
+        assert assigner.extract_timestamp(at_bound, record_timestamp) == (
+            source_clock + 30_000
+        )
+        assert assigner.extract_timestamp(over_bound, record_timestamp) == record_timestamp
+        assert at_bound == original_at_bound
+        assert over_bound == original_over_bound
+
+    @pytest.fixture
+    def topology_fakes(self):
+        """A source-to-assignment topology with every intervening operation
+        made fatal. It models API calls only; it creates no gateway or JVM."""
+        events = []
+
+        class FakeStream:
+            def __init__(self, source, parallelism):
+                self.source = source
+                self.parallelism = parallelism
+
+            def assign_timestamps_and_watermarks(self, strategy):
+                events.append(("assign_timestamps_and_watermarks", self.source, strategy))
+                return FakeStream(self.source, self.parallelism)
+
+            def _unexpected(self, operation):
+                events.append((operation, self.source))
+                raise AssertionError(
+                    f"{operation} ran between from_source and timestamp assignment"
+                )
+
+            def process(self, *args, **kwargs):
+                return self._unexpected("process")
+
+            def map(self, *args, **kwargs):
+                return self._unexpected("map")
+
+            def key_by(self, *args, **kwargs):
+                return self._unexpected("key_by")
+
+            def connect(self, *args, **kwargs):
+                return self._unexpected("connect")
+
+            def set_parallelism(self, *args, **kwargs):
+                return self._unexpected("set_parallelism")
+
+        class FakeEnvironment:
+            def __init__(self):
+                self.parallelism = clip_detector_job.FLINK_PARALLELISM
+
+            def from_source(self, source, watermark_strategy, name):
+                events.append(("from_source", source, watermark_strategy, name))
+                return FakeStream(source, self.parallelism)
+
+        return FakeEnvironment(), events
+
+    def test_both_python_assigners_are_attached_immediately_after_the_sources(
+        self, watermark_fakes, topology_fakes
+    ):
+        """PyFlink 1.18 ignores a Python TimestampAssigner passed directly to
+        from_source. The no-watermark source placeholder and executable
+        post-source assignment are therefore one indivisible wiring step on
+        both sides of the connected operator (decision 25 / contract §1.1.1)."""
+        env, events = topology_fakes
+        settings = spike_detector.SuppressionSourceSettings()
+
+        chat, suppression = clip_detector_job.build_event_time_streams(
+            env, "CHAT_SOURCE", "SUPPRESSION_SOURCE", settings
+        )
+
+        assert [event[0] for event in events] == [
+            "from_source",
+            "assign_timestamps_and_watermarks",
+            "from_source",
+            "assign_timestamps_and_watermarks",
+        ]
+        for source in ("CHAT_SOURCE", "SUPPRESSION_SOURCE"):
+            source_index = next(
+                i for i, event in enumerate(events)
+                if event[0] == "from_source" and event[1] == source
+            )
+            assignment = events[source_index + 1]
+            assert assignment[0] == "assign_timestamps_and_watermarks"
+            assert assignment[1] == source
+            assert events[source_index][2].kind == "no_watermarks"
+            assert assignment[2].kind == "bounded"
+
+        assigned = {
+            event[1]: event[2]
+            for event in events
+            if event[0] == "assign_timestamps_and_watermarks"
+        }
+        assert isinstance(
+            assigned["CHAT_SOURCE"].assigner,
+            clip_detector_job.SentAtTimestampAssigner,
+        )
+        assert isinstance(
+            assigned["SUPPRESSION_SOURCE"].assigner,
+            clip_detector_job.SuppressionTimestampAssigner,
+        )
+        assert chat.parallelism == suppression.parallelism == 4
+        assert settings.expected_partitions == settings.expected_parallelism == 4
+
+    def test_main_delegates_both_sources_to_the_tested_wiring_helper(self):
+        """The fake-tested helper must be the production path, not dead test
+        scaffolding. This inspects Python syntax only and never invokes main."""
+        tree = ast.parse(textwrap.dedent(inspect.getsource(clip_detector_job.main)))
+        helper_calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "build_event_time_streams"
+        ]
+        assert len(helper_calls) == 1
+
+    def test_the_effective_suppression_assignment_keeps_the_future_time_fallback(
+        self, watermark_fakes, topology_fakes
+    ):
+        """The +30s guard is exercised through the strategy actually attached
+        after from_source, not merely through an otherwise-dead assigner."""
+        env, events = topology_fakes
+        settings = spike_detector.SuppressionSourceSettings()
+        clip_detector_job.build_event_time_streams(
+            env, "CHAT_SOURCE", "SUPPRESSION_SOURCE", settings
+        )
+        assigned = next(
+            event[2] for event in events
+            if event[0] == "assign_timestamps_and_watermarks"
+            and event[1] == "SUPPRESSION_SOURCE"
+        )
+        assigner = assigned.assigner
+        assigner._clock_ms = lambda: OCCURRED_AT_MS
+        record_timestamp = OCCURRED_AT_MS + 250
+        at_bound = valid_suppression_record(
+            occurred_at_ms=(
+                OCCURRED_AT_MS
+                + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+            )
+        )
+        over_bound = valid_suppression_record(
+            occurred_at_ms=(
+                OCCURRED_AT_MS
+                + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+                + 1
+            )
+        )
+
+        assert assigner.extract_timestamp(at_bound, record_timestamp) == (
+            OCCURRED_AT_MS
+            + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        )
+        assert assigner.extract_timestamp(over_bound, record_timestamp) == record_timestamp
+        assert json.loads(over_bound)["occurred_at_ms"] == (
+            OCCURRED_AT_MS
+            + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+            + 1
+        )
+
+    def test_the_effective_chat_assignment_keeps_the_future_time_fallback(
+        self, watermark_fakes, topology_fakes
+    ):
+        """The strategy returned by the wiring helper carries the hardened
+        sent_at assigner, rather than an assigner lost on an earlier wrapper."""
+        env, events = topology_fakes
+        settings = spike_detector.SuppressionSourceSettings()
+        clip_detector_job.build_event_time_streams(
+            env, "CHAT_SOURCE", "SUPPRESSION_SOURCE", settings
+        )
+        assigned = next(
+            event[2] for event in events
+            if event[0] == "assign_timestamps_and_watermarks"
+            and event[1] == "CHAT_SOURCE"
+        )
+        assigner = assigned.assigner
+        assert isinstance(assigner, clip_detector_job.SentAtTimestampAssigner)
+        assigner._clock_ms = lambda: OCCURRED_AT_MS
+        max_skew_ms = spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        at_bound = chat_record(sent_at=OCCURRED_AT_MS + max_skew_ms)
+        over_bound = chat_record(sent_at=OCCURRED_AT_MS + max_skew_ms + 1)
+        original_over_bound = over_bound
+        record_timestamp = OCCURRED_AT_MS + 250
+
+        assert assigner.extract_timestamp(at_bound, record_timestamp) == (
+            OCCURRED_AT_MS + max_skew_ms
+        )
+        assert assigner.extract_timestamp(over_bound, record_timestamp) == record_timestamp
+        assert over_bound == original_over_bound
 
     def test_event_time_comes_from_occurred_at_ms(self):
         """Twitch's clock, the same one and the same converter chat-messages
         uses, which is what makes peak_second * 1000 < suppress_until_ms
         meaningful (contract invariant 2)."""
-        assigner = clip_detector_job.SuppressionTimestampAssigner()
+        assigner = clip_detector_job.SuppressionTimestampAssigner(
+            clock_ms=lambda: OCCURRED_AT_MS
+        )
         assert assigner.extract_timestamp(valid_suppression_record(), 999) == OCCURRED_AT_MS
+
+    def test_future_trust_is_enforced_before_the_source_watermark(self):
+        """A rejected far-future value must not poison event time upstream of
+        process_element2, where the normal rejection metric and log occur."""
+        record_timestamp = OCCURRED_AT_MS + 250
+        assigner = clip_detector_job.SuppressionTimestampAssigner(
+            clock_ms=lambda: OCCURRED_AT_MS
+        )
+
+        assert assigner.extract_timestamp(
+            valid_suppression_record(
+                occurred_at_ms=(
+                    OCCURRED_AT_MS
+                    + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+                )
+            ),
+            record_timestamp,
+        ) == (
+            OCCURRED_AT_MS
+            + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        )
+        assert assigner.extract_timestamp(
+            valid_suppression_record(
+                occurred_at_ms=(
+                    OCCURRED_AT_MS
+                    + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+                    + 1
+                )
+            ),
+            record_timestamp,
+        ) == record_timestamp
 
     @pytest.mark.parametrize(
         "raw",
@@ -1681,7 +1975,9 @@ class TestSuppressionSourceWiring:
     def test_a_record_without_a_usable_time_falls_back_to_the_record_timestamp(self, raw):
         """Handing None to Flink's timestamp assignment is what the chat
         assigner already guards against; this one must not be different."""
-        assigner = clip_detector_job.SuppressionTimestampAssigner()
+        assigner = clip_detector_job.SuppressionTimestampAssigner(
+            clock_ms=lambda: OCCURRED_AT_MS
+        )
         assert assigner.extract_timestamp(raw, 999) == 999
 
     def test_both_streams_are_keyed_then_connected_then_processed(self):

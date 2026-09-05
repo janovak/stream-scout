@@ -648,15 +648,28 @@ class SentAtTimestampAssigner(TimestampAssigner):
     ctx.timestamp() / the watermark it drives.
     """
 
+    def __init__(self, clock_ms=None):
+        self._clock_ms = clock_ms
+
+    def _source_clock_ms(self) -> int:
+        if self._clock_ms is not None:
+            return int(self._clock_ms())
+        return int(time.time() * 1000)
+
     def extract_timestamp(self, value: str, record_timestamp: int) -> int:
         try:
             sent_at = json.loads(value)["sent_at"]
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError, TypeError):
             return record_timestamp
-        # sent_at is present-but-null, not just missing: fall back rather
-        # than handing None to Flink's timestamp assignment, which expects
-        # an int and isn't guarded against it.
-        return record_timestamp if sent_at is None else sent_at
+        # Chat is never dropped for an untrustworthy timestamp. Use Kafka
+        # record time for event-time assignment instead, preventing one bad
+        # value from poisoning the binding chat watermark while preserving the
+        # message itself for counting and detection.
+        if not _plain_int(sent_at) or not is_trustworthy_notice_time(
+            sent_at, self._source_clock_ms()
+        ):
+            return record_timestamp
+        return sent_at
 
 
 def _suppression_payload(value) -> Optional[dict]:
@@ -720,17 +733,30 @@ class SuppressionTimestampAssigner(TimestampAssigner):
     `suppress_from_ms <= peak_second * 1000 < suppress_until_ms` meaningful
     (contract invariant 2).
 
-    A record with no usable time falls back to the record timestamp for the
-    same reason SentAtTimestampAssigner does: handing None to Flink's timestamp
-    assignment, which expects an int, would fail the job over one bad record.
+    A record with no usable or trustworthy time falls back to the Kafka record
+    timestamp. The original payload still reaches process_element2 and is
+    rejected there; this fallback only prevents an untrusted future value from
+    irreversibly advancing the source watermark before that rejection.
     """
+
+    def __init__(self, clock_ms=None):
+        self._clock_ms = clock_ms
+
+    def _source_clock_ms(self) -> int:
+        if self._clock_ms is not None:
+            return int(self._clock_ms())
+        return int(time.time() * 1000)
 
     def extract_timestamp(self, value, record_timestamp: int) -> int:
         payload = _suppression_payload(value)
         if payload is None:
             return record_timestamp
         occurred_at_ms = _plain_int(payload.get("occurred_at_ms"))
-        return record_timestamp if occurred_at_ms is None else occurred_at_ms
+        if occurred_at_ms is None or not is_trustworthy_notice_time(
+            occurred_at_ms, self._source_clock_ms()
+        ):
+            return record_timestamp
+        return occurred_at_ms
 
 
 def build_suppression_source(settings: SuppressionSourceSettings):
@@ -756,6 +782,31 @@ def build_suppression_source(settings: SuppressionSourceSettings):
         .build()
 
 
+def build_chat_watermark_strategy():
+    """The chat stream's real strategy, built once and attached post-source.
+
+    Event time comes from sent_at (Twitch's own clock) via
+    SentAtTimestampAssigner -- AnomalyDetector's bucketing and per-second
+    timers ride on this, not on our ingestion timestamp or wall-clock time.
+    WATERMARK_OUT_OF_ORDERNESS_SECONDS is shared with tools/replay.py so the
+    harness simulates the same allowed lateness.
+
+    WATERMARK_IDLENESS_SECONDS (KNOWN_ISSUES.md Issue 4): an input can go quiet
+    for a long stretch and freeze the operator watermark -- the minimum across
+    every input -- until this timeout releases it. Through 2026-08-27 the topic
+    ran with far more partitions than this job's parallelism, so most splits
+    carried 0-1 broadcasters and this fired routinely; that mismatch is fixed
+    (chat-messages now matches FLINK_PARALLELISM 1:1, see docker-compose.yml),
+    but a single broadcaster's own input can still go quiet on its own
+    regardless of partition count, and this timeout is still what recovers
+    from it.
+    """
+    return WatermarkStrategy \
+        .for_bounded_out_of_orderness(Duration.of_seconds(WATERMARK_OUT_OF_ORDERNESS_SECONDS)) \
+        .with_idleness(Duration.of_seconds(WATERMARK_IDLENESS_SECONDS)) \
+        .with_timestamp_assigner(SentAtTimestampAssigner())
+
+
 def build_suppression_watermark_strategy(settings: SuppressionSourceSettings):
     """Real watermarks on the sparse input, never no_watermarks().
 
@@ -770,6 +821,44 @@ def build_suppression_watermark_strategy(settings: SuppressionSourceSettings):
         .for_bounded_out_of_orderness(Duration.of_seconds(settings.out_of_orderness_seconds)) \
         .with_idleness(Duration.of_seconds(settings.idleness_seconds)) \
         .with_timestamp_assigner(SuppressionTimestampAssigner())
+
+
+def build_event_time_streams(env, chat_source, suppression_source, settings):
+    """Both sources entered with no_watermarks(), then immediately given their
+    real strategy on the returned stream (contract section 1.1.1, decision 25).
+
+    PyFlink 1.18's StreamExecutionEnvironment.from_source() forwards only
+    watermark_strategy._j_watermark_strategy, so a Python TimestampAssigner
+    handed to from_source is silently discarded -- no error, no warning -- and
+    event time degrades to the Kafka record timestamp on both inputs. Only
+    DataStream.assign_timestamps_and_watermarks() installs the executable
+    Python timestamp-assigner/watermark-generator operator, which is why the
+    strategy given to from_source here is a placeholder and the real strategy
+    is attached on the very next call. That is also what keeps
+    SuppressionTimestampAssigner's +30 s source trust check reachable ahead of
+    the independent rejection in process_element2.
+
+    Nothing may come between a from_source and its assignment: idleness is now
+    generated per assignment subtask rather than per Kafka split, so the
+    equivalence relies on topic partitions = source parallelism = assignment
+    parallelism = 4 over a one-to-one forward chain (research section 4.1.2,
+    R13). Any map, key_by, rescale, repartition, or explicit parallelism
+    between the two calls breaks that and requires revalidation; both streams
+    therefore stay on the job-wide FLINK_PARALLELISM.
+    """
+    chat_stream = env.from_source(
+        chat_source,
+        WatermarkStrategy.no_watermarks(),
+        "Kafka Source"
+    ).assign_timestamps_and_watermarks(build_chat_watermark_strategy())
+
+    suppression_stream = env.from_source(
+        suppression_source,
+        WatermarkStrategy.no_watermarks(),
+        "Suppression Source"
+    ).assign_timestamps_and_watermarks(build_suppression_watermark_strategy(settings))
+
+    return chat_stream, suppression_stream
 
 
 def connect_detector(chat_stream, suppression_stream, detector):
@@ -934,8 +1023,8 @@ class AnomalyDetector(KeyedCoProcessFunction):
     def process_element1(self, value, ctx: KeyedCoProcessFunction.Context) -> None:
         try:
             # ctx.timestamp() is sent_at (Twitch's own clock) -- assigned by
-            # SentAtTimestampAssigner on the source's WatermarkStrategy, not
-            # our ingestion timestamp and not wall-clock time.
+            # the post-source SentAtTimestampAssigner before CommandFilter,
+            # not our ingestion timestamp and not wall-clock time.
             bucket = ctx.timestamp() // 1000
 
             current_count = self.message_counts.get(bucket)
@@ -1466,46 +1555,26 @@ def main():
         .set_value_only_deserializer(SimpleStringSchema()) \
         .build()
 
-    # Create watermark strategy. Event time comes from sent_at (Twitch's own
-    # clock) via SentAtTimestampAssigner -- AnomalyDetector's bucketing and
-    # per-second timers ride on this, not on our ingestion timestamp or
-    # wall-clock time. WATERMARK_OUT_OF_ORDERNESS_SECONDS is shared with
-    # tools/replay.py so the harness simulates the same allowed lateness.
-    # WATERMARK_IDLENESS_SECONDS (KNOWN_ISSUES.md Issue 4): a split can go
-    # quiet for a long stretch and freeze the operator watermark -- the
-    # minimum across every split -- until this timeout releases it. Through
-    # 2026-08-27 the topic ran with far more partitions than this job's
-    # parallelism, so most splits carried 0-1 broadcasters and this fired
-    # routinely; that mismatch is fixed (chat-messages now matches
-    # FLINK_PARALLELISM 1:1, see docker-compose.yml), but a single
-    # broadcaster's own split can still go quiet on its own regardless of
-    # partition count, and this timeout is still what recovers from it.
-    watermark_strategy = WatermarkStrategy \
-        .for_bounded_out_of_orderness(Duration.of_seconds(WATERMARK_OUT_OF_ORDERNESS_SECONDS)) \
-        .with_idleness(Duration.of_seconds(WATERMARK_IDLENESS_SECONDS)) \
-        .with_timestamp_assigner(SentAtTimestampAssigner())
-
-    # Build the pipeline
-    messages = env.from_source(
+    # Build the pipeline. Both sources are entered with no_watermarks() and
+    # given their real bounded/idled strategy immediately afterwards, because
+    # PyFlink 1.18 executes a Python TimestampAssigner only when it is
+    # installed by DataStream.assign_timestamps_and_watermarks() (contract
+    # section 1.1.1, decision 25). The sparse second input (Feature 007) is
+    # built from SuppressionSourceSettings, which test_spike_detector.py
+    # asserts with no PyFlink installed and no broker running (research D16).
+    # Both topics are provisioned with one partition per subtask and nothing
+    # repartitions between source and assignment, so per-subtask idleness is
+    # exactly per-split idleness (docker-compose.yml kafka-init, research
+    # section 4.1).
+    messages, suppression_records = build_event_time_streams(
+        env,
         kafka_source,
-        watermark_strategy,
-        "Kafka Source"
+        build_suppression_source(suppression_settings),
+        suppression_settings,
     )
 
     # Filter out command messages
     filtered = messages.process(CommandFilter())
-
-    # The sparse second input (Feature 007). Its source and watermark strategy
-    # are built from SuppressionSourceSettings, which test_spike_detector.py
-    # asserts with no PyFlink installed and no broker running (research D16).
-    # The topic is provisioned with one partition per subtask, so every source
-    # subtask owns exactly one split and split idleness is well defined
-    # (docker-compose.yml kafka-init, research section 4.1).
-    suppression_records = env.from_source(
-        build_suppression_source(suppression_settings),
-        build_suppression_watermark_strategy(suppression_settings),
-        "Suppression Source"
-    )
 
     # Key both inputs by broadcaster_id and detect anomalies. The suppression
     # input reaches AnomalyDetector only; CommandFilter and ClipCreator are
