@@ -74,17 +74,20 @@ observe — the known one is the library's reconnect re-subscribing part way and
 giving up — where the count would otherwise keep reporting a channel that no
 longer exists.
 
-Subscriptions are spread over a pool of websocket connections, **300 per
-connection** (Twitch's cap). The pool starts empty and opens another connection
-when the ones it has are full, so ~500 channels run on two.
+Subscriptions are spread over a pool of websocket connections, **300
+subscriptions per connection** (Twitch's cap). Feature 007 requires two
+subscriptions per monitored channel: `channel.chat.message` and
+`channel.chat.notification`. One session can therefore hold at most 150
+complete channel pairs.
 
-**This transport tops out at 900 channels.** Twitch allows a maximum of **3
-websocket connections with enabled subscriptions** per client-id/user-id pair,
-at 300 each. The pool refuses to open a fourth rather than let Twitch reject the
-subscriptions on it one by one, so the ceiling shows up as a clear log line —
-`pool is at its 3-connection limit` — instead of a silent retry loop. Past 900
-the required transport is EventSub **webhook**, not more sockets; see
-`specs/004-eventsub-parallel-reconciler/research.md` D1.
+**This transport tops out at 900 subscriptions, not 900 dual-covered
+channels.** Twitch allows a maximum of **3 websocket connections with enabled
+subscriptions** per client-id/user-id pair, at 300 each. Feature 007 sets a firm
+400-channel ceiling: 400 channels use 800 subscriptions and reserve the
+remaining 100 globally for reconnect and adoption safety. The pool refuses to
+open a fourth connection rather than let Twitch reject subscriptions one by
+one, so exhaustion shows up as `pool is at its 3-connection limit`. See
+"Feature 007: gift/raid suppression operations" below.
 
 ### Reading the reconciler metrics
 
@@ -96,27 +99,21 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_|reconcile_|subscrip
 
 | Metric | Read it as |
 |---|---|
-| `eventsub_subscription_count` | Live subscriptions held. Should equal the wanted set — compare against `ZCARD chat:desired`. It moves DURING a pass, not only at the end: it steps up as a cold start creates, and drops the moment a socket loss is reported, which is the dip to alert on. A steady small gap is normally one channel refusing authorization; check the logs for `subscription missing proper authorization` |
+| `eventsub_subscription_count` | Live subscriptions held, in **subscription** units. With complete Feature 007 coverage it should be twice `ZCARD chat:desired`, up to 800; use `eventsub_channel_coverage`, not this gauge, for channel counts. It moves DURING a pass, not only at the end: it steps up as a cold start creates, and drops the moment a socket loss is reported |
 | `reconcile_last_success_timestamp` | Unix time of the last pass that **ran to completion**. **This is the stalled-reconciler alarm.** If it stops advancing while polls keep succeeding, the reconciler is stuck and the subscription set is frozen — the poller cannot tell you this, because it still works. Two things it does **not** mean: it is not "a pass with no failures" (at 500 channels one broadcaster refuses every pass, so gating on that would freeze the gauge and destroy the signal — per-channel failures are `subscription_create_failures_total`); and **a gap of a few minutes during a cold start is normal, not a stall**. A pass that hits 429s backs off and retries inside the pass, up to `RECONCILE_MAX_RETRY_ROUNDS` × `RECONCILE_RATE_LIMIT_BACKOFF_SECONDS` ≈ 200 s at the defaults, and the stamp only lands when the pass ends. Before restarting anything, check `reconcile_duration_seconds` and whether the subscription count is still climbing |
 | `reconcile_duration_seconds` | Histogram of pass duration. A converged pass is milliseconds. Buckets run to 120 s because a cold start to 500 channels takes ~51 s |
 | `subscription_create_failures_total` | Counter, labelled by `reason`. **No series at all is the healthy state**, not a broken exporter: this client registers a labelled series on its first increment |
-| `eventsub_connection_occupancy` | Subscriptions per connection, labelled by connection id. None should exceed 300 |
+| `eventsub_connection_occupancy{connection}` | Subscriptions per connection. None may exceed 300 |
 
 ---
 
 ## Ramping the monitored channel count
 
-Spec 004 removed the ingestion ceiling. Production now runs at `JOIN_THRESHOLD`
-800 / `LEAVE_THRESHOLD` 900, raised in steps from 15 / 30 by the ramps below
-(15 / 30 → 150 / 300 on 2026-08-30, then 150 / 300 → 800 / 900 on 2026-08-31
-after feature 006 batched the poller). Raise the count in steps, not in one
-jump. Each step adds real message volume and real Flink load.
-
-`LEAVE_THRESHOLD` 900 sits at the transport's hard cap (3 connections × 300 =
-900 subscriptions). The desired set runs below it in practice — the top 900 by
-rank minus the ~20% with clipping disabled is ~720–800 — but there is no room
-left for a higher `LEAVE_THRESHOLD` on this transport. Past 900, move to
-EventSub webhooks.
+The ladder below records the historical single-subscription ramp through
+feature 006. Feature 007 supersedes its operating point with a firm
+`JOIN_THRESHOLD=400` / `LEAVE_THRESHOLD=400` ceiling because every channel now
+uses two subscriptions. Do not use the historical 800/900 result to raise a
+feature-007 deployment; follow the dedicated rollout and rollback below.
 
 ### What `JOIN_THRESHOLD` and `LEAVE_THRESHOLD` actually do
 
@@ -130,8 +127,8 @@ out. To run near a round number of channels, set `LEAVE_THRESHOLD` to it and
 
 ### How to change the thresholds
 
-The poller reads both from the environment. `LEAVE_THRESHOLD` must be greater
-than `JOIN_THRESHOLD`, or the service refuses to start.
+The poller reads both from the environment. `JOIN_THRESHOLD` must not exceed
+`LEAVE_THRESHOLD`; equality is valid and deliberately used by feature 007.
 
 1. Set both variables in the `stream-monitoring` `environment:` block in
    `docker-compose.yml`.
@@ -159,7 +156,7 @@ LEAVE_THRESHOLD clip-allowed streams found even after padding fetch` appears.
 | 3 | 300 / 500 | ~320 | clean |
 | 4 | 480 / 500 | ~485 | clean |
 | 5 | 800 / 1000 | ~800 | **did not converge, rolled back** (pre feature 006) — see below |
-| 6 | 800 / 900 | ~720–800 | clean on 2026-08-31, post feature 006 — **current production** |
+| 6 | 800 / 900 | ~720–800 | clean on 2026-08-31, post feature 006 — historical single-subscription result |
 
 Soak each step for at least 30 minutes before the next.
 
@@ -172,11 +169,11 @@ at 900 ranked, so the poll no longer stalls the way step 5 did.
 
 | Signal | Healthy | Stop and investigate |
 |---|---|---|
-| `eventsub_subscription_count` vs `ZCARD chat:desired` | equal, within one pass interval | a gap that does not close |
+| `eventsub_subscription_count` vs `ZCARD chat:desired` | historical single-subscription transport: equal; Feature 007 complete coverage: twice the desired count, within one pass interval | a gap that does not close |
 | `reconcile_duration_seconds` | a converged pass is milliseconds at ~50 channels, ~2–4 s at 300–485 | the median grows faster than the channel count |
 | `subscription_create_failures_total{reason="429"}` | absent, or brief cold-start bursts all retried | keeps rising after convergence |
 | `subscription_create_failures_total{reason="transient_session"}` | a cold-start burst (seen up to ~70), then static | keeps rising during steady state |
-| `eventsub_connection_occupancy` | no connection over 300; the pool grows at the cap | `pool is at its 3-connection limit` (the 900-channel hard cap) |
+| `eventsub_connection_occupancy` | no connection over 300; the pool grows at the cap | `pool is at its 3-connection limit` (the 900-subscription hard cap) |
 | Kafka producer lag, Flink source watermark lag | flat | either grows and does not recover |
 | Flink TaskManager heap | flat (measured ~2.6 GB RSS through 485 channels, cap 6 GB) | approaches the cap |
 | Flink TaskManager thread count | flat (~135) | climbing — `ClipCreator` pileup |
@@ -296,12 +293,255 @@ No schema, dependency, Redis layout, threshold, EventSub-policy, or Flink
 reversal is required. If a later ramp has happened, decide its threshold
 rollback separately rather than coupling it to the code rollback.
 
-### Rolling back a step
+### Rolling back a pre-007 single-subscription step
 
-Lower both numbers, restart `stream-monitoring`. The reconciler drops the
-now-unwanted subscriptions on its next pass. Nothing downstream breaks: Flink
-keeps the baseline state for a dropped channel until its TTL expires, so a
-re-raise inside that window keeps the warm-up.
+This historical procedure applies only when no
+`channel.chat.notification` subscriptions exist. Lower both numbers and restart
+`stream-monitoring`; the reconciler drops the now-unwanted subscriptions on its
+next pass. For Feature 007, use the capacity-safe rollback order below and
+**never raise either threshold above 400 while any notification subscription
+remains**.
+
+---
+
+## Feature 007: gift/raid suppression operations
+
+This section is the operator runbook for
+`specs/007-suppress-gift-raid-bursts`. Live validation is performed by an
+operator on the configured machine. Local tests, fixtures, static assertions,
+and replay output do **not** establish deployed evidence E1-E5.
+
+### Capacity and coverage contract
+
+- The firm monitored-set ceiling is **400 channels**, enforced by
+  `JOIN_THRESHOLD=400` and `LEAVE_THRESHOLD=400`. Do not hide a different
+  hysteresis policy in code.
+- Each monitored channel needs two independent subscriptions:
+  `channel.chat.message` for chat and `channel.chat.notification` for gift/raid
+  notices. At the ceiling this is 400 channels × 2 = **800 subscriptions** of
+  the 900-subscription account limit, leaving **100 subscriptions of global
+  reconnect/adoption headroom**.
+- Each websocket session is capped at 300 **subscriptions**, so it can hold at
+  most **150 complete channel pairs**. A pair may be split across sessions.
+- Keep units explicit: `active_stream_count` and
+  `eventsub_channel_coverage` count **channels**;
+  `eventsub_subscription_count` and `eventsub_connection_occupancy` count
+  **subscriptions**.
+
+Coverage is a per-channel derived state:
+
+| State | Meaning and operator interpretation |
+|---|---|
+| `complete` | Both subscriptions are live. Compare this channel count with `ZCARD chat:desired`; suppression coverage is available |
+| `chat_only` | Chat is live but notification is missing and repair is eligible. Chat and clipping continue; suppression fails open until repair |
+| `notification_only` | Notification is live but chat is missing. The reconciler repairs chat; no chat means no clip decisions for that channel meanwhile |
+| `degraded_chat_only` | Twitch refused the auxiliary notification subscription while chat remained live. Chat is deliberately retained and suppression fails open; the retry hold-off is active |
+
+An auxiliary refusal starts a
+`AUXILIARY_REFUSAL_RETRY_SECONDS=3600` hold-off so the reconciler does not
+hot-loop. On expiry the state returns to `chat_only` and normal repair resumes.
+A websocket reconnect or connection retirement makes it eligible immediately;
+a successful create or 409 adoption clears the hold-off. It never writes the
+seven-day whole-channel refusal that would evict chat.
+
+`desired_set_churn_total` increments by **entered channels + departed channels**
+after each successful desired-set publication. NFR-007 requires the average to
+be **at most 8 membership changes per poll** over a full deployed 24-hour
+observation at 400/400. Read a counter delta, not its lifetime value, and divide
+the 24-hour delta by the number of successfully published polls in the same
+window (`Poll finished` provides `entered`, `left`, `desired`, and outcome
+context). Above 8 blocks suppression gating. The only resolution is a
+specification change to a narrower join threshold inside the firm 400 ceiling,
+never an undocumented configuration or code workaround.
+
+### Suppression topic and policy
+
+`kafka-init` creates `suppression-events` before the Flink job starts. The topic
+has **four partitions**, replication factor one, and **one-hour retention**
+(`retention.ms=3600000`). Its Kafka key is the UTF-8 string form of
+`broadcaster_id`, and the producer verifies that it agrees with the payload.
+
+Version 1 carries required `schema_version=1`, integer `broadcaster_id`,
+`notice_type`, and Twitch-clock epoch-millisecond `occurred_at_ms`. Optional
+`notice_id`, `received_at_ms`, and raid `viewer_count` are diagnostic only.
+Records carry notices, not computed deadlines or window policy.
+
+Only `community_sub_gift`, `sub_gift`, and `raid` trigger suppression.
+`unraid`, plain `sub`, `resub`, and every other category are excluded. Gift
+notices use 120 seconds and raids use 180 seconds; raid viewer count never
+scales the duration.
+
+The active interval is notice-bounded and half-open:
+`[occurrence, deadline)`. A peak before the notice remains eligible even when
+reported later, a peak at the notice is suppressed, and a peak exactly at the
+deadline is eligible. An extending overlap retains the earliest chain start
+and the maximum candidate deadline; an earlier/equal candidate is a complete
+no-op, and a notice at or after the old deadline starts a new interval.
+
+The fixed future-time trust bound is 30 seconds, not an environment setting.
+`occurred_at_ms <= consumer_receipt_ms + 30000` is accepted; accepted future
+skew is clamped to delivery age zero and logged. A value even 1 ms farther
+ahead is rejected as `reason="fields"` before delivery observation or
+suppression-state access. Missing, malformed, late, or unavailable suppression
+signals always **fail open**: normal clip eligibility continues, and an
+already-emitted clip is never retracted.
+
+`docker-compose.yml` deliberately checks in
+`SUPPRESSION_GATING_ENABLED=false` in both Flink blocks. The code default is
+`true`, so verify the deployed compose value and the startup log
+`SUPPRESSION_GATING_ENABLED: False`; do not rely on an omitted variable.
+Operators change both compose values to `true` only after the rollout gates
+below pass.
+
+### Signal reference
+
+Counters reset with their process. Use Prometheus `increase(...[W])` or
+`rate(...[W])`, not raw counter subtraction across restarts. Gauges are current
+levels; histogram observations are per trusted record.
+
+| Signal | Unit and exact interpretation |
+|---|---|
+| `clips_suppressed_total{broadcaster_id,notice_type}` | Counter of would-have-clipped decisions stopped by an active window, attributed to channel and the notice that moved the deadline. `increase(...[W])` is suppressions during `W`. `anomalies_detected_total` **still increments** for the same decision |
+| `eventsub_channel_coverage{state}` | Gauge in **channels** for `complete`, `chat_only`, `notification_only`, and `degraded_chat_only`. Compare `state="complete"` with the Redis desired count; inspect partial/degraded series rather than inferring coverage from subscription totals |
+| `eventsub_connection_occupancy{connection}` | Gauge in **subscriptions per websocket connection**, including the connection label. Every value must remain at or below 300 |
+| `eventsub_subscription_count` | Gauge in **subscriptions across the pool**. Complete dual coverage is approximately 2 × desired channels and no more than 800 steady state |
+| `active_stream_count` | Gauge in **channels** in the reconciler's actual set after a completed pass. It is not a subscription count; read it with desired count and coverage state |
+| `suppression_notices_ignored_total{notice_type}` | Producer counter for deliberately excluded categories; known categories retain their name and unknown/absent categories use bounded `other`. Traffic here is not malformed |
+| `suppression_notices_malformed_total{reason}` | Producer counter for trigger notices dropped without publication: bounded reasons `identity` or `occurred_at`. Any increase is a producer/input fault, not ordinary excluded traffic |
+| `suppression_records_rejected_total{reason}` | Consumer counter for records ignored as `decode`, `schema_version`, or `fields`; over-30-second future timestamps are `fields`. Rejected records create no delivery sample or suppression state |
+| `suppression_records_consumed_total{lag_class}` | Counter for trusted records actually consumed/applied. `healthy` means clamped age ≤30 s; `lagging` means >30 s. There is intentionally no `idle` series |
+| `suppression_delivery_age_seconds` | Histogram, one observation per trusted record, in **seconds**, of `max(0, consumer receipt - occurred_at)`. Use its bucket/rate distribution for percentiles; rejected records and silence add no observation |
+| `desired_set_churn_total` | Unlabelled counter in **channel membership changes**: entered + departed after successful publication. Its release reading is the 24-hour delta divided by successful polls, bounded at ≤8 changes/poll |
+
+For a Prometheus window `W`, read delivery state in this order:
+
+1. `sum(increase(suppression_records_consumed_total[W])) == 0` means
+   **idle/unknown**, never healthy.
+2. Otherwise,
+   `sum(increase(suppression_records_consumed_total{lag_class="lagging"}[W])) > 0`
+   means **lagging**.
+3. Otherwise the received records in that window are **healthy**.
+
+Age is computed only for trusted records as
+`max(0, consumer_receipt_ms - occurred_at_ms)`: at or below 30 seconds is
+healthy and above 30 seconds is lagging. Optional producer `received_at_ms` may
+split the diagnosis into Twitch-to-producer and producer-to-consumer delay, but
+it never changes classification. Complete coverage plus topic silence proves
+only that subscriptions exist; it does not prove broker delivery health. This
+feature cannot distinguish a stalled path from legitimate silence without a
+real notice.
+
+### Structured logs and diagnosis
+
+Use the existing `docker logs` patterns in Parts 3 and 5 and Prometheus UI in
+Part 2. The following exact message prefixes and fields separate the failure
+domains:
+
+| Message or signal | Meaning / fields / next check |
+|---|---|
+| `Twitch refused the chat-notification subscription, keeping chat and degrading suppression coverage for this channel` | Auxiliary refusal; fields include `broadcaster_id`, `retry_after_seconds`, and `error`. Expect `degraded_chat_only`, retained chat, and a bounded retry |
+| `Chat-notification hold-off cleared, the channel is repairable again` | Recovery; `reason` identifies notification coverage, reconnect, retirement, or channel drop. Confirm transition through `chat_only` to `complete` |
+| `Suppression notice dropped as untrustworthy` | Producer rejected a trigger before Kafka; inspect bounded `reason`, `notice_type`, and `notice_id`, and correlate with `suppression_notices_malformed_total` |
+| `Failed to publish suppression event` / `Kafka delivery failed` | Producer/broker path failed after mapping. Chat remains live and the detector fails open |
+| `Suppression notice refused for broadcaster ...` | Consumer rejected an occurrence beyond the fixed future bound; the line includes channel, type, occurrence, consumer receipt, bound, and `no deadline written`. Correlate with `suppression_records_rejected_total{reason="fields"}` and host clocks |
+| `Suppression clock skew for broadcaster ...` | Accepted occurrence is ahead by no more than 30 s; age was clamped to zero and the notice was still applied |
+| `Suppression delivery lag for broadcaster ...` | Trusted age exceeded 30 s; the line includes channel, type, and age. The notice is late but still applied |
+| `CLIP SUPPRESSED for broadcaster ...` | Suppression decision; includes channel, notice type, peak, interval bounds, notice time, and intensity. It must pair with one `clips_suppressed_total` increment and no clip yield |
+| `Error applying suppression notice for broadcaster ...` | Unexpected consumer exception. Treat as fail-open and inspect the traceback plus rejection/consumption counters |
+| `Subscription operation failed` with `pool is at its 3-connection limit` | Capacity refusal, distinct from malformed or delivery failures. Inspect total subscriptions, per-connection occupancy, coverage, desired count, and thresholds |
+| `Poll finished` | Churn context; `entered` + `left` is that successful publication's increment, with `desired` and `outcome` for the 24-hour calculation |
+
+Decode, unknown-version, and ordinary field/category consumer rejections have
+no dedicated payload log; distinguish them by
+`suppression_records_rejected_total{reason}`. This avoids logging untrusted
+payloads.
+
+Troubleshoot in this order:
+
+1. **Coverage missing:** compare desired channels with
+   `eventsub_channel_coverage` and `active_stream_count`, then compare the
+   expected two subscriptions per complete channel with total and per-connection
+   occupancy. A partial state is coverage loss; `degraded_chat_only` plus the
+   refusal log is bounded auxiliary refusal, not a broker-lag diagnosis.
+2. **Producer input or publication:** ignored notices are policy; malformed
+   notices indicate identity/time failure; publication/delivery errors indicate
+   Kafka transport. All fail open.
+3. **Consumer rejection:** split `decode`, `schema_version`, and `fields`.
+   Future-time `fields` plus the refusal log requires a clock check; the record
+   did not contribute a health sample or state.
+4. **Delivery:** apply the three-state Prometheus reading above. Lagging records
+   remain applied. Silence is idle/unknown; do not substitute complete coverage
+   for delivery evidence.
+5. **Decision:** correlate `CLIP SUPPRESSED`,
+   `clips_suppressed_total`, and the still-incrementing
+   `anomalies_detected_total`. If policy is suspect, turn gating off first.
+6. **Capacity/churn:** verify ≤400 desired channels, ≤800 steady subscriptions,
+   every connection ≤300, and the 24-hour churn average ≤8/poll. A 401st
+   channel must be refused without consuming the 100-slot headroom.
+
+### Forward rollout and pending evidence
+
+Run these gates in order on the configured machine:
+
+1. **B0 — current single-subscription revision:** set 400/400 using the
+   threshold procedure above and wait for Redis `chat:desired` and
+   `eventsub_subscription_count` to converge near 400. This is unconditionally
+   safe at 400 × 1; E1 does not block this preliminary ramp-down.
+2. **Deploy with gating off:** ensure `kafka-init` has created
+   `suppression-events` **before** starting the feature Flink job. Deploy the
+   feature revision with the checked-in `SUPPRESSION_GATING_ENABLED=false` and
+   let dual coverage converge. Clip behavior remains pre-007.
+3. **E1 — mixed types and cost:** enumerate live EventSub subscriptions, prove
+   both types coexist on live sessions, and prove `total_cost=0` against
+   `max_total_cost=10`. Non-zero cost blocks the feature; use the rollback below.
+4. **E2 — capacity and churn:** prove 400 complete channels, 800 subscriptions,
+   no connection above 300, at least 100 slots free, and refusal of the 401st
+   channel. Observe 400/400 for a full 24 hours and require average desired-set
+   entries + departures ≤8 per poll.
+5. **E3 — sparse-source watermark:** keep the topic silent for at least one
+   hour and prove chat detection/watermark behavior does not stall. Then observe
+   one isolated notice after silence and prove detection resumes and the source
+   re-idles within
+   `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS`.
+6. **Enable, then E4:** only after E1, all of E2 including the 24-hour churn
+   gate, and both E3 cases pass, change
+   `SUPPRESSION_GATING_ENABLED=true` in both Flink compose blocks and recreate
+   the Flink components using the existing procedure. Capture real gift and
+   raid slices and verify mapping, trusted-record age, delivery classification,
+   intended suppression, unaffected pre-notice/outside-window peaks, and the
+   120/180-second defaults. Check and record NTP/clock synchronization on the
+   producer and consumer hosts with approved host tooling: skew over 30 seconds
+   makes notices reject and therefore fail open.
+7. **E5 — rollback rehearsal:** exercise the exact capacity-safe order below.
+
+Evidence remains pending until an operator records it:
+
+| Evidence | Required deployed observation | Status |
+|---|---|---|
+| E1 | Live mixed subscription types; cost 0 of 10 | [ ] Pending operator run |
+| E2 | 400/800 convergence, ≤300 per connection, 100 headroom, 401st refusal, and 24-hour churn ≤8/poll | [ ] Pending operator run |
+| E3 | One-hour silence does not stall; isolated-notice hold stays within the documented re-idle bound | [ ] Pending operator run |
+| E4 | Real gift/raid mapping, age and clock behavior, in-window suppression, and unaffected outside/pre-notice peaks | [ ] Pending operator run |
+| E5 | Kill switch and capacity-safe rollback rehearsal | [ ] Pending operator run |
+
+### Capacity-safe rollback
+
+The governing invariant is absolute: **thresholds MUST NEVER be raised above
+400 while any `channel.chat.notification` subscription exists.**
+
+1. Set `SUPPRESSION_GATING_ENABLED=false` first. This alone is the complete
+   response to a detection-policy-only incident; leave subscriptions and topic
+   in place while diagnosing.
+2. For a transport rollback, unwind or revert the dual-subscription revision
+   while `JOIN_THRESHOLD` and `LEAVE_THRESHOLD` remain 400/400.
+3. Wait until subscription enumeration contains no
+   `channel.chat.notification`, `eventsub_subscription_count` is approximately
+   the desired channel count (~400 rather than ~800), and coverage plus desired
+   metrics are stable.
+4. Only then raise thresholds back toward the prior single-subscription ramp.
+
+The `suppression-events` topic may remain. There is no database schema, Redis
+layout, token, or dependency rollback.
 
 ---
 
@@ -464,7 +704,7 @@ docker compose restart kafka
 docker compose up -d --wait --wait-timeout 180 kafka
 docker exec streamscout-kafka kafka-topics --bootstrap-server localhost:9092 --list
 ```
-Should list `chat-messages` and `stream-lifecycle`.
+Should list `chat-messages`, `stream-lifecycle`, and `suppression-events`.
 
 **After a Kafka restart, also restart these** — they hold open connections to Kafka that do not reconnect on their own:
 ```bash
@@ -664,13 +904,12 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_subscription_count|r
    silent, so the problem is downstream — check the Kafka producer logs and
    `kafka_messages_produced`.
 4. **The count has plateaued and the log says `pool is at its 3-connection
-   limit`.** This is not a fault to restart: the monitored set has been raised
-   past what this transport can carry. Twitch allows 3 websocket connections ×
-   300 subscriptions = **900 channels** per client-id/user-id pair, and the pool
-   refuses a fourth socket deliberately. `subscription_create_failures_total
-   {reason="error"}` climbs while `eventsub_subscription_count` sits flat at
-   ~900. Either lower `LEAVE_THRESHOLD` back under 900, or move to EventSub
-   webhook — see `specs/004-eventsub-parallel-reconciler/research.md` D1.
+   limit`.** This is not a fault to restart: the monitored set or in-flight
+   work has exceeded transport capacity. Twitch allows 3 websocket connections
+   × 300 = **900 subscriptions**, not channels. Feature 007 permits at most 400
+   dual-covered channels (800 steady subscriptions) and reserves 100 slots;
+   do not admit a 401st channel or raise thresholds. Inspect coverage,
+   occupancy, desired count, and the capacity-safe rollback above.
    Re-seeding the token and restarting both achieve nothing here.
 5. **Authentication errors** — check which kind before touching the token. A
    token that is missing, expired, scope-reduced or hand-edited is logged as
