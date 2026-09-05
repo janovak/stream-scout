@@ -1058,9 +1058,9 @@ class TestChannelThresholdConfig:
     def test_thresholds_read_from_environment(self):
         """The monitored set can be ramped without editing code."""
         join, leave = stream_monitoring_service.resolve_thresholds(
-            {"JOIN_THRESHOLD": "300", "LEAVE_THRESHOLD": "500"}
+            {"JOIN_THRESHOLD": "300", "LEAVE_THRESHOLD": "400"}
         )
-        assert (join, leave) == (300, 500)
+        assert (join, leave) == (300, 400)
 
     def test_inverted_band_is_rejected(self):
         """LEAVE below JOIN leaves no hysteresis, so every joined channel would
@@ -1072,10 +1072,17 @@ class TestChannelThresholdConfig:
 
     def test_equal_thresholds_are_allowed(self):
         """A zero-width band is degenerate but not incoherent -- it is the
-        no-hysteresis case, and the operator may want it while ramping."""
+        accepted no-hysteresis case used by Feature 007's firm ceiling."""
         assert stream_monitoring_service.resolve_thresholds(
-            {"JOIN_THRESHOLD": "50", "LEAVE_THRESHOLD": "50"}
-        ) == (50, 50)
+            {"JOIN_THRESHOLD": "400", "LEAVE_THRESHOLD": "400"}
+        ) == (400, 400)
+
+    def test_thresholds_above_the_dual_coverage_ceiling_are_rejected(self):
+        """Configuration cannot consume the 100-slot reconnect headroom."""
+        with pytest.raises(ValueError, match="preserve EventSub reconnect headroom"):
+            stream_monitoring_service.resolve_thresholds(
+                {"JOIN_THRESHOLD": "400", "LEAVE_THRESHOLD": "401"}
+            )
 
     def test_zero_join_threshold_is_rejected(self):
         """Monitoring nothing is a misconfiguration, not a valid state."""
@@ -3319,6 +3326,88 @@ class TestPollDispatchCounts:
         assert actual == expected
 
 
+class TestDesiredSetChurnAccounting:
+    """T027 -- offline proof of accounting, not the 24-hour NFR-007 result."""
+
+    @staticmethod
+    def run_poll(service, *, join=4, leave=4):
+        return TestBatchedPollOrchestration.run_poll(
+            service, join=join, leave=leave
+        )
+
+    def test_metric_is_an_unlabelled_counter_separate_from_active_streams(self):
+        metric = getattr(stream_monitoring_service, "desired_set_churn_total")
+
+        assert metric._type == "counter"
+        assert tuple(metric._labelnames) == ()
+        assert metric is not stream_monitoring_service.active_stream_count
+        assert stream_monitoring_service.active_stream_count._type == "gauge"
+
+    def test_success_counts_entered_plus_departed_after_publication(self):
+        fake_redis = FakeRedis()
+        seed_desired(
+            fake_redis,
+            [(f"old-{index}", index) for index in range(1, 5)],
+        )
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[
+                (f"new-{index}", 100 + index) for index in range(1, 5)
+            ],
+        )
+        metric = getattr(stream_monitoring_service, "desired_set_churn_total")
+        before = metric._value.get()
+        active_before = stream_monitoring_service.active_stream_count._value.get()
+        values_at_publish = []
+        publish = service.desired_store.publish
+
+        def publish_and_observe(desired, broadcaster_ids):
+            values_at_publish.append(metric._value.get())
+            return publish(desired, broadcaster_ids)
+
+        service.desired_store.publish = MagicMock(
+            side_effect=publish_and_observe
+        )
+
+        self.run_poll(service)
+
+        assert values_at_publish == [before], (
+            "churn was counted before the desired-set publication succeeded"
+        )
+        assert metric._value.get() - before == 8
+        assert service.last_poll_result["entered"] == 4
+        assert service.last_poll_result["left"] == 4
+        assert (
+            service.last_poll_result["entered"]
+            + service.last_poll_result["left"]
+            == 8
+        ), "8 changes per poll is directly observable; this is not 24-hour evidence"
+        assert (
+            stream_monitoring_service.active_stream_count._value.get()
+            == active_before
+        )
+
+    @pytest.mark.parametrize("after_apply", [False, True])
+    def test_failed_publication_does_not_count_churn(self, after_apply):
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("old", 1)])
+        service = make_poller(
+            [],
+            fake_redis,
+            ranked_records=[("new", 2)],
+            desired_publish_error=ConnectionError("publish failed"),
+            desired_publish_error_after_apply=after_apply,
+        )
+        metric = getattr(stream_monitoring_service, "desired_set_churn_total")
+        before = metric._value.get()
+
+        self.run_poll(service, join=1, leave=1)
+
+        assert service.last_poll_result["outcome"] == "desired_publish_failed"
+        assert metric._value.get() == before
+
+
 class TestPollObservabilityAndBoundaries:
     @staticmethod
     def run_poll(service):
@@ -3517,14 +3606,28 @@ class TestPollObservabilityAndBoundaries:
         assert record.metadata_unique_count == 1
         assert record.metadata_failure_streak == 1
 
-    def test_production_compose_thresholds_remain_frozen(self):
+    def test_production_compose_matches_feature_007_capacity_ceiling(self):
         repository_root = Path(__file__).resolve().parents[2]
         compose = (repository_root / "docker-compose.yml").read_text()
         stream_monitoring = compose.split("\n  stream-monitoring:", 1)[1]
         stream_monitoring = stream_monitoring.split("\n  api-frontend:", 1)[0]
 
-        assert stream_monitoring.count("- JOIN_THRESHOLD=800") == 1
-        assert stream_monitoring.count("- LEAVE_THRESHOLD=900") == 1
+        assert stream_monitoring.count("- JOIN_THRESHOLD=400") == 1
+        assert stream_monitoring.count("- LEAVE_THRESHOLD=400") == 1
+        assert (
+            stream_monitoring.count(
+                "- AUXILIARY_REFUSAL_RETRY_SECONDS=3600"
+            )
+            == 1
+        )
+        lines = stream_monitoring.splitlines()
+        join_line = lines.index("      - JOIN_THRESHOLD=400")
+        rationale = "\n".join(
+            lines[max(0, join_line - 20):join_line + 6]
+        ).lower()
+        assert "400 channels" in rationale
+        assert "800 subscriptions" in rationale
+        assert "100" in rationale and "headroom" in rationale
         assert (
             stream_monitoring.count(
                 "- CLIPPING_DISABLED_FETCH_PAD_FRACTION=0.30"
@@ -8578,9 +8681,11 @@ class TestPoolCapacityUnits:
         asyncio.run(run())
 
     def test_the_four_hundred_and_first_candidate_is_not_admitted(self):
-        """Refused at the INTENT layer, so the transport is never asked for an
-        801st subscription. With a zero-width band the retained set cannot
-        carry an extra channel either."""
+        """T017/T027: the 400/400 intent layer never returns a 401st channel.
+
+        The existing pool-capacity tests cover the 800-subscription runtime
+        side; this pins the desired-set boundary without duplicating them.
+        """
 
         ranked = [f"c{index}" for index in range(1, 402)]
 
@@ -9017,6 +9122,553 @@ def make_eventsub_event(
             )(),
         },
     )()
+
+
+_ABSENT = object()
+SUPPRESSION_OCCURRED_AT = datetime(
+    2026, 9, 4, 12, 0, 0, 123000, tzinfo=timezone.utc
+)
+SUPPRESSION_RECEIVED_AT_MS = 1788523200456
+KNOWN_IGNORED_NOTICE_TYPES = (
+    "sub",
+    "resub",
+    "gift_paid_upgrade",
+    "prime_paid_upgrade",
+    "unraid",
+    "pay_it_forward",
+    "announcement",
+    "bits_badge_tier",
+    "charity_donation",
+)
+
+
+def make_suppression_event(
+    *,
+    notice_type="community_sub_gift",
+    broadcaster_id="123",
+    occurred_at=SUPPRESSION_OCCURRED_AT,
+    notice_id="notice-uuid",
+    viewer_count=321,
+):
+    """A ChannelChatNotificationEvent fake that can omit TwitchObject fields."""
+    metadata = {}
+    if occurred_at is not _ABSENT:
+        metadata["message_timestamp"] = occurred_at
+    if notice_id is not _ABSENT:
+        metadata["message_id"] = notice_id
+
+    data = {
+        "system_message": "DO_NOT_LOG_SYSTEM_MESSAGE",
+        "message": "DO_NOT_LOG_CHAT_TEXT",
+        "chatter_user_id": "DO_NOT_LOG_USER_ID",
+    }
+    if notice_type is not _ABSENT:
+        data["notice_type"] = notice_type
+    if broadcaster_id is not _ABSENT:
+        data["broadcaster_user_id"] = broadcaster_id
+    if notice_type == "raid" and viewer_count is not _ABSENT:
+        data["raid"] = type(
+            "RaidNotice", (), {"viewer_count": viewer_count}
+        )()
+    elif notice_type == "community_sub_gift":
+        data["community_sub_gift"] = type(
+            "CommunityGiftNotice",
+            (),
+            {"total": 50, "gifter_user_name": "DO_NOT_LOG_GIFTER"},
+        )()
+    elif notice_type == "sub_gift":
+        data["sub_gift"] = type(
+            "GiftNotice",
+            (),
+            {"sub_tier": "3000", "recipient_user_name": "DO_NOT_LOG_RECIPIENT"},
+        )()
+
+    return type(
+        "NotificationEvent",
+        (),
+        {
+            "metadata": type("NotificationMetadata", (), metadata)(),
+            "event": type("NotificationData", (), data)(),
+        },
+    )()
+
+
+def expected_suppression_payload(
+    notice_type,
+    *,
+    broadcaster_id=123,
+    notice_id="notice-uuid",
+    viewer_count=None,
+):
+    return {
+        "schema_version": 1,
+        "broadcaster_id": broadcaster_id,
+        "notice_type": notice_type,
+        "occurred_at_ms": to_epoch_ms(SUPPRESSION_OCCURRED_AT),
+        "notice_id": notice_id,
+        "received_at_ms": SUPPRESSION_RECEIVED_AT_MS,
+        "viewer_count": viewer_count,
+    }
+
+
+def service_counter_value(metric_name, **labels):
+    metric = getattr(stream_monitoring_service, metric_name)
+    return metric.labels(**labels)._value.get()
+
+
+class TestSuppressionEventMapping:
+    """T004 -- pure version-1 producer contract."""
+
+    @staticmethod
+    def map(event):
+        mapper = getattr(eventsub_pool, "map_suppression_event")
+        result = mapper(
+            event,
+            received_at_ms=SUPPRESSION_RECEIVED_AT_MS,
+        )
+        result_type = getattr(eventsub_pool, "SuppressionMapResult")
+        assert isinstance(result, result_type)
+        return result
+
+    def test_schema_version_constant_is_one(self):
+        assert getattr(eventsub_pool, "SUPPRESSION_SCHEMA_VERSION") == 1
+
+    @pytest.mark.parametrize(
+        ("notice_type", "viewer_count"),
+        [
+            ("community_sub_gift", None),
+            ("sub_gift", None),
+            ("raid", 321),
+        ],
+    )
+    def test_trigger_maps_to_exact_version_one_record(
+        self, notice_type, viewer_count
+    ):
+        result = self.map(
+            make_suppression_event(
+                notice_type=notice_type,
+                viewer_count=viewer_count,
+            )
+        )
+
+        assert result.kind == "mapped"
+        assert result.notice_type == notice_type
+        assert result.reason is None
+        assert result.payload == expected_suppression_payload(
+            notice_type,
+            viewer_count=viewer_count,
+        )
+        assert isinstance(result.payload["schema_version"], int)
+        assert isinstance(result.payload["broadcaster_id"], int)
+        assert isinstance(result.payload["notice_type"], str)
+        assert isinstance(result.payload["occurred_at_ms"], int)
+        assert isinstance(result.payload["received_at_ms"], int)
+        assert result.payload["notice_id"] is None or isinstance(
+            result.payload["notice_id"], str
+        )
+        assert result.payload["viewer_count"] is None or isinstance(
+            result.payload["viewer_count"], int
+        )
+        assert set(result.payload) == {
+            "schema_version",
+            "broadcaster_id",
+            "notice_type",
+            "occurred_at_ms",
+            "notice_id",
+            "received_at_ms",
+            "viewer_count",
+        }
+        assert not {
+            "suppress_until_ms",
+            "deadline_ms",
+            "window_ms",
+            "window_seconds",
+            "system_message",
+            "message",
+            "text",
+            "chatter_user_id",
+            "user_id",
+        } & set(result.payload)
+
+    def test_optional_fields_are_null_when_twitch_omits_them(self):
+        event = make_suppression_event(
+            notice_type="raid",
+            notice_id=_ABSENT,
+            viewer_count=_ABSENT,
+        )
+
+        result = self.map(event)
+
+        assert result.payload == expected_suppression_payload(
+            "raid",
+            notice_id=None,
+            viewer_count=None,
+        )
+
+    def test_raid_viewer_count_is_diagnostic_only(self):
+        small = self.map(
+            make_suppression_event(notice_type="raid", viewer_count=1)
+        ).payload
+        large = self.map(
+            make_suppression_event(notice_type="raid", viewer_count=100_000)
+        ).payload
+
+        assert {
+            key: value for key, value in small.items() if key != "viewer_count"
+        } == {
+            key: value for key, value in large.items() if key != "viewer_count"
+        }
+        assert small["viewer_count"] == 1
+        assert large["viewer_count"] == 100_000
+        assert not {
+            "suppress_until_ms",
+            "deadline_ms",
+            "window_ms",
+            "window_seconds",
+        } & set(small)
+
+    @pytest.mark.parametrize(
+        ("notice_type", "metric_label"),
+        [
+            *(
+                (notice_type, notice_type)
+                for notice_type in KNOWN_IGNORED_NOTICE_TYPES
+            ),
+            ("future_notice_type", "other"),
+            (_ABSENT, "other"),
+        ],
+    )
+    def test_non_trigger_is_a_typed_ignored_result(
+        self, notice_type, metric_label
+    ):
+        result = self.map(
+            make_suppression_event(notice_type=notice_type)
+        )
+
+        assert result.kind == "ignored"
+        assert result.payload is None
+        assert result.notice_type == metric_label
+        assert result.reason is None
+
+    @pytest.mark.parametrize(
+        "broadcaster_id",
+        [None, "", "not-an-integer", _ABSENT],
+    )
+    def test_untrustworthy_identity_is_malformed(self, broadcaster_id):
+        result = self.map(
+            make_suppression_event(broadcaster_id=broadcaster_id)
+        )
+
+        assert result.kind == "malformed"
+        assert result.payload is None
+        assert result.notice_type == "community_sub_gift"
+        assert result.reason == "identity"
+
+    @pytest.mark.parametrize(
+        "occurred_at",
+        [None, "", "not-a-timestamp", _ABSENT],
+    )
+    def test_untrustworthy_occurrence_time_is_not_replaced_by_ingest_time(
+        self, occurred_at
+    ):
+        result = self.map(
+            make_suppression_event(occurred_at=occurred_at)
+        )
+
+        assert result.kind == "malformed"
+        assert result.payload is None
+        assert result.notice_type == "community_sub_gift"
+        assert result.reason == "occurred_at"
+
+    def test_ignored_classification_precedes_unrelated_missing_fields(self):
+        event = make_suppression_event(
+            notice_type=_ABSENT,
+            broadcaster_id=_ABSENT,
+            occurred_at=_ABSENT,
+        )
+
+        result = self.map(event)
+
+        assert result.kind == "ignored"
+        assert result.notice_type == "other"
+        assert result.reason is None
+
+
+class TestSuppressionNotificationPublisher:
+    """T033 -- callback wiring, publication, and bounded observability."""
+
+    def test_transport_receives_the_notification_handler(self):
+        async def run():
+            service = StreamMonitoringService()
+            service.twitch = object()
+            pool = MagicMock()
+            pool.start = AsyncMock()
+
+            with patch.object(
+                stream_monitoring_service,
+                "EventSubPoolTransport",
+                return_value=pool,
+            ) as pool_type:
+                assert await service._build_transport() is pool
+
+            args, kwargs = pool_type.call_args
+            assert args == (service.twitch, service._on_eventsub_message)
+            assert (
+                kwargs["notification_handler"]
+                == service._on_eventsub_notification
+            )
+            assert kwargs["on_subscriptions_lost"] == service._on_subscriptions_lost
+            pool.start.assert_awaited_once_with()
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize(
+        ("notice_type", "viewer_count"),
+        [
+            ("community_sub_gift", None),
+            ("sub_gift", None),
+            ("raid", 321),
+        ],
+    )
+    def test_valid_notice_publishes_exact_key_and_json(
+        self, notice_type, viewer_count
+    ):
+        async def run():
+            service = StreamMonitoringService()
+            service.kafka_producer = MagicMock()
+            before = service_counter_value(
+                "kafka_messages_produced",
+                topic="suppression-events",
+            )
+
+            await service._on_eventsub_notification(
+                make_suppression_event(
+                    notice_type=notice_type,
+                    viewer_count=viewer_count,
+                ),
+                received_at_ms=SUPPRESSION_RECEIVED_AT_MS,
+            )
+
+            service.kafka_producer.produce.assert_called_once()
+            produced = service.kafka_producer.produce.call_args.kwargs
+            expected = expected_suppression_payload(
+                notice_type,
+                viewer_count=viewer_count,
+            )
+            assert set(produced) == {"topic", "key", "value", "callback"}
+            assert produced["topic"] == "suppression-events"
+            assert produced["key"] == b"123"
+            assert produced["value"] == json.dumps(expected).encode("utf-8")
+            decoded = json.loads(produced["value"].decode("utf-8"))
+            assert produced["key"] == str(
+                decoded["broadcaster_id"]
+            ).encode("utf-8")
+            assert produced["callback"] == service._delivery_callback
+            service.kafka_producer.poll.assert_called_once_with(0)
+            assert [
+                call[0] for call in service.kafka_producer.method_calls
+            ] == ["produce", "poll"]
+            assert (
+                service_counter_value(
+                    "kafka_messages_produced",
+                    topic="suppression-events",
+                )
+                - before
+                == 1
+            )
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize(
+        ("notice_type", "metric_label"),
+        [
+            *(
+                (notice_type, notice_type)
+                for notice_type in KNOWN_IGNORED_NOTICE_TYPES
+            ),
+            ("future_notice_type", "other"),
+            (_ABSENT, "other"),
+        ],
+    )
+    def test_ignored_notice_is_counted_with_a_bounded_label(
+        self, notice_type, metric_label
+    ):
+        async def run():
+            service = StreamMonitoringService()
+            service.kafka_producer = MagicMock()
+            metric = getattr(
+                stream_monitoring_service,
+                "suppression_notices_ignored_total",
+            )
+            assert tuple(metric._labelnames) == ("notice_type",)
+            before = service_counter_value(
+                "suppression_notices_ignored_total",
+                notice_type=metric_label,
+            )
+
+            await service._on_eventsub_notification(
+                make_suppression_event(notice_type=notice_type),
+                received_at_ms=SUPPRESSION_RECEIVED_AT_MS,
+            )
+
+            service.kafka_producer.produce.assert_not_called()
+            assert (
+                service_counter_value(
+                    "suppression_notices_ignored_total",
+                    notice_type=metric_label,
+                )
+                - before
+                == 1
+            )
+            assert metric_label in {
+                *KNOWN_IGNORED_NOTICE_TYPES,
+                "other",
+            }
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize(
+        ("reason", "event"),
+        [
+            (
+                "identity",
+                make_suppression_event(
+                    notice_type="raid",
+                    broadcaster_id=_ABSENT,
+                ),
+            ),
+            (
+                "occurred_at",
+                make_suppression_event(
+                    notice_type="raid",
+                    occurred_at=_ABSENT,
+                ),
+            ),
+        ],
+    )
+    def test_malformed_notice_is_counted_and_structured_logged(
+        self, reason, event, caplog
+    ):
+        async def run():
+            service = StreamMonitoringService()
+            service.kafka_producer = MagicMock()
+            metric = getattr(
+                stream_monitoring_service,
+                "suppression_notices_malformed_total",
+            )
+            assert tuple(metric._labelnames) == ("reason",)
+            before = service_counter_value(
+                "suppression_notices_malformed_total",
+                reason=reason,
+            )
+
+            with caplog.at_level(logging.WARNING):
+                await service._on_eventsub_notification(
+                    event,
+                    received_at_ms=SUPPRESSION_RECEIVED_AT_MS,
+                )
+
+            service.kafka_producer.produce.assert_not_called()
+            assert (
+                service_counter_value(
+                    "suppression_notices_malformed_total",
+                    reason=reason,
+                )
+                - before
+                == 1
+            )
+            records = [
+                record
+                for record in caplog.records
+                if getattr(record, "reason", None) == reason
+            ]
+            assert len(records) == 1
+            assert records[0].levelno >= logging.WARNING
+            assert records[0].notice_type == "raid"
+            assert records[0].notice_id == "notice-uuid"
+            assert "DO_NOT_LOG_SYSTEM_MESSAGE" not in caplog.text
+            assert "DO_NOT_LOG_CHAT_TEXT" not in caplog.text
+            assert "DO_NOT_LOG_USER_ID" not in caplog.text
+
+        asyncio.run(run())
+
+    def test_produce_exception_is_contained_and_chat_handler_still_runs(
+        self, caplog
+    ):
+        async def run():
+            service = StreamMonitoringService()
+            service.kafka_producer = MagicMock()
+            service.kafka_producer.produce.side_effect = RuntimeError(
+                "broker unavailable"
+            )
+            before = service_counter_value(
+                "kafka_messages_produced",
+                topic="suppression-events",
+            )
+
+            with caplog.at_level(logging.ERROR):
+                await service._on_eventsub_notification(
+                    make_suppression_event(),
+                    received_at_ms=SUPPRESSION_RECEIVED_AT_MS,
+                )
+
+            service.kafka_producer.poll.assert_not_called()
+            assert (
+                service_counter_value(
+                    "kafka_messages_produced",
+                    topic="suppression-events",
+                )
+                == before
+            )
+            assert any(
+                record.message == "Failed to publish suppression event"
+                for record in caplog.records
+            )
+
+            service._publish_chat_message = MagicMock()
+            await service._on_eventsub_message(make_eventsub_event())
+            service._publish_chat_message.assert_called_once()
+
+        asyncio.run(run())
+
+
+class TestSuppressionTopicConfiguration:
+    """T034 -- checked-in topic shape and producer topic identity."""
+
+    def test_kafka_init_adds_only_the_expected_suppression_topic(self):
+        repository_root = Path(__file__).resolve().parents[2]
+        compose = (repository_root / "docker-compose.yml").read_text()
+        kafka_init = compose.split("\n  kafka-init:", 1)[1]
+        kafka_init = kafka_init.split("\n  flink-jobmanager:", 1)[0]
+
+        suppression_command = (
+            "kafka-topics --bootstrap-server kafka:29092 --create "
+            "--if-not-exists --topic suppression-events --partitions 4 "
+            "--replication-factor 1 --config retention.ms=3600000"
+        )
+        chat_command = (
+            "kafka-topics --bootstrap-server kafka:29092 --create "
+            "--if-not-exists --topic chat-messages --partitions 4 "
+            "--replication-factor 1 --config retention.ms=3600000"
+        )
+        lifecycle_command = (
+            "kafka-topics --bootstrap-server kafka:29092 --create "
+            "--if-not-exists --topic stream-lifecycle --partitions 10 "
+            "--replication-factor 1 --config retention.ms=604800000"
+        )
+
+        assert kafka_init.count(suppression_command) == 1
+        assert kafka_init.count(chat_command) == 1
+        assert kafka_init.count(lifecycle_command) == 1
+        assert kafka_init.count("--topic suppression-events") == 1
+        assert kafka_init.count("--topic chat-messages") == 1
+        assert kafka_init.count("--topic stream-lifecycle") == 1
+
+    def test_producer_topic_constant_is_exact(self):
+        assert (
+            getattr(stream_monitoring_service, "SUPPRESSION_EVENTS_TOPIC")
+            == "suppression-events"
+        )
 
 
 class FakeRefusalStore(RefusalStore):

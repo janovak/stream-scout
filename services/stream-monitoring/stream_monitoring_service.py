@@ -36,7 +36,7 @@ from twitchAPI.type import InvalidTokenException, MissingScopeException
 from twitchAPI.type import AuthScope
 
 from desired_set_store import DesiredSetStore, RedisDesiredSetStore
-from eventsub_pool import EventSubPoolTransport, map_chat_message
+from eventsub_pool import EventSubPoolTransport, map_chat_message, map_suppression_event
 from reconciler import (
     PostgresRefusalStore,
     Reconciler,
@@ -95,13 +95,13 @@ SCOPE_MAP = {
 # A streamer leaves it only on exiting top LEAVE_THRESHOLD
 # This preserves Flink baseline data during rank fluctuations
 #
-# Configurable so the monitored set can be ramped empirically (15/30 ->
-# 50/100 -> 150/300 ...) to find where the system actually degrades, rather
-# than designing for one guessed target. The old warning here was that a
-# larger set cost startup time inside the poll tick, at roughly
-# LEAVE_THRESHOLD/2 seconds to join from cold. That is no longer true: the
-# poll writes intent and returns, and `reconciler.py` does the fan-out in
-# parallel outside the tick. See `compute_desired_set` below.
+# Two EventSub subscriptions per monitored channel make 400 the hard ceiling:
+# 400 * 2 = 800 of the 900 available slots, preserving 100 for reconnect and
+# adoption overlap. Configuration may lower the ramp, but it must not consume
+# that headroom.
+MAX_MONITORED_CHANNELS = 400
+
+
 def resolve_thresholds(env=None):
     """Read and validate the hysteresis thresholds from `env`.
 
@@ -126,6 +126,11 @@ def resolve_thresholds(env=None):
         raise ValueError(
             f"LEAVE_THRESHOLD ({leave}) must be >= JOIN_THRESHOLD "
             f"({join}) to give the hysteresis band a width"
+        )
+    if leave > MAX_MONITORED_CHANNELS:
+        raise ValueError(
+            f"LEAVE_THRESHOLD ({leave}) must be <= "
+            f"{MAX_MONITORED_CHANNELS} to preserve EventSub reconnect headroom"
         )
     return join, leave
 
@@ -258,6 +263,11 @@ POLL_PHASES = (
 )
 PHASE_OUTCOMES = ("success", "failure", "empty")
 
+# The Feature 007 notice topic. Named once here rather than repeated as a
+# literal, because the producer's topic identity is asserted directly against
+# this constant and against `docker-compose.yml`'s `kafka-init` block.
+SUPPRESSION_EVENTS_TOPIC = "suppression-events"
+
 active_stream_count = Gauge("active_stream_count", "Number of currently monitored streams")
 chat_messages_total = Counter("chat_messages_total", "Total chat messages processed", ["broadcaster_id"])
 twitch_api_errors_total = Counter("twitch_api_errors_total", "Total Twitch API errors", ["error_type"])
@@ -275,6 +285,35 @@ stream_poll_phase_duration_seconds = Histogram(
 stream_metadata_consecutive_failures = Gauge(
     "stream_metadata_consecutive_failures",
     "Consecutive failed non-empty streamer metadata batches",
+)
+# Chat notifications that were not a suppression trigger. Ordinary traffic, not
+# a fault: `sub`, `resub` and the rest of the documented categories arrive
+# constantly. The label is bounded by `map_suppression_event` -- a documented
+# category keeps its own name and everything else lands in `other`, so a new
+# Twitch category cannot grow the label set.
+suppression_notices_ignored_total = Counter(
+    "suppression_notices_ignored_total",
+    "Chat notifications outside the suppression trigger set, by bounded notice type",
+    ["notice_type"],
+)
+# Trigger notices that were dropped because their identity or their occurrence
+# time could not be trusted. Separate from the counter above precisely because
+# this one IS a fault: publishing here would mean guessing a channel or
+# fabricating a deadline (FR-017). Bounded to `identity` and `occurred_at`.
+suppression_notices_malformed_total = Counter(
+    "suppression_notices_malformed_total",
+    "Suppression trigger notices dropped for untrustworthy identity or occurrence time",
+    ["reason"],
+)
+# Channels entering plus channels leaving the desired set, summed over polls
+# whose publication succeeded. Unlabelled on purpose: a per-channel label would
+# add one series per broadcaster that ever churned, and the NFR-007 bound is a
+# rate over the whole set rather than a per-channel question. `active_stream_count`
+# answers "how many now"; this answers "how much movement", and neither can be
+# derived from the other.
+desired_set_churn_total = Counter(
+    "desired_set_churn_total",
+    "Channels entering plus channels leaving the desired set, over published polls",
 )
 
 
@@ -515,11 +554,14 @@ class StreamMonitoringService:
 
         The pool needs one thing the transport interface does not describe:
         somewhere to put the messages it receives. That is
-        `_on_eventsub_message` below.
+        `_on_eventsub_message` below, and -- since Feature 007 --
+        `_on_eventsub_notification` for the gift and raid notices that arrive
+        on the same sockets.
         """
         pool = EventSubPoolTransport(
             self.twitch,
             self._on_eventsub_message,
+            notification_handler=self._on_eventsub_notification,
             on_subscriptions_lost=self._on_subscriptions_lost,
         )
         await pool.start()
@@ -568,6 +610,58 @@ class StreamMonitoringService:
             chat_messages_total.labels(broadcaster_id=str(broadcaster_id)).inc()
         except Exception as e:
             logger.error("Error processing EventSub chat message", extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+            })
+
+    async def _on_eventsub_notification(self, event, received_at_ms: Optional[int] = None):
+        """Publish one gift/raid notice to `suppression-events`, or count why not.
+
+        Called by the pool once per `channel.chat.notification` event, on the
+        SAME socket loop that delivers chat. Nothing here may block or retry:
+        a stall on this path stalls chat delivery for every channel on that
+        socket, and suppression is the feature that is allowed to be absent
+        (FR-011) while chat is not.
+
+        Every classification decision lives in `map_suppression_event`, so
+        this method never reads the raw event and therefore never sees the
+        free user text a notice carries.
+
+        The three outcomes are counted apart on purpose. `ignored` is ordinary
+        traffic. `malformed` is a fault worth an alert -- it means a trigger
+        was dropped rather than guessed at. Only a mapped notice is published.
+        """
+        try:
+            result = map_suppression_event(event, received_at_ms=received_at_ms)
+            if result.kind == "mapped":
+                # Both the key and the payload identity come from this one
+                # validated value, so they cannot disagree (contract §3.5).
+                self._publish_suppression_event(
+                    result.payload["broadcaster_id"], result.payload
+                )
+            elif result.kind == "ignored":
+                suppression_notices_ignored_total.labels(
+                    notice_type=result.notice_type
+                ).inc()
+            else:
+                suppression_notices_malformed_total.labels(
+                    reason=result.reason
+                ).inc()
+                # Bounded fields only: the reason, the category and Twitch's
+                # own notice id. No message text, no chatter, no gifter.
+                logger.warning(
+                    "Suppression notice dropped as untrustworthy",
+                    extra={
+                        "reason": result.reason,
+                        "notice_type": result.notice_type,
+                        "notice_id": result.notice_id,
+                    },
+                )
+        except Exception as e:
+            # Containment, as on the chat path: an exception escaping here
+            # surfaces only in the library's done-callback and would ride the
+            # socket that is also carrying chat.
+            logger.error("Error processing EventSub chat notification", extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
             })
@@ -1097,6 +1191,12 @@ class StreamMonitoringService:
                 )
                 return outcome
 
+            # Only now: the desired set is durably published, so these channels
+            # really did enter and leave. Counting before the write would keep
+            # counting churn that a failed publication rolled back, and the
+            # NFR-007 bound is read off this counter.
+            desired_set_churn_total.inc(entered_count + left_count)
+
             if self.reconciler is not None:
                 self.reconciler.notify_desired_changed()
             finish_phase(
@@ -1218,6 +1318,34 @@ class StreamMonitoringService:
             kafka_messages_produced.labels(topic="stream-lifecycle").inc()
         except Exception as e:
             logger.error("Failed to publish lifecycle event", extra={"error": str(e)})
+
+    def _publish_suppression_event(self, broadcaster_id: int, payload: dict):
+        """Publish one suppression notice to Kafka.
+
+        The same shape as the two publishers above, including the counter
+        AFTER the produce/poll pair: a produce that raised published nothing,
+        and counting it would make the topic look healthy while it was empty.
+
+        The key is derived from the payload's own validated `broadcaster_id`,
+        which is the producer's invariant to keep -- the Flink job deserializes
+        values only and can never check it (contract §4.0).
+
+        A broker problem is logged and swallowed. Suppression then degrades to
+        absent, which the consumer reads as not-suppressed (FR-011); raising
+        instead would push the failure back onto the socket that is also
+        delivering chat.
+        """
+        try:
+            self.kafka_producer.produce(
+                topic=SUPPRESSION_EVENTS_TOPIC,
+                key=str(broadcaster_id).encode("utf-8"),
+                value=json.dumps(payload).encode("utf-8"),
+                callback=self._delivery_callback
+            )
+            self.kafka_producer.poll(0)
+            kafka_messages_produced.labels(topic=SUPPRESSION_EVENTS_TOPIC).inc()
+        except Exception as e:
+            logger.error("Failed to publish suppression event", extra={"error": str(e)})
 
     def _delivery_callback(self, err, msg):
         """Kafka delivery callback."""

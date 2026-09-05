@@ -140,6 +140,39 @@ MAX_SUBSCRIPTIONS = SUBSCRIPTIONS_PER_CONNECTION * MAX_CONNECTIONS
 CHAT_MESSAGE_SUBSCRIPTION_TYPE = "channel.chat.message"
 CHAT_NOTIFICATION_SUBSCRIPTION_TYPE = "channel.chat.notification"
 
+# Version of the `suppression-events` payload, carried on every record
+# (contracts/suppression-events.schema.md §2). A consumer that does not
+# recognise the value ignores the record, which is what makes adding an
+# optional field safe against a live topic.
+SUPPRESSION_SCHEMA_VERSION = 1
+
+# The only `notice_type` values that ever produce a record (FR-005). Everything
+# else -- including the documented categories below, an absent attribute and
+# any value Twitch adds later -- produces nothing. This tuple is the topic's
+# invariant 3: the consumer's allow-list is defence in depth, not the filter.
+SUPPRESSION_TRIGGER_NOTICE_TYPES = ("community_sub_gift", "sub_gift", "raid")
+
+# The documented 4.5.0 categories that are NOT triggers (research §2.2). They
+# are enumerated so an ignored notice can be counted under its own name while
+# the label set stays bounded: a metric label taken straight from Twitch would
+# grow without limit the day a new category ships.
+KNOWN_IGNORED_NOTICE_TYPES = frozenset(
+    {
+        "sub",
+        "resub",
+        "gift_paid_upgrade",
+        "prime_paid_upgrade",
+        "unraid",
+        "pay_it_forward",
+        "announcement",
+        "bits_badge_tier",
+        "charity_donation",
+    }
+)
+
+# Where every unrecognised or absent category is counted instead (research R7).
+UNKNOWN_NOTICE_TYPE_LABEL = "other"
+
 # How long a channel stays in `degraded_chat_only` after Twitch refuses its
 # notification subscription while chat is live (research D2, data-model I17).
 #
@@ -397,6 +430,163 @@ def map_chat_message(event, *, received_at_ms: Optional[int] = None) -> dict:
     }
 
 
+@dataclass(frozen=True)
+class SuppressionMapResult:
+    """What one `channel.chat.notification` event turned into.
+
+    Typed rather than an `Optional[dict]` so the three outcomes the producer
+    contract distinguishes cannot be confused at the call site: a notice that
+    is not a trigger is ORDINARY (`ignored`), while a trigger this cannot be
+    made trustworthy is a FAULT (`malformed`). Both produce no record, and
+    counting them on the same metric would hide the second behind the first.
+
+    `notice_type` is always a bounded metric label: the real category for a
+    trigger or a documented non-trigger, and `other` for anything else.
+    `reason` is set only for `malformed`, and is one of `identity` or
+    `occurred_at`. `notice_id` is carried so the failure log can name the
+    notice without the caller re-reading the raw event -- which is where the
+    free user text lives.
+    """
+
+    kind: str
+    payload: Optional[dict]
+    notice_type: str
+    reason: Optional[str] = None
+    notice_id: Optional[str] = None
+
+
+def _suppression_notice_id(metadata) -> Optional[str]:
+    """Twitch's own `message_id` for this notice, or `None`.
+
+    `getattr` for the same reason `map_chat_message` uses it: pyTwitchAPI
+    omits an absent field entirely rather than setting it to `None`. Anything
+    that is not a string is dropped, because the contract types the field
+    `str | null` and a diagnostic is not worth a type violation.
+    """
+    notice_id = getattr(metadata, "message_id", None)
+    return notice_id if isinstance(notice_id, str) else None
+
+
+def _suppression_broadcaster_id(value) -> Optional[int]:
+    """The channel identity, or `None` when it cannot be trusted.
+
+    Never guessed and never defaulted (contract §2.1): a suppression record
+    for the wrong channel would silence clipping on a channel that had no
+    burst.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _raid_viewer_count(data) -> Optional[int]:
+    """The raid's audience size, when Twitch sent a trustworthy one.
+
+    Diagnostic only (contract §2.2): the raid window is a constant, so this
+    number may never reach any consumer logic. It is carried so the tuning
+    question "should raid windows scale with audience?" can be revisited from
+    the topic instead of from a producer change.
+    """
+    raid = getattr(data, "raid", None)
+    viewer_count = getattr(raid, "viewer_count", None)
+    if isinstance(viewer_count, bool) or not isinstance(viewer_count, int):
+        return None
+    return viewer_count
+
+
+def map_suppression_event(event, *, received_at_ms: Optional[int] = None) -> SuppressionMapResult:
+    """Map a `ChannelChatNotificationEvent` onto the `suppression-events` schema.
+
+    The schema is `contracts/suppression-events.schema.md`, and this function
+    is its whole enforcement point: it is the only place a record can be
+    created. Pure, so the contract is testable without a socket, a Twitch
+    client or a producer (T004/T005).
+
+    What it carries is a NOTICE, never a decision. No window duration and no
+    computed deadline appear here -- baking policy into the topic would make
+    every retained record wrong the moment a window is retuned (research D7).
+
+    Order matters. The category is classified FIRST, so a notice this feature
+    does not care about is ignored without ever being judged on identity or
+    time it was never going to need. Counting a `sub` as malformed because
+    Twitch omitted a field this feature does not read would turn ordinary
+    traffic into a fault signal.
+
+    The one deliberate divergence from the chat path: a trigger whose
+    `message_timestamp` cannot be read is DROPPED rather than published with a
+    null time. `map_chat_message` publishes `sent_at: null` because the
+    assigner may fall back to record time; here the timestamp becomes a
+    suppression deadline, and substituting the ingestion clock would fabricate
+    one -- which FR-017 forbids (research D9).
+    """
+    data = event.event
+    metadata = getattr(event, "metadata", None)
+    notice_id = _suppression_notice_id(metadata)
+
+    notice_type = getattr(data, "notice_type", None)
+    if notice_type not in SUPPRESSION_TRIGGER_NOTICE_TYPES:
+        return SuppressionMapResult(
+            kind="ignored",
+            payload=None,
+            notice_type=(
+                notice_type
+                if isinstance(notice_type, str)
+                and notice_type in KNOWN_IGNORED_NOTICE_TYPES
+                else UNKNOWN_NOTICE_TYPE_LABEL
+            ),
+            notice_id=notice_id,
+        )
+
+    broadcaster_id = _suppression_broadcaster_id(
+        getattr(data, "broadcaster_user_id", None)
+    )
+    if broadcaster_id is None:
+        return SuppressionMapResult(
+            kind="malformed",
+            payload=None,
+            notice_type=notice_type,
+            reason="identity",
+            notice_id=notice_id,
+        )
+
+    # The same converter and therefore the same clock as `chat-messages.sent_at`,
+    # which is what makes comparing a peak second with a deadline meaningful.
+    occurred_at_ms = to_epoch_ms(getattr(metadata, "message_timestamp", None))
+    if occurred_at_ms is None:
+        return SuppressionMapResult(
+            kind="malformed",
+            payload=None,
+            notice_type=notice_type,
+            reason="occurred_at",
+            notice_id=notice_id,
+        )
+
+    if received_at_ms is None:
+        # Read once. The ingestion clock is diagnostic only -- it never stands
+        # in for `occurred_at_ms` above.
+        received_at_ms = int(time.time() * 1000)
+
+    return SuppressionMapResult(
+        kind="mapped",
+        payload={
+            "schema_version": SUPPRESSION_SCHEMA_VERSION,
+            "broadcaster_id": broadcaster_id,
+            "notice_type": notice_type,
+            "occurred_at_ms": occurred_at_ms,
+            "notice_id": notice_id,
+            "received_at_ms": int(received_at_ms),
+            "viewer_count": (
+                _raid_viewer_count(data) if notice_type == "raid" else None
+            ),
+        },
+        notice_type=notice_type,
+        notice_id=notice_id,
+    )
+
+
 @dataclass
 class _Connection:
     """One websocket session and the subscriptions it holds."""
@@ -442,7 +632,8 @@ async def _discard_notification(event) -> None:
     Dual coverage is not conditional on anything having somewhere to put the
     notices (FR-001): every monitored channel gets both subscriptions, so the
     pool can be constructed without a notification handler and still create
-    the subscription. The producer that consumes these lands with T005.
+    the subscription. The service wires `_on_eventsub_notification` in its
+    place, which maps and publishes through `map_suppression_event`.
     """
     logger.debug("Chat notification received with no handler wired, discarding")
 

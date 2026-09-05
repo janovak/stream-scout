@@ -102,11 +102,21 @@ services:
     # it. Deploying this requires deleting the live `chat-messages` topic
     # before the next restart so this command creates it fresh at 4;
     # otherwise the config here silently stops matching reality.
+    #
+    # `suppression-events` (Feature 007) carries the gift/raid notices the
+    # clip detector uses to ignore the bursts they cause. 4 partitions for the
+    # same reason as above: it must equal FLINK_PARALLELISM so every source
+    # subtask owns exactly one split and split idleness stays well defined.
+    # 1 h retention because a notice is actionable for at most 180 s -- long
+    # enough to replay for debugging, short enough that the topic is not an
+    # operational log. It carries a notice and never a decision, so retuning a
+    # suppression window never invalidates a retained record.
     command: |
       "
       echo 'Creating Kafka topics...'
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic stream-lifecycle --partitions 10 --replication-factor 1 --config retention.ms=604800000
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic chat-messages --partitions 4 --replication-factor 1 --config retention.ms=3600000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic suppression-events --partitions 4 --replication-factor 1 --config retention.ms=3600000
       echo 'Kafka topics created successfully!'
       kafka-topics --bootstrap-server kafka:29092 --list
       "
@@ -397,6 +407,10 @@ services:
       # Scopes this service needs on the token, seeded by
       # seed_twitch_tokens.py REQUIRED_SCOPES:
       #   user:read:chat -- EventSub channel.chat.message (the chat transport)
+      #                     AND channel.chat.notification (the gift/raid
+      #                     notices feature 007 suppresses on). One scope
+      #                     covers both subscription types; feature 007 adds
+      #                     no new scope and nothing reseeds the token.
       #   clips:edit     -- clip creation, shared with the Flink job
       # A token without user:read:chat makes every chat subscription refuse;
       # the service logs that at ERROR on start-up rather than going quiet.
@@ -405,18 +419,29 @@ services:
       - PROMETHEUS_PORT=9100
       - HEALTH_CHECK_PORT=8080
       - LOG_LEVEL=INFO
-      # Monitored channel band. Raised to 800/900 on 2026-08-31 after the
-      # 150/300 point soaked clean for ~1 h post feature-006 merge (all polls
-      # outcome=success, metadata failure streak 0, EventSub converged, no
-      # scheduler skips). Earlier the 2026-08-30 ramp proved ~485 channels safe
-      # (TaskManager RSS flat ~2.6 GB, no ClipCreator pileup, no clip rate
-      # limit). See OPERATIONS.md "Ramping the monitored channel count".
-      - JOIN_THRESHOLD=800
-      - LEAVE_THRESHOLD=900
+      # Monitored channel band, lowered to a firm 400/400 ceiling for feature
+      # 007. The arithmetic is explicit and checked in: every monitored channel
+      # now costs TWO EventSub subscriptions (chat message + chat
+      # notification), and Twitch allows 3 sessions x 300 = 900 subscriptions
+      # on this client-id/user-id pair. So 400 channels = 800 subscriptions,
+      # leaving 100 subscriptions of global headroom for reconnects and 409
+      # adoption across the whole pool.
+      # The band is deliberately zero-width: 400/400 is a locked, measured
+      # ceiling rather than a hysteresis range, and resolve_thresholds accepts
+      # LEAVE == JOIN for exactly this case.
+      # The 24-hour churn bound (NFR-007 / SC-011) is DEPLOYED evidence: it is
+      # read from desired_set_churn_total on the configured machine and is not
+      # claimed here.
+      - JOIN_THRESHOLD=400
+      - LEAVE_THRESHOLD=400
+      # How long a channel stays degraded_chat_only after Twitch refuses its
+      # notification subscription while chat is live. Bounded rather than
+      # permanent, so one auxiliary 403 cannot cost that channel its chat.
+      - AUXILIARY_REFUSAL_RETRY_SECONDS=3600
       # Pad, as a fraction of LEAVE_THRESHOLD, so channels with clipping
       # disabled don't shrink the candidate pool below LEAVE_THRESHOLD. Measured
       # disabled rate near the top is ~22% and thins with depth; 0.30 keeps
-      # margin at any threshold (270 extra at 900). Raise if the "Fewer than
+      # margin at any threshold (120 extra at 400). Raise if the "Fewer than
       # LEAVE_THRESHOLD" warning fires.
       - CLIPPING_DISABLED_FETCH_PAD_FRACTION=0.30
     volumes:
