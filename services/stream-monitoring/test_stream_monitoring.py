@@ -1072,17 +1072,43 @@ class TestChannelThresholdConfig:
 
     def test_equal_thresholds_are_allowed(self):
         """A zero-width band is degenerate but not incoherent -- it is the
-        accepted no-hysteresis case used by Feature 007's firm ceiling."""
+        safe first-deploy override before Feature 007 ramps retention to 450."""
         assert stream_monitoring_service.resolve_thresholds(
             {"JOIN_THRESHOLD": "400", "LEAVE_THRESHOLD": "400"}
         ) == (400, 400)
 
-    def test_thresholds_above_the_dual_coverage_ceiling_are_rejected(self):
-        """Configuration cannot consume the 100-slot reconnect headroom."""
-        with pytest.raises(ValueError, match="preserve EventSub reconnect headroom"):
+    def test_the_retention_threshold_may_reach_the_channel_maximum(self):
+        """T060 / FR-013, decision 27: entry 400, retention and maximum 450.
+
+        450 channels x 2 subscriptions is exactly the 900 the account allows,
+        so 450 is a legal retention threshold. It used to be rejected, because
+        the superseded model reserved 100 slots it no longer promises
+        (FR-014).
+        """
+        assert stream_monitoring_service.resolve_thresholds(
+            {"JOIN_THRESHOLD": "400", "LEAVE_THRESHOLD": "450"}
+        ) == (400, 450)
+
+    def test_thresholds_above_the_dual_coverage_maximum_are_rejected(self):
+        """451 retained channels are 902 subscriptions against 900 slots.
+
+        The bound is the arithmetic, and the message has to say so: the
+        rejected configuration is one the transport cannot hold, not one that
+        eats a reserve nothing reserves any more.
+        """
+        with pytest.raises(ValueError) as caught:
             stream_monitoring_service.resolve_thresholds(
-                {"JOIN_THRESHOLD": "400", "LEAVE_THRESHOLD": "401"}
+                {"JOIN_THRESHOLD": "400", "LEAVE_THRESHOLD": "451"}
             )
+
+        message = str(caught.value)
+        assert "450" in message, (
+            "the rejection does not name the maximum it enforces"
+        )
+        assert "headroom" not in message.lower(), (
+            "the message still justifies the bound with the reconnect "
+            "headroom decision 27 removed; the bound is 450 x 2 == 900"
+        )
 
     def test_zero_join_threshold_is_rejected(self):
         """Monitoring nothing is a misconfiguration, not a valid state."""
@@ -3327,7 +3353,7 @@ class TestPollDispatchCounts:
 
 
 class TestDesiredSetChurnAccounting:
-    """T027 -- offline proof of accounting, not the 24-hour NFR-007 result."""
+    """T027/T064 -- offline proof of advisory churn accounting."""
 
     @staticmethod
     def run_poll(service, *, join=4, leave=4):
@@ -3382,7 +3408,7 @@ class TestDesiredSetChurnAccounting:
             service.last_poll_result["entered"]
             + service.last_poll_result["left"]
             == 8
-        ), "8 changes per poll is directly observable; this is not 24-hour evidence"
+        ), "entered plus departed channels are counted after publication"
         assert (
             stream_monitoring_service.active_stream_count._value.get()
             == active_before
@@ -3606,14 +3632,32 @@ class TestPollObservabilityAndBoundaries:
         assert record.metadata_unique_count == 1
         assert record.metadata_failure_streak == 1
 
-    def test_production_compose_matches_feature_007_capacity_ceiling(self):
+    def test_production_compose_matches_the_amended_capacity_model(self):
+        """T060 / T063, decision 27 -- safely stage the 400 / 450 change.
+
+        The checked-in default remains 400 for the initial dual-coverage
+        deployment. After E1 and E2a pass, an operator explicitly sets
+        LEAVE_THRESHOLD=450 to reach the final retention target. JOIN stays a
+        literal 400 throughout, so a missing environment override cannot
+        accidentally admit more channels.
+        """
         repository_root = Path(__file__).resolve().parents[2]
         compose = (repository_root / "docker-compose.yml").read_text()
         stream_monitoring = compose.split("\n  stream-monitoring:", 1)[1]
         stream_monitoring = stream_monitoring.split("\n  api-frontend:", 1)[0]
 
         assert stream_monitoring.count("- JOIN_THRESHOLD=400") == 1
-        assert stream_monitoring.count("- LEAVE_THRESHOLD=400") == 1
+        assert (
+            stream_monitoring.count(
+                "- LEAVE_THRESHOLD=${LEAVE_THRESHOLD:-400}"
+            )
+            == 1
+        ), (
+            "the checked-in deployment must default retention to 400 until "
+            "the dual-coverage evidence passes"
+        )
+        assert stream_monitoring.count("- LEAVE_THRESHOLD=450") == 0
+        assert stream_monitoring.count("- LEAVE_THRESHOLD=400") == 0
         assert (
             stream_monitoring.count(
                 "- AUXILIARY_REFUSAL_RETRY_SECONDS=3600"
@@ -3623,11 +3667,27 @@ class TestPollObservabilityAndBoundaries:
         lines = stream_monitoring.splitlines()
         join_line = lines.index("      - JOIN_THRESHOLD=400")
         rationale = "\n".join(
-            lines[max(0, join_line - 20):join_line + 6]
+            lines[max(0, join_line - 24):join_line + 6]
         ).lower()
-        assert "400 channels" in rationale
-        assert "800 subscriptions" in rationale
-        assert "100" in rationale and "headroom" in rationale
+        assert "entry" in rationale and "retention" in rationale, (
+            "the rationale does not explain the entry/retention split"
+        )
+        assert "450" in rationale and "900" in rationale, (
+            "the rationale does not carry the 450 x 2 == 900 arithmetic"
+        )
+        assert "e2a" in rationale, (
+            "the rationale does not record that the retention threshold is "
+            "deployed at 400 until E1/E2a pass"
+        )
+        assert "final target" in rationale
+        assert "leave_threshold=450" in rationale, (
+            "the adjacent rationale must give the explicit operator override "
+            "that ramps retention to the final 450 target"
+        )
+        assert "headroom" not in rationale, (
+            "the rationale still promises the 100-slot reconnect headroom; "
+            "FR-014 reserves nothing, and 450 channels consume all 900 slots"
+        )
         assert (
             stream_monitoring.count(
                 "- CLIPPING_DISABLED_FETCH_PAD_FRACTION=0.30"
@@ -8660,6 +8720,15 @@ class TestPoolCapacityUnits:
         asyncio.run(run())
 
     def test_four_hundred_channels_use_eight_hundred_of_nine_hundred(self):
+        """The E2a rung of the amended rollout, unchanged as arithmetic.
+
+        400 channels are 800 subscriptions with 100 slots still free. That is
+        no longer a RESERVE -- decision 27 promises none, and the retention
+        threshold moves to 450 once E1 and E2a pass -- but it is exactly the
+        state the dual transport is deployed into first, so the relation is
+        still worth pinning.
+        """
+
         async def run():
             pool = make_dual_pool()
             for broadcaster_id in range(1, 401):
@@ -8669,7 +8738,8 @@ class TestPoolCapacityUnits:
             assert subscriptions == 800
             assert eventsub_pool.MAX_SUBSCRIPTIONS == 900
             assert eventsub_pool.MAX_SUBSCRIPTIONS - subscriptions == 100, (
-                "the adoption and reconnect headroom is gone"
+                "the deployed 400-channel step no longer leaves the 100 slots "
+                "E2a is measured at"
             )
             assert len(pool._connections) <= eventsub_pool.MAX_CONNECTIONS
             assert all(
@@ -8757,6 +8827,1496 @@ class TestPoolCapacityUnits:
             assert counts.get("notification_only") == 1
 
         asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Feature 007 amendment -- entry 400 / retention-and-maximum 450, and the
+# exact-capacity behaviour that makes 900 of 900 a correct operating point
+# (T060, T061; autonomous decisions 27 and 28)
+# ---------------------------------------------------------------------------
+#
+# Foreign or orphaned enabled subscriptions on the client-id/user-id pair are
+# the one accepted exact-capacity risk with NO test here on purpose. Detecting
+# them needs an exact account-wide total, and the only thing that could supply
+# one is `get_eventsub_subscriptions().total` -- which the Phase 0 spike
+# measured as wrong and which `FakePoolTwitch` therefore reports as a
+# deliberate lie that nothing may read. It stays deployed evidence (E2b).
+
+
+def capacity_error_type():
+    """The distinct `PoolCapacityError` decision 28 adds (data-model I26).
+
+    Resolved at call time rather than imported at module scope, for the same
+    reason `CHAT_TYPE` is spelled out above: a name that does not exist yet
+    must fail the capacity tests alone instead of every test in this file.
+
+    The pool owns it -- it is a fact about this transport's slots -- and the
+    reconciler classifies it, so if both modules expose the name they must
+    expose the SAME object. Two classes would mean a capacity error raised by
+    the pool is caught by nothing.
+    """
+    error = getattr(eventsub_pool, "PoolCapacityError", None)
+    if error is None:
+        pytest.fail(
+            "eventsub_pool.PoolCapacityError does not exist: a hard capacity "
+            "exhaustion is indistinguishable from a provider refusal or a "
+            "transient fault, so the reconciler cannot tell a full account "
+            "from Twitch refusing us (decision 28, data-model I26)"
+        )
+    reconciler_side = getattr(reconciler_module, "PoolCapacityError", None)
+    if reconciler_side is not None and reconciler_side is not error:
+        pytest.fail(
+            "eventsub_pool.PoolCapacityError and reconciler.PoolCapacityError "
+            "are different classes, so a capacity error raised by the pool is "
+            "caught by neither the reconciler's classification nor a caller's "
+            "`except`"
+        )
+    return error
+
+
+def pair_reservation(pool):
+    """The atomic two-connection reservation decision 28 adds (I25).
+
+    One slot on EACH of two connections, taken in one critical section, when
+    no single connection has room for the pair and the pool holds at least two
+    free slots. Both or neither: two concurrent pairs that each reserve half of
+    the same two slots both fail on create, at the exact moment the pool has
+    no slack to recover with.
+    """
+    reserve_pair = getattr(pool, "_reserve_pair", None)
+    if reserve_pair is None:
+        pytest.fail(
+            "the pool has no `_reserve_pair`: a channel's pair can only be "
+            "placed where two slots sit on one connection, so parity "
+            "fragmentation makes a pool with room report itself full and "
+            "convergence stalls at 449 (decision 28, data-model I25)"
+        )
+    return reserve_pair
+
+
+def connection_capacity_of(pool):
+    """Per-connection capacity, including full-below-the-cap (I27).
+
+    The minimal accessor the reconciler can publish from, in the same shape as
+    `occupancy()` and `coverage_counts()`: the transport reports, the
+    reconciler owns the metric. Keyed by connection id, so the label set stays
+    bounded by `MAX_CONNECTIONS`.
+    """
+    accessor = getattr(pool, "connection_capacity", None)
+    if accessor is None:
+        pytest.fail(
+            "the pool has no `connection_capacity()`: a connection that "
+            "Twitch calls full BELOW the 300 cap strands the very slots the "
+            "450th channel needs, and nothing exposes it (decision 28, "
+            "data-model I27). Expected {connection: {'occupancy', 'cap', "
+            "'full_at', 'free', 'full_below_cap'}}"
+        )
+    return accessor()
+
+
+def connection_full_gauge():
+    """`eventsub_connection_full{connection}` (plan, FR-015, NFR-004)."""
+    gauge = getattr(reconciler_module, "eventsub_connection_full", None)
+    if gauge is None:
+        pytest.fail(
+            "reconciler.eventsub_connection_full does not exist: an operator "
+            "cannot see which connection is full, so a stranded-capacity "
+            "condition reads as an unexplained refusal at 449 channels "
+            "(decision 28)"
+        )
+    return gauge
+
+
+def required_connection_capacity_gauge(name):
+    """Resolve one exact per-connection capacity metric name."""
+    gauge = getattr(reconciler_module, name, None)
+    if gauge is None:
+        pytest.fail(
+            f"reconciler.{name} does not exist: connection_capacity() cannot "
+            "be observed with the required per-connection units"
+        )
+    assert gauge._name == name
+    return gauge
+
+
+def effective_cap(pool, connection):
+    """The occupancy this connection can actually reach.
+
+    `cap` unless Twitch has refused below it, in which case the level it
+    refused at is the real ceiling and the difference is stranded capacity.
+    """
+    if connection.full_at is None:
+        return pool.cap
+    return min(pool.cap, connection.full_at)
+
+
+def connection_free_slots(pool):
+    """Free SUBSCRIPTION slots per open connection, keyed like `occupancy()`.
+
+    `load`, not `occupancy`: a reserved slot is spoken for, and at exact
+    capacity the difference between the two is the whole margin.
+    """
+    return {
+        str(connection.connection_id): max(
+            0, effective_cap(pool, connection) - connection.load
+        )
+        for connection in pool._connections
+    }
+
+
+def free_slots(pool):
+    """Free slots across the OPEN connections. Ungrown sockets are not slots."""
+    return sum(connection_free_slots(pool).values())
+
+
+async def fill_to_the_channel_maximum(pool, channels=450):
+    """Bring `channels` channels to complete dual coverage, in rank order."""
+    for broadcaster_id in range(1, channels + 1):
+        await pool.create(broadcaster_id)
+    return list(range(1, channels + 1))
+
+
+def a_channel_on(pool, connection):
+    """The lowest-numbered channel whose CHAT slot lives on `connection`."""
+    return min(
+        slot.broadcaster_id
+        for (_, coverage_type), slot in pool._slots.items()
+        if coverage_type is eventsub_pool.CoverageType.CHAT
+        and slot.connection_id == connection.connection_id
+    )
+
+
+async def strand_one_slot_on(pool, connection):
+    """Free exactly ONE slot on `connection`, the way a revocation does.
+
+    This is where parity fragmentation comes from: a channel's pair is placed
+    together, so a connection only reaches an odd occupancy when one half of
+    some channel goes on its own. The channel is left `notification_only`,
+    which is a convergent state the reconciler already understands.
+    """
+    broadcaster_id = a_channel_on(pool, connection)
+    await revoke_subscription(
+        pool, chat_slot(pool, broadcaster_id).subscription_id, CHAT_TYPE, broadcaster_id
+    )
+    return broadcaster_id
+
+
+class TestAmendedMonitoredSetBoundaries:
+    """T060 / FR-013, FR-014, SC-006, decision 27 -- entry 400, maximum 450.
+
+    The band is back: a channel that is not already monitored enters only
+    inside the top 400, an incumbent is retained through rank 450, and the set
+    never exceeds 450. `compute_desired_set` already computes
+    `(previous | top_join) & top_leave`, so what is new here is the boundary
+    the shipped thresholds put it on, not the expression.
+    """
+
+    RANKED = [f"c{index}" for index in range(1, 501)]
+
+    def test_the_monitored_maximum_is_derived_from_the_subscription_ceiling(self):
+        """450 is not a number someone liked: it is 900 // 2 (FR-014).
+
+        Two subscriptions per channel and 900 slots on the account leave
+        exactly 450 channels and NO guaranteed free reserve. A maximum that
+        drifts from that arithmetic is a maximum that either strands slots or
+        promises a 901st.
+        """
+        assert eventsub_pool.MAX_SUBSCRIPTIONS == 900
+        assert stream_monitoring_service.MAX_MONITORED_CHANNELS == 450
+        assert (
+            stream_monitoring_service.MAX_MONITORED_CHANNELS
+            == eventsub_pool.MAX_SUBSCRIPTIONS // 2
+        ), "the monitored maximum no longer follows the subscription ceiling"
+        assert (
+            eventsub_pool.MAX_SUBSCRIPTIONS
+            - stream_monitoring_service.MAX_MONITORED_CHANNELS * 2
+            == 0
+        ), "a free reserve reappeared; FR-014 promises none"
+
+    def test_a_fresh_channel_inside_the_retention_band_does_not_enter(self):
+        """Ranks 401-450 retain, they do not admit. A newcomer there stays out
+        or the band silently becomes the entry threshold."""
+        desired = compute_desired_set(self.RANKED, set(), 400, 450)
+
+        assert len(desired) == 400
+        assert "c400" in desired
+        assert "c401" not in desired
+        assert "c450" not in desired
+
+    def test_an_incumbent_is_retained_through_rank_450(self):
+        """The same ranks, the other side of the asymmetry (FR-013)."""
+        incumbents = {f"c{index}" for index in range(401, 451)}
+
+        desired = compute_desired_set(self.RANKED, incumbents, 400, 450)
+
+        assert len(desired) == 450
+        assert desired["c401"] == 401
+        assert desired["c450"] == 450
+
+    def test_an_incumbent_past_rank_450_leaves(self):
+        """451 is outside the band, so the incumbent exits -- and the 451st
+        qualifying channel is excluded at the INTENT layer, which is what
+        keeps the transport from ever being asked for a 901st subscription."""
+        incumbents = {f"c{index}" for index in range(401, 452)}
+
+        desired = compute_desired_set(self.RANKED, incumbents, 400, 450)
+
+        assert "c450" in desired
+        assert "c451" not in desired
+        assert len(desired) == 450
+
+    def test_the_desired_set_never_exceeds_the_maximum(self):
+        """Whatever the previous set held -- a restart from a wider band, a
+        ranking five hundred long -- the answer is capped at 450 channels,
+        which is 900 subscriptions exactly."""
+        desired = compute_desired_set(self.RANKED, set(self.RANKED), 400, 450)
+
+        assert len(desired) == stream_monitoring_service.MAX_MONITORED_CHANNELS
+        assert max(desired.values()) == 450
+        assert len(desired) * 2 == eventsub_pool.MAX_SUBSCRIPTIONS
+
+
+class TestExactCapacityCeiling:
+    """T060 / FR-014, FR-015, SC-006 -- 450 channels are 900 of 900 slots.
+
+    Relations, not approximations: the quickstart's E2b reading is equality on
+    every one of these, because at exact capacity "about 900" is the shape of
+    both a healthy pool and a broken one.
+    """
+
+    def test_450_complete_channels_occupy_exactly_900_subscriptions(self):
+        async def run():
+            pool = make_dual_pool()
+            await fill_to_the_channel_maximum(pool)
+
+            occupancy = pool.occupancy()
+            subscriptions = sum(occupancy.values())
+            assert subscriptions == eventsub_pool.MAX_SUBSCRIPTIONS == 900
+            assert len(pool._connections) == eventsub_pool.MAX_CONNECTIONS == 3
+            assert sorted(occupancy.values()) == [300, 300, 300], (
+                f"the pool did not pack into three full sessions: {occupancy}"
+            )
+            assert all(
+                count <= SUBSCRIPTIONS_PER_CONNECTION for count in occupancy.values()
+            )
+            complete = pool.coverage_counts().get("complete")
+            assert complete == 450
+            assert subscriptions == complete * 2, (
+                "channels and subscriptions have drifted apart (FR-015)"
+            )
+            assert free_slots(pool) == 0, (
+                "a free reserve survived; FR-014 promises none at the maximum"
+            )
+
+        asyncio.run(run())
+
+    def test_the_451st_qualifying_channel_is_excluded_before_the_transport(self):
+        """FR-014: admission is refused where intent is computed, so the pool
+        is never asked for a 901st subscription. The transport's own refusal
+        is the second line of defence, and `TestPoolCapacityErrors` covers it.
+        """
+        ranked = [f"c{index}" for index in range(1, 452)]
+        incumbents = {f"c{index}" for index in range(1, 451)}
+
+        desired = compute_desired_set(ranked, incumbents, 400, 450)
+
+        assert "c451" not in desired
+        assert len(desired) == 450
+        assert len(desired) * 2 <= eventsub_pool.MAX_SUBSCRIPTIONS
+
+
+class TestExactCapacitySplitPlacement:
+    """T061 / NFR-001, data-model I25, decision 28 -- placing a pair at 900.
+
+    Two free slots on two different connections are two free slots. Refusing a
+    pair because neither connection alone can hold it turns a full pool into a
+    FALSELY full one, and at the ceiling that is the difference between
+    converging at 450 and stalling at 449.
+    """
+
+    @staticmethod
+    async def _fragmented_pool():
+        """Two saturated sessions with one stranded slot on each.
+
+        A cap of 4 over two connections is the 300-over-three shape in
+        miniature, and it has the property that matters: every channel is a
+        PAIR, so a session only reaches an odd occupancy when some channel is
+        left holding one half. Two of those on two different sessions is the
+        parity fragmentation decision 27 accepts and decision 28 must place
+        into.
+        """
+        pool = make_dual_pool(cap=4, max_connections=2)
+        await pool.start()
+        for broadcaster_id in (1, 2, 3, 4):
+            await pool.create(broadcaster_id)
+        first, second = pool._connections
+        assert sum(pool.occupancy().values()) == 8, "the fixture did not fill"
+
+        await strand_one_slot_on(pool, first)
+        await strand_one_slot_on(pool, second)
+
+        assert connection_free_slots(pool) == {"0": 1, "1": 1}, (
+            "the fixture no longer sets up the case it is testing: it needs "
+            "one free slot on each session and none with room for a pair"
+        )
+        assert free_slots(pool) == 2
+        return pool
+
+    def test_a_pair_splits_across_two_connections_when_no_connection_holds_two(self):
+        """The load-bearing case, at the real numbers.
+
+        900 of 900 with a single half revoked on two sessions leaves 898 and
+        two free slots that no whole pair can use. The last channel is
+        reachable only by taking one of each.
+        """
+
+        async def run():
+            pool = make_dual_pool()
+            await pool.start()
+            await fill_to_the_channel_maximum(pool)
+            first, second, _third = pool._connections
+            await strand_one_slot_on(pool, first)
+            await strand_one_slot_on(pool, second)
+            assert sum(pool.occupancy().values()) == 898
+            assert free_slots(pool) == 2
+            assert max(connection_free_slots(pool).values()) == 1, (
+                "a connection still has room for a whole pair, so this proves "
+                "nothing about splitting"
+            )
+
+            await pool.create(451)
+
+            assert coverage_state(pool, 451) == "complete"
+            assert (
+                chat_slot(pool, 451).connection_id
+                != notification_slot(pool, 451).connection_id
+            ), "the pair was not split, so one of the two free slots is stranded"
+            occupancy = pool.occupancy()
+            assert sum(occupancy.values()) == eventsub_pool.MAX_SUBSCRIPTIONS
+            assert all(
+                count <= SUBSCRIPTIONS_PER_CONNECTION for count in occupancy.values()
+            ), f"a session went past the 300 cap: {occupancy}"
+            assert free_slots(pool) == 0
+            assert all(connection.reserved == 0 for connection in pool._connections)
+
+        asyncio.run(run())
+
+    def test_the_pair_reservation_prefers_one_connection_while_it_has_room(self):
+        """Co-location FIRST. Splitting costs locality -- a socket death then
+        takes half a channel instead of all of it -- so it is the fallback,
+        never the habit."""
+
+        async def run():
+            pool = make_dual_pool(cap=10)
+            connection = await pool._grow()
+
+            placement = await pair_reservation(pool)(9)
+
+            assert set(placement) == set(eventsub_pool.CoverageType)
+            assert placement[eventsub_pool.CoverageType.CHAT] is connection
+            assert placement[eventsub_pool.CoverageType.NOTIFICATION] is connection
+            assert connection.reserved == 2, (
+                "the whole pair was not held, so a worker routing in this "
+                "window sees room that is already spoken for"
+            )
+
+            await pool._release(connection, slots=2)
+            assert connection.reserved == 0
+
+        asyncio.run(run())
+
+    def test_the_pair_reservation_grows_before_using_two_existing_holes(self):
+        """When growth is available, preserve locality instead of fragmenting.
+
+        Two one-slot holes are sufficient only at the connection ceiling.
+        Before then, a new connection can hold the pair together and leaves
+        those holes available for one-sided repairs.
+        """
+
+        async def run():
+            pool = make_dual_pool(cap=4, max_connections=3)
+            await pool.start()
+            for broadcaster_id in (1, 2, 3, 4):
+                await pool.create(broadcaster_id)
+            first, second = pool._connections
+            await strand_one_slot_on(pool, first)
+            await strand_one_slot_on(pool, second)
+
+            assert len(pool._connections) == 2
+            assert connection_free_slots(pool) == {"0": 1, "1": 1}
+
+            placement = await pair_reservation(pool)(5)
+
+            assert len(pool._connections) == 3
+            grown = pool._connections[-1]
+            assert {
+                placement[coverage_type].connection_id
+                for coverage_type in eventsub_pool.CoverageType
+            } == {grown.connection_id}, (
+                "the pair was permanently split before the pool reached its "
+                "connection ceiling"
+            )
+            assert grown.reserved == 2
+            assert connection_free_slots(pool)[str(first.connection_id)] == 1
+            assert connection_free_slots(pool)[str(second.connection_id)] == 1
+
+            await pool._release(grown, slots=2)
+            assert all(connection.reserved == 0 for connection in pool._connections)
+
+        asyncio.run(run())
+
+    def test_the_pair_reservation_takes_one_slot_on_each_connection_when_it_must(self):
+        """The helper's own contract: a mapping of coverage type to the
+        connection that half will be created on, both halves held at once.
+        This fixture is already at max_connections, so growth is unavailable.
+        """
+
+        async def run():
+            pool = await self._fragmented_pool()
+            first, second = pool._connections
+
+            placement = await pair_reservation(pool)(5)
+
+            assert set(placement) == set(eventsub_pool.CoverageType)
+            assert {
+                placement[coverage_type].connection_id
+                for coverage_type in eventsub_pool.CoverageType
+            } == {first.connection_id, second.connection_id}
+            assert first.reserved == 1 and second.reserved == 1
+            assert free_slots(pool) == 0, (
+                "the reservation is not counted, so another worker can take "
+                "the same two slots"
+            )
+
+            # The one-slot path a repair uses is unchanged by any of this.
+            for connection in placement.values():
+                await pool._release(connection, slots=1)
+            assert all(connection.reserved == 0 for connection in pool._connections)
+            assert await pool._reserve(5, slots=1) in (first, second)
+
+        asyncio.run(run())
+
+    def test_two_pairs_racing_for_the_last_two_slots_reserve_all_or_nothing(self):
+        """Both slots or neither, in ONE critical section (decision 28).
+
+        Reserving them one at a time lets two concurrent pairs take half of
+        the same two free slots: both then fail on create, and at exact
+        capacity there is no slack to recover with. The interleaving is forced
+        with events rather than sleeps -- the loser must attempt its
+        reservation while the winner still holds both.
+        """
+
+        async def run():
+            capacity_error = capacity_error_type()
+            pool = await self._fragmented_pool()
+
+            reserved = asyncio.Event()
+            attempted = asyncio.Event()
+            for connection in pool._connections:
+                websocket = connection.websocket
+                original = websocket.listen_channel_chat_message
+
+                async def gated(
+                    broadcaster_user_id, user_id, callback, _original=original
+                ):
+                    if broadcaster_user_id == "5":
+                        # The winner holds both halves and has recorded
+                        # neither. Let the loser try for them now.
+                        reserved.set()
+                        await attempted.wait()
+                    return await _original(broadcaster_user_id, user_id, callback)
+
+                websocket.listen_channel_chat_message = gated
+
+            async def winner():
+                try:
+                    return await pool.create(5)
+                finally:
+                    # Never leave the loser waiting, whatever happened here.
+                    reserved.set()
+
+            async def loser():
+                await reserved.wait()
+                try:
+                    return await pool.create(6)
+                finally:
+                    attempted.set()
+
+            outcomes = await asyncio.gather(
+                winner(), loser(), return_exceptions=True
+            )
+
+            failures = [
+                outcome for outcome in outcomes if isinstance(outcome, BaseException)
+            ]
+            assert len(failures) == 1, (
+                f"both pairs took half of the same two slots: {outcomes}"
+            )
+            assert isinstance(failures[0], capacity_error)
+            assert not isinstance(
+                failures[0],
+                (SubscriptionRefusedError, RateLimitedError, TransientSessionError),
+            ), "a full pool was reported as a refusal or a transient fault"
+
+            states = {
+                broadcaster_id: coverage_state(pool, broadcaster_id)
+                for broadcaster_id in (5, 6)
+            }
+            assert sorted(states.values()) == ["absent", "complete"], (
+                f"neither or both channels landed: {states}"
+            )
+            loser_id = next(bid for bid, state in states.items() if state == "absent")
+            assert chat_slot(pool, loser_id) is None
+            assert notification_slot(pool, loser_id) is None, (
+                "the loser kept half a reservation's worth of coverage"
+            )
+            assert sum(pool.occupancy().values()) == 8
+            assert free_slots(pool) == 0
+            assert all(connection.reserved == 0 for connection in pool._connections)
+
+        asyncio.run(run())
+
+    def test_a_failure_after_reservation_keeps_the_successful_half(self):
+        """A chat-only channel is a convergent state, so the surviving half
+        stays: discarding it would cost a slot to recreate, and at 900 of 900
+        that slot may not be there on the next pass. The FAILED half's
+        reservation is released, on whichever connection it was taken."""
+
+        async def run():
+            pool = await self._fragmented_pool()
+            for connection in pool._connections:
+                connection.websocket.raise_on_subscribe_by_type[NOTIFICATION_TYPE] = (
+                    eventsub_pool.TwitchBackendException("twitch 500")
+                )
+
+            with pytest.raises(TransportError):
+                await pool.create(5)
+
+            assert coverage_state(pool, 5) == "chat_only", (
+                "the surviving chat half was discarded with its sibling"
+            )
+            assert sorted(pool.occupancy().values()) == [3, 4]
+            assert all(connection.reserved == 0 for connection in pool._connections), (
+                "the failed half's reservation outlived the create, so the "
+                "slot it held can never be used again"
+            )
+            assert free_slots(pool) == 1
+
+            # And the repair is a ONE-slot placement into the slot the failure
+            # gave back, which completes the channel on the next pass.
+            for connection in pool._connections:
+                connection.websocket.raise_on_subscribe_by_type.pop(
+                    NOTIFICATION_TYPE, None
+                )
+
+            await pool.create(5)
+
+            assert coverage_state(pool, 5) == "complete"
+            assert sum(pool.occupancy().values()) == 8
+            assert free_slots(pool) == 0
+            chat_creates = sum(
+                len(listen_calls_of(connection.websocket, CHAT_TYPE))
+                for connection in pool._connections
+            )
+            assert chat_creates == 5, (
+                "the repair made a second chat subscription for the channel "
+                "that already had one (FR-002)"
+            )
+
+        asyncio.run(run())
+
+
+class TestExactCapacityConvergence:
+    """T061 / NFR-001, NFR-003, decisions 27-28 -- staying correct at 900.
+
+    At 800 of 900 the pool always had a whole connection's worth of slack, so
+    every ordering question below was academic. With no reserve, a pass that
+    creates before it drops cannot converge at all.
+    """
+
+    @staticmethod
+    async def _ceiling_with_split_pairs(pool):
+        """450 complete channels, 900 subscriptions, two pairs split 1 + 1.
+
+        Reachable, and reached the way the deployed path reaches it. Parity is
+        why splits come in twos: three sessions of 300 are even, so one split
+        pair leaves two sessions odd and a second split is what closes the
+        arithmetic again.
+
+        1. 450 channels fill three sessions exactly.
+        2. Two revocations strand one free slot on two different sessions.
+        3. The next channel admitted cannot be co-located, so it is split.
+        4. The two half-covered channels leave the set and are reclaimed,
+           stranding the same 1 + 1 again.
+        5. The channel that replaces them is split too.
+
+        Returns the channels the pool holds and the two that are split.
+        """
+        await fill_to_the_channel_maximum(pool)
+        first, second, _third = pool._connections
+        departed = [
+            await strand_one_slot_on(pool, first),
+            await strand_one_slot_on(pool, second),
+        ]
+        assert sum(pool.occupancy().values()) == 898
+
+        split_channels = []
+        for broadcaster_id, reclaim in ((451, departed), (452, ())):
+            await pool.create(broadcaster_id)
+            split_channels.append(broadcaster_id)
+            handles = pool.partial_channel_handles()
+            for gone in reclaim:
+                await pool.delete(handles[gone])
+
+        held = [
+            broadcaster_id
+            for broadcaster_id in range(1, 453)
+            if broadcaster_id not in departed
+        ]
+        assert sum(pool.occupancy().values()) == eventsub_pool.MAX_SUBSCRIPTIONS
+        assert pool.coverage_counts().get("complete") == 450
+        assert free_slots(pool) == 0
+        for broadcaster_id in split_channels:
+            assert (
+                chat_slot(pool, broadcaster_id).connection_id
+                != notification_slot(pool, broadcaster_id).connection_id
+            ), f"channel {broadcaster_id} was not placed as a split pair"
+        return held, split_channels
+
+    @staticmethod
+    def _seed(fake_redis, broadcaster_ids):
+        seed_desired(
+            fake_redis, [(f"c{bid}", bid) for bid in sorted(broadcaster_ids)]
+        )
+
+    def test_a_departing_split_pair_is_dropped_before_its_replacement_is_created(self):
+        """The ordering IS the convergence at exact capacity.
+
+        The departing channel holds one slot on each of two sessions. Until
+        both are released there is nowhere for the arriving channel to go, so
+        a pass that created first would report a full pool and leave the
+        monitored set one channel short until some later pass happened to
+        interleave differently.
+        """
+
+        async def run():
+            fake_redis = FakeRedis()
+            pool = make_dual_pool(twitch=FakePoolTwitch())
+            await pool.start()
+            held, split_channels = await self._ceiling_with_split_pairs(pool)
+            reconciler = make_reconciler(
+                pool, fake_redis, readopt_interval_seconds=3600
+            )
+            # The pool was brought to the ceiling directly, so the reconciler
+            # is handed the view a completed enumeration would have left it.
+            reconciler._actual = {
+                broadcaster_id: chat_slot(pool, broadcaster_id).subscription_id
+                for broadcaster_id in held
+            }
+            reconciler._adoption_complete = True
+            reconciler._last_adopt = time.monotonic()
+
+            departing = split_channels[0]
+            arriving = 500
+            self._seed(
+                fake_redis, [bid for bid in held if bid != departing] + [arriving]
+            )
+
+            order = []
+            transport_create, transport_delete = pool.create, pool.delete
+
+            async def recording_create(broadcaster_id):
+                order.append(("create", broadcaster_id))
+                return await transport_create(broadcaster_id)
+
+            async def recording_delete(subscription_id):
+                order.append(("delete", subscription_id))
+                return await transport_delete(subscription_id)
+
+            pool.create, pool.delete = recording_create, recording_delete
+
+            await reconciler.reconcile_once()
+
+            operations = [operation for operation, _ in order]
+            assert "delete" in operations and "create" in operations
+            assert operations.index("create") > max(
+                index
+                for index, operation in enumerate(operations)
+                if operation == "delete"
+            ), (
+                f"a create was issued before the departing pair was dropped: "
+                f"{operations}"
+            )
+            assert coverage_state(pool, departing) == "absent"
+            assert coverage_state(pool, arriving) == "complete"
+            assert (
+                chat_slot(pool, arriving).connection_id
+                != notification_slot(pool, arriving).connection_id
+            ), "the replacement did not take the two slots the drop freed"
+            occupancy = pool.occupancy()
+            assert sum(occupancy.values()) == eventsub_pool.MAX_SUBSCRIPTIONS
+            assert all(
+                count <= SUBSCRIPTIONS_PER_CONNECTION for count in occupancy.values()
+            )
+            assert pool.coverage_counts().get("complete") == 450
+            assert free_slots(pool) == 0
+            assert arriving in reconciler._actual
+            assert departing not in reconciler._actual
+
+        asyncio.run(run())
+
+    def test_a_hard_socket_loss_reconverges_to_the_exact_ceiling(self):
+        """A session death at 900 takes 300 subscriptions with it.
+
+        Convergence is bounded explicitly: one pass is expected -- the losses
+        are absent, not refused, so the ordinary diff re-creates them -- and
+        anything past two passes is a reconciler that cannot get back to the
+        ceiling it was at, which at exact capacity looks the same as a
+        permanent coverage hole.
+        """
+
+        async def run():
+            fake_redis = FakeRedis()
+            pool = make_dual_pool(twitch=FakePoolTwitch())
+            await pool.start()
+            reconciler = make_reconciler(
+                pool, fake_redis, readopt_interval_seconds=3600
+            )
+            pool.on_subscriptions_lost = reconciler.invalidate_actual_set
+            self._seed(fake_redis, range(1, 451))
+
+            await reconciler.reconcile_once()
+            assert sum(pool.occupancy().values()) == eventsub_pool.MAX_SUBSCRIPTIONS
+            assert pool.coverage_counts().get("complete") == 450
+
+            pool._connections[1].websocket.die()
+            assert pool.reap_dead_connections() == SUBSCRIPTIONS_PER_CONNECTION
+            assert sum(pool.occupancy().values()) == 600
+
+            passes = 0
+            for _ in range(3):
+                passes += 1
+                await reconciler.reconcile_once()
+                assert (
+                    sum(pool.occupancy().values())
+                    <= eventsub_pool.MAX_SUBSCRIPTIONS
+                ), "the repair pushed the account past 900 subscriptions"
+                if pool.coverage_counts().get("complete") == 450:
+                    break
+
+            occupancy = pool.occupancy()
+            assert sum(occupancy.values()) == eventsub_pool.MAX_SUBSCRIPTIONS
+            assert pool.coverage_counts().get("complete") == 450
+            assert len(pool._connections) == eventsub_pool.MAX_CONNECTIONS
+            assert all(
+                count <= SUBSCRIPTIONS_PER_CONNECTION for count in occupancy.values()
+            )
+            assert free_slots(pool) == 0
+            assert passes <= 2, (
+                f"reconvergence to the ceiling took {passes} passes; the "
+                "channels a dead session held are absent, not refused"
+            )
+
+        asyncio.run(run())
+
+    def test_a_reconnect_that_rotates_ids_consumes_no_extra_slot(self):
+        """Decision 27's first reason the reserve can go.
+
+        Twitch disables everything on a session that ends, and reconnecting
+        rotates subscription ids inside the same budget. The pool must
+        re-create against the slots the old session released rather than ask
+        for new ones, or a reconnect at the ceiling is a 901st subscription.
+        """
+
+        async def run():
+            pool = make_dual_pool(twitch=FakePoolTwitch())
+            await pool.start()
+            await fill_to_the_channel_maximum(pool)
+            connection = pool._connections[0]
+            websocket = connection.websocket
+            broadcaster_id = a_channel_on(pool, connection)
+
+            websocket.reconnect("session-after-reconnect")
+            websocket.rotate_ids()
+
+            handle = await pool.create(broadcaster_id)
+
+            occupancy = pool.occupancy()
+            assert sum(occupancy.values()) == eventsub_pool.MAX_SUBSCRIPTIONS
+            assert all(
+                count <= SUBSCRIPTIONS_PER_CONNECTION for count in occupancy.values()
+            )
+            assert coverage_state(pool, broadcaster_id) == "complete"
+            assert chat_slot(pool, broadcaster_id).subscription_id == handle
+            assert (
+                chat_slot(pool, broadcaster_id).session_id == "session-after-reconnect"
+            )
+            assert free_slots(pool) == 0
+            assert all(live.reserved == 0 for live in pool._connections)
+
+        asyncio.run(run())
+
+    def test_a_conflict_at_exact_capacity_is_adopted_without_consuming_a_slot(self):
+        """Decision 27's second reason: a 409 means it already exists and is
+        already counted. Adoption records the id and creates nothing.
+
+        At 900 of 900 that has to hold even though the pool has no free slot
+        to offer the create it is about to attempt -- the subscription being
+        adopted is already occupying one of the 900.
+        """
+
+        async def run():
+            twitch = FakePoolTwitch()
+            pool = make_dual_pool(twitch=twitch)
+            await pool.start()
+            await fill_to_the_channel_maximum(pool)
+            connection = pool._connections[0]
+            websocket = connection.websocket
+            broadcaster_id = a_channel_on(pool, connection)
+            chat_id = chat_slot(pool, broadcaster_id).subscription_id
+            notification_id = notification_slot(pool, broadcaster_id).subscription_id
+
+            # The pool's own index lost the channel -- a restart, or a walk
+            # that failed before it reached these rows. Twitch still holds
+            # both halves, and they still occupy their slots.
+            for coverage_type in eventsub_pool.CoverageType:
+                pool._slots.pop((broadcaster_id, coverage_type), None)
+            pool._by_subscription.pop(chat_id, None)
+            pool._by_subscription.pop(notification_id, None)
+            twitch.subscriptions = [
+                existing_subscription(chat_id, broadcaster_id, websocket.session_id),
+                notification_subscription(
+                    notification_id, broadcaster_id, websocket.session_id
+                ),
+            ]
+            for live in pool._connections:
+                live.websocket.raise_on_subscribe = (
+                    eventsub_pool.EventSubSubscriptionConflict("409 conflict")
+                )
+            calls_before = {
+                live.connection_id: len(live.websocket.listen_calls)
+                for live in pool._connections
+            }
+
+            handle = await pool.create(broadcaster_id)
+
+            assert handle == chat_id
+            assert chat_slot(pool, broadcaster_id).subscription_id == chat_id
+            assert (
+                notification_slot(pool, broadcaster_id).subscription_id
+                == notification_id
+            )
+            assert coverage_state(pool, broadcaster_id) == "complete"
+            assert sum(pool.occupancy().values()) == eventsub_pool.MAX_SUBSCRIPTIONS, (
+                "adoption changed the occupancy of a pool that was already "
+                "exactly full"
+            )
+            assert {
+                live.connection_id: len(live.websocket.listen_calls)
+                for live in pool._connections
+            } == calls_before, "adoption created a subscription"
+            assert all(live.reserved == 0 for live in pool._connections)
+
+        asyncio.run(run())
+
+
+class TestPoolCapacityErrors:
+    """T061 / NFR-004, data-model I26, decision 28 -- "the account is full".
+
+    With no reserve, "no slot anywhere" is an expected, reportable operating
+    state. It must never reach the reconciler as a provider refusal: that path
+    writes `streamers.eventsub_refused_at`, which stands for seven days, so an
+    arithmetic condition would evict a channel for a week.
+    """
+
+    @staticmethod
+    async def _exhausted_pool():
+        """Every connection open and every slot taken, in miniature."""
+        pool = make_dual_pool(cap=2, max_connections=3)
+        for broadcaster_id in (1, 2, 3):
+            await pool.create(broadcaster_id)
+        assert len(pool._connections) == 3
+        assert sum(pool.occupancy().values()) == 6
+        assert free_slots(pool) == 0
+        return pool
+
+    def test_a_full_pool_raises_the_distinct_capacity_error(self):
+        async def run():
+            capacity_error = capacity_error_type()
+            pool = await self._exhausted_pool()
+            blocked_before = pool._growth_blocked_until
+
+            with pytest.raises(capacity_error) as caught:
+                await pool.create(4)
+
+            assert isinstance(caught.value, TransportError), (
+                "the capacity error is outside the transport error family the "
+                "reconciler catches"
+            )
+            assert not isinstance(
+                caught.value,
+                (SubscriptionRefusedError, RateLimitedError, TransientSessionError),
+            )
+            assert pool._growth_blocked_until == blocked_before, (
+                "a hard ceiling armed the transient growth backoff; waiting "
+                "cannot fix 900 of 900, and the timer delays the next "
+                "legitimate placement after a delete or a retirement"
+            )
+            assert pool._growth_blocked_until <= time.monotonic()
+            assert sum(pool.occupancy().values()) == 6, (
+                "existing coverage was evicted to make room"
+            )
+            assert pool.coverage_counts().get("complete") == 3
+            assert coverage_state(pool, 4) == "absent"
+            assert all(connection.reserved == 0 for connection in pool._connections)
+
+        asyncio.run(run())
+
+    def test_a_delete_immediately_permits_the_next_create(self):
+        """Nothing to wait for means nothing IS waited for. The slot a delete
+        gives back is usable on the same pass, not after a backoff armed for a
+        condition no timer can change."""
+
+        async def run():
+            capacity_error = capacity_error_type()
+            pool = await self._exhausted_pool()
+            with pytest.raises(capacity_error):
+                await pool.create(4)
+
+            await pool.delete(chat_slot(pool, 1).subscription_id)
+            assert free_slots(pool) == 2
+
+            await pool.create(4)
+
+            assert coverage_state(pool, 4) == "complete"
+            assert sum(pool.occupancy().values()) == 6
+            assert pool._growth_blocked_until <= time.monotonic(), (
+                "the capacity refusal left a growth backoff armed behind it"
+            )
+
+        asyncio.run(run())
+
+    def test_capacity_preflight_shares_one_snapshot_across_blocked_creates(self):
+        """One full pool must not trigger two Helix walks per blocked channel.
+
+        Concurrent callers and a following serial caller share one bounded
+        snapshot generation. The snapshot may adopt only enabled rows on a
+        session this pool currently holds; broadcaster-mismatched, disabled,
+        and dead-session rows remain unclaimed.
+        """
+
+        async def run():
+            capacity_error = capacity_error_type()
+            twitch = FakePoolTwitch()
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(
+                cap=2,
+                max_connections=2,
+                twitch=twitch,
+                monotonic_ms=clock,
+            )
+            await pool.start()
+            await pool.create(10)
+            await pool.create(11)
+            assert free_slots(pool) == 0
+
+            chat = chat_slot(pool, 10)
+            notification = notification_slot(pool, 10)
+            live_session = chat.session_id
+            for coverage_type, slot in (
+                (eventsub_pool.CoverageType.CHAT, chat),
+                (eventsub_pool.CoverageType.NOTIFICATION, notification),
+            ):
+                pool._slots.pop((10, coverage_type))
+                pool._by_subscription.pop(slot.subscription_id)
+
+            twitch.subscriptions = [
+                existing_subscription(
+                    chat.subscription_id, 10, live_session
+                ),
+                notification_subscription(
+                    notification.subscription_id, 10, live_session
+                ),
+                existing_subscription("dead-chat", 12, "dead-session"),
+                notification_subscription("dead-notice", 12, "dead-session"),
+                existing_subscription(
+                    "disabled-chat",
+                    13,
+                    live_session,
+                    status="websocket_disconnected",
+                ),
+                notification_subscription(
+                    "disabled-notice",
+                    13,
+                    live_session,
+                    status="websocket_disconnected",
+                ),
+                existing_subscription("foreign-chat", 999, live_session),
+                notification_subscription("foreign-notice", 999, live_session),
+            ]
+
+            original_preflight = pool._adopt_at_capacity
+            all_concurrent_callers_arrived = asyncio.Event()
+            arrivals = 0
+
+            async def synchronized_preflight(*args, **kwargs):
+                nonlocal arrivals
+                arrivals += 1
+                if arrivals == 3:
+                    all_concurrent_callers_arrived.set()
+                await all_concurrent_callers_arrived.wait()
+                return await original_preflight(*args, **kwargs)
+
+            pool._adopt_at_capacity = synchronized_preflight
+            outcomes = await asyncio.gather(
+                pool.create(10),
+                pool.create(12),
+                pool.create(13),
+                return_exceptions=True,
+            )
+
+            assert outcomes[0] == chat.subscription_id
+            assert all(
+                isinstance(outcome, capacity_error) for outcome in outcomes[1:]
+            )
+            with pytest.raises(capacity_error):
+                await pool.create(14)
+
+            assert twitch.listed_types.count(CHAT_TYPE) == 1
+            assert twitch.listed_types.count(NOTIFICATION_TYPE) == 1
+            assert chat_slot(pool, 10).subscription_id == chat.subscription_id
+            assert (
+                notification_slot(pool, 10).subscription_id
+                == notification.subscription_id
+            )
+            for broadcaster_id in (12, 13, 14, 999):
+                assert coverage_state(pool, broadcaster_id) == "absent"
+            assert sum(pool.occupancy().values()) == 4
+            assert all(connection.reserved == 0 for connection in pool._connections)
+
+        asyncio.run(run())
+
+    def test_capacity_snapshot_window_starts_after_the_walk_finishes(self):
+        """Slow pagination must not consume the cache window before storage."""
+
+        async def run():
+            capacity_error = capacity_error_type()
+            twitch = FakePoolTwitch()
+            clock = FakeMonotonicMs()
+            pool = make_dual_pool(
+                cap=2,
+                max_connections=2,
+                twitch=twitch,
+                monotonic_ms=clock,
+            )
+            await pool.start()
+            await pool.create(1)
+            await pool.create(2)
+
+            original_collect = pool._collect_adoptable
+
+            async def slow_collect(*args, **kwargs):
+                await original_collect(*args, **kwargs)
+                clock.advance_seconds(0.6)
+
+            pool._collect_adoptable = slow_collect
+
+            for broadcaster_id in (3, 4):
+                with pytest.raises(capacity_error):
+                    await pool.create(broadcaster_id)
+
+            assert twitch.listed_types.count(CHAT_TYPE) == 1
+            assert twitch.listed_types.count(NOTIFICATION_TYPE) == 1
+            assert pool._adoption_expires_ms > clock.now_ms
+
+        asyncio.run(run())
+
+    def test_a_failed_connect_is_not_a_capacity_error_and_still_backs_off(self):
+        """The control. `_grow` fails two ways and they are not the same
+        failure: a pool at its three-connection limit has nothing to wait for,
+        while a connect that did not come up may recover -- and the backoff
+        that stops the rest of a batch queueing behind its own 30-second
+        handshake has to stay armed for that one."""
+
+        async def run():
+            capacity_error = capacity_error_type()
+            pool = make_dual_pool()
+            pool._connection_factory = lambda: FakeWebsocket(fail_start=True)
+
+            with pytest.raises(TransportError) as caught:
+                await pool.create(7)
+
+            assert not isinstance(caught.value, capacity_error), (
+                "a socket that would not open was reported as a full account"
+            )
+            assert pool._growth_blocked_until > time.monotonic(), (
+                "the connect-failure backoff was dropped, so every remaining "
+                "channel in the batch waits out its own connect"
+            )
+
+        asyncio.run(run())
+
+    def test_the_capacity_error_is_counted_under_its_own_reason(self):
+        """FR-012, NFR-004: an operator has to be able to answer "is the
+        account full, or is Twitch refusing us" without reading logs.
+
+        Driven through the reconciler on the real pool at the ceiling, because
+        the classification only matters where the durable refusal cache and
+        the failure counter live.
+        """
+
+        async def run():
+            capacity_error_type()  # fail here, not on a mystery counter delta
+            fake_redis = FakeRedis()
+            refusal_store = FakeRefusalStore()
+            pool = make_dual_pool(twitch=FakePoolTwitch())
+            await pool.start()
+            reconciler = make_reconciler(
+                pool,
+                fake_redis,
+                refusal_store=refusal_store,
+                readopt_interval_seconds=3600,
+            )
+            seed_desired(fake_redis, [(f"c{bid}", bid) for bid in range(1, 451)])
+            await reconciler.reconcile_once()
+            assert len(reconciler._actual) == 450
+
+            reasons = (
+                "capacity", "refused", "error", "rate_limited", "transient_session"
+            )
+            before = {reason: counter_value(reason) for reason in reasons}
+            blocked_before = pool._growth_blocked_until
+            seed_desired(fake_redis, [(f"c{bid}", bid) for bid in range(1, 452)])
+
+            await reconciler.reconcile_once()
+
+            after = {reason: counter_value(reason) for reason in reasons}
+            assert after["capacity"] - before["capacity"] == 1, (
+                "the 451st channel was not counted under a capacity reason"
+            )
+            for reason in ("refused", "error", "rate_limited", "transient_session"):
+                assert after[reason] == before[reason], (
+                    f"a capacity condition was also counted as {reason!r}"
+                )
+            assert refusal_store.marked == [], (
+                "a full account wrote the durable per-channel refusal cache, "
+                "which evicts the channel for seven days (data-model I26)"
+            )
+            assert 451 not in reconciler._actual
+            assert len(reconciler._actual) == 450, "existing coverage was evicted"
+            assert pool.coverage_counts().get("complete") == 450
+            assert sum(pool.occupancy().values()) == eventsub_pool.MAX_SUBSCRIPTIONS
+            assert reconciler_module.eventsub_subscription_count._value.get() == 900
+            assert pool._growth_blocked_until == blocked_before
+
+        asyncio.run(run())
+
+
+class TestConnectionFullAtVisibility:
+    """T061 / FR-015, data-model I27, decision 28 -- `full_at` is evidence.
+
+    `full_at` records the occupancy Twitch refused at. Below 300 it means the
+    connection permanently offers fewer slots than the capacity model counts
+    on, which at exact capacity is the whole margin -- so it is exposed rather
+    than left silent, and a session transition invalidates the observation
+    that produced it.
+    """
+
+    @staticmethod
+    async def _pool_with_a_below_cap_full_connection():
+        """One session full at its cap, one that refused below it."""
+        pool = make_dual_pool(cap=6)
+        await pool._grow()
+        for broadcaster_id in (1, 2, 3):
+            await pool.create(broadcaster_id)
+        await pool.create(4)  # opens the second session
+        first, second = pool._connections
+        assert (first.occupancy, second.occupancy) == (6, 2)
+
+        second.websocket.raise_on_subscribe = (
+            eventsub_pool.EventSubSubscriptionError("subscription limit reached")
+        )
+        try:
+            with pytest.raises(TransportError):
+                await pool.create(5)
+        finally:
+            second.websocket.raise_on_subscribe = None
+        assert second.full_at == 2
+        return pool, first, second
+
+    def test_a_connection_full_below_the_cap_is_exposed_as_stranded_capacity(self):
+        async def run():
+            pool, _first, second = await self._pool_with_a_below_cap_full_connection()
+
+            capacity = connection_capacity_of(pool)
+
+            assert set(capacity) == set(pool.occupancy()), (
+                "the capacity view and the occupancy view disagree about "
+                "which connections exist"
+            )
+            stranded = capacity[str(second.connection_id)]
+            assert stranded["occupancy"] == 2
+            assert stranded["cap"] == pool.cap == 6
+            assert stranded["full_at"] == 2
+            assert stranded["free"] == 0
+            assert stranded["full_below_cap"] is True, (
+                "four slots the capacity model counts on are stranded and "
+                "nothing says so"
+            )
+            assert connection_free_slots(pool)[str(second.connection_id)] == 0
+
+        asyncio.run(run())
+
+    def test_full_at_the_cap_is_ordinary_fullness_not_degradation(self):
+        """A session at its cap is doing its job. Reporting it as stranded
+        capacity would bury the connection that is genuinely short."""
+
+        async def run():
+            pool, first, _second = await self._pool_with_a_below_cap_full_connection()
+
+            entry = connection_capacity_of(pool)[str(first.connection_id)]
+
+            assert entry["occupancy"] == entry["cap"] == 6
+            assert entry["full_at"] is None
+            assert entry["free"] == 0
+            assert entry["full_below_cap"] is False
+
+        asyncio.run(run())
+
+    def test_a_reconnect_clears_and_re_evaluates_full_at(self):
+        """The refusal belonged to the session that has just gone. Keeping it
+        strands slots on a session that never refused anything, and at the
+        ceiling those are the slots the last channel needs."""
+
+        async def run():
+            pool, _first, second = await self._pool_with_a_below_cap_full_connection()
+            assert pool.route(9, slots=2) is not second
+
+            second.websocket.reconnect("session-after-reconnect")
+            await pool.create(a_channel_on(pool, second))
+
+            assert second.full_at is None, (
+                "the observation outlived the session that produced it"
+            )
+            entry = connection_capacity_of(pool)[str(second.connection_id)]
+            assert entry["full_at"] is None
+            assert entry["full_below_cap"] is False
+            assert entry["free"] == pool.cap - second.occupancy
+            assert pool.route(9, slots=2) is second, (
+                "the reconnected session is still out of routing"
+            )
+
+        asyncio.run(run())
+
+    def test_retirement_drops_the_connection_from_the_capacity_view(self):
+        """A retired session has no capacity, stranded or otherwise, and a
+        view that keeps reporting it keeps a label alive for a connection that
+        no longer exists."""
+
+        async def run():
+            pool, first, second = await self._pool_with_a_below_cap_full_connection()
+
+            pool._retire(second)
+
+            capacity = connection_capacity_of(pool)
+            assert set(capacity) == {str(first.connection_id)}
+            assert set(capacity) == set(pool.occupancy())
+
+        asyncio.run(run())
+
+    def test_the_capacity_gauge_is_bounded_and_leaves_the_unit_gauges_alone(self):
+        """FR-015, NFR-004. The label is the connection id and nothing else,
+        so the series count is bounded by `MAX_CONNECTIONS` -- and publishing
+        it must not disturb the channel and subscription gauges beside it,
+        which are in different units.
+        """
+
+        async def run():
+            gauge = connection_full_gauge()
+            free_gauge = required_connection_capacity_gauge(
+                "eventsub_connection_free_slots"
+            )
+            below_cap_gauge = required_connection_capacity_gauge(
+                "eventsub_connection_full_below_cap"
+            )
+            for capacity_gauge in (gauge, free_gauge, below_cap_gauge):
+                capacity_gauge.clear()
+            reconciler_module.eventsub_connection_occupancy.clear()
+            reconciler_module.eventsub_channel_coverage.clear()
+            pool, first, second = await self._pool_with_a_below_cap_full_connection()
+            reconciler = make_reconciler(pool, FakeRedis())
+
+            reconciler._publish_transport_metrics()
+
+            full = gauge_label_values(gauge, "connection")
+            assert set(full) == {
+                str(first.connection_id), str(second.connection_id)
+            }
+            assert len(full) <= eventsub_pool.MAX_CONNECTIONS
+            assert full[str(first.connection_id)] == 1
+            assert full[str(second.connection_id)] == 1, (
+                "a connection with no free slot below the cap does not read "
+                "as full, so its stranded capacity is invisible"
+            )
+            assert gauge_label_values(free_gauge, "connection") == {
+                str(first.connection_id): 0.0,
+                str(second.connection_id): 0.0,
+            }
+            assert gauge_label_values(below_cap_gauge, "connection") == {
+                str(first.connection_id): 0.0,
+                str(second.connection_id): 1.0,
+            }
+            occupancy = gauge_label_values(
+                reconciler_module.eventsub_connection_occupancy, "connection"
+            )
+            assert occupancy == {
+                str(first.connection_id): 6.0, str(second.connection_id): 2.0
+            }, "the occupancy gauge changed units or lost a connection"
+            assert reconciler_module.eventsub_subscription_count._value.get() == 8
+            coverage = gauge_label_values(
+                reconciler_module.eventsub_channel_coverage, "state"
+            )
+            assert coverage["complete"] == 4, (
+                "the channel gauge started counting subscriptions (FR-015)"
+            )
+
+            # A retired connection must not keep its last value, exactly as
+            # the occupancy gauge already promises.
+            pool._retire(second)
+            reconciler._publish_transport_metrics()
+
+            assert set(gauge_label_values(gauge, "connection")) == {
+                str(first.connection_id)
+            }
+            assert set(gauge_label_values(free_gauge, "connection")) == {
+                str(first.connection_id)
+            }
+            assert set(gauge_label_values(below_cap_gauge, "connection")) == {
+                str(first.connection_id)
+            }
+            for capacity_gauge in (gauge, free_gauge, below_cap_gauge):
+                capacity_gauge.clear()
+
+        asyncio.run(run())
+
+    def test_capacity_metrics_publish_exact_units_and_clear_retired_labels(self):
+        """All three capacity fields are separate, exact connection gauges."""
+        full = connection_full_gauge()
+        free = required_connection_capacity_gauge(
+            "eventsub_connection_free_slots"
+        )
+        below_cap = required_connection_capacity_gauge(
+            "eventsub_connection_full_below_cap"
+        )
+        for gauge in (full, free, below_cap):
+            gauge.clear()
+        reconciler_module.eventsub_connection_occupancy.clear()
+        reconciler_module.eventsub_channel_coverage.clear()
+
+        transport = StubTransport()
+        occupancy = {"ordinary": 300, "stranded": 250, "nonfull": 10}
+        capacity = {
+            "ordinary": {
+                "occupancy": 300,
+                "cap": 300,
+                "full_at": None,
+                "free": 0,
+                "full_below_cap": False,
+            },
+            "stranded": {
+                "occupancy": 250,
+                "cap": 300,
+                "full_at": 250,
+                "free": 0,
+                "full_below_cap": True,
+            },
+            "nonfull": {
+                "occupancy": 10,
+                "cap": 300,
+                "full_at": None,
+                "free": 290,
+                "full_below_cap": False,
+            },
+        }
+        transport.occupancy = lambda: dict(occupancy)
+        transport.connection_capacity = lambda: dict(capacity)
+        transport.coverage_counts = lambda: {"complete": 280, "chat_only": 1}
+        reconciler = make_reconciler(transport, FakeRedis())
+
+        reconciler._publish_transport_metrics()
+
+        assert gauge_label_values(full, "connection") == {
+            "ordinary": 1.0,
+            "stranded": 1.0,
+            "nonfull": 0.0,
+        }
+        assert gauge_label_values(free, "connection") == {
+            "ordinary": 0.0,
+            "stranded": 0.0,
+            "nonfull": 290.0,
+        }
+        assert gauge_label_values(below_cap, "connection") == {
+            "ordinary": 0.0,
+            "stranded": 1.0,
+            "nonfull": 0.0,
+        }
+        assert gauge_label_values(
+            reconciler_module.eventsub_connection_occupancy, "connection"
+        ) == {key: float(value) for key, value in occupancy.items()}
+        assert reconciler_module.eventsub_subscription_count._value.get() == 560
+        coverage = gauge_label_values(
+            reconciler_module.eventsub_channel_coverage, "state"
+        )
+        assert coverage["complete"] == 280
+        assert coverage["chat_only"] == 1
+
+        occupancy.clear()
+        occupancy["nonfull"] = 10
+        capacity.clear()
+        capacity["nonfull"] = {
+            "occupancy": 10,
+            "cap": 300,
+            "full_at": None,
+            "free": 290,
+            "full_below_cap": False,
+        }
+        reconciler._publish_transport_metrics()
+
+        expected_labels = {"nonfull"}
+        assert set(gauge_label_values(full, "connection")) == expected_labels
+        assert set(gauge_label_values(free, "connection")) == expected_labels
+        assert set(gauge_label_values(below_cap, "connection")) == expected_labels
+        assert set(
+            gauge_label_values(
+                reconciler_module.eventsub_connection_occupancy, "connection"
+            )
+        ) == expected_labels
+
+    def test_a_transport_that_cannot_report_capacity_still_reconciles(self):
+        """Observability may never break reconciliation. `StubTransport` has
+        no connections to describe, so the capacity publication has to be as
+        optional as `coverage_counts()` already is."""
+        fake_redis = FakeRedis()
+        seed_desired(fake_redis, [("a", 1), ("b", 2)])
+        reconciler = make_reconciler(StubTransport(), fake_redis)
+        gauges = [
+            getattr(reconciler_module, name, None)
+            for name in (
+                "eventsub_connection_full",
+                "eventsub_connection_free_slots",
+                "eventsub_connection_full_below_cap",
+            )
+        ]
+        for gauge in gauges:
+            if gauge is not None:
+                gauge.clear()
+
+        asyncio.run(reconciler.reconcile_once())
+
+        assert reconciler.subscription_count == 2
+        for gauge in gauges:
+            if gauge is not None:
+                assert gauge_label_values(gauge, "connection") == {}
 
 
 class TestDegradedWithoutUserAuth:

@@ -58,8 +58,8 @@ never infers one from the other.
 
 The unit that follows from that is the one thing to keep straight: a
 CONNECTION holds at most 300 SUBSCRIPTIONS, so at most 150 fully covered
-CHANNELS; the pool holds at most 400 channels, which is 800 of the 900
-subscriptions the three sessions allow. `occupancy()` answers in
+CHANNELS; the pool holds at most 450 channels, which is exactly 900
+subscriptions across three sessions. `occupancy()` answers in
 subscriptions and `coverage_counts()` in channels, and mixing them is how a
 session silently goes to 301.
 
@@ -106,12 +106,21 @@ from reconciler import (
     ADOPTABLE_STATUSES,
     CHANNEL_COVERAGE_STATES,
     ExistingSubscription,
+    PoolCapacityError,
     RateLimitedError,
     SubscriptionRefusedError,
     SubscriptionTransport,
     TransientSessionError,
     TransportError,
 )
+
+# `PoolCapacityError` is imported rather than defined here on purpose. It is a
+# fact about THIS transport's slots, but the taxonomy the reconciler classifies
+# lives in `reconciler.py`, so the class is defined once and re-exported
+# through this module: `eventsub_pool.PoolCapacityError` and
+# `reconciler.PoolCapacityError` are the SAME object. Two classes sharing one
+# name would mean a capacity error raised here is caught by nothing there
+# (decision 28, data-model I26).
 
 logger = logging.getLogger("stream_monitoring")
 
@@ -122,7 +131,7 @@ SUBSCRIPTIONS_PER_CONNECTION = 300
 # "You can create a maximum of 3 WebSockets connections with enabled
 # subscriptions", per client-id/user-id pair
 # (dev.twitch.tv/docs/eventsub/handling-websocket-events, checked 2026-08-29).
-# So the real ceiling for this transport is 3 x 300 = 900 channels, not the
+# So the real ceiling for this transport is 3 x 300 = 900 subscriptions, not the
 # arbitrary number the growth rule implied. Past it Twitch refuses the
 # subscriptions on the fourth socket with wording that matches none of the
 # markers below, so the channels routed there would be retried for ever on a
@@ -202,8 +211,8 @@ class CoverageType(Enum):
     """The closed set of subscription types one monitored channel needs.
 
     Closed on purpose: every capacity number in `data-model.md` §4 is derived
-    from there being exactly two of these (400 channels x 2 = 800 of the 900
-    subscriptions Twitch allows this token). A third member would change all
+    from there being exactly two of these (450 channels x 2 = 900
+    subscriptions, the full allowance for this token). A third member would change all
     of them, so adding one has to be a deliberate edit here.
     """
 
@@ -262,6 +271,15 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 30.0
 # so the caller's Kafka flush can carry the chat they produced. The library's
 # own `_stop()` sleeps 0.25 s for the same reason.
 SOCKET_DRAIN_SECONDS = 0.25
+
+# How long one capacity-preflight enumeration stays usable, in MILLISECONDS on
+# the injected monotonic clock. At exact capacity every blocked channel in a
+# batch asks the same question -- "does this already exist?" -- and each answer
+# used to cost two type-filtered Helix walks. One bounded snapshot answers the
+# whole batch in two walks, and a window this short cannot outlive the pass
+# that took it. It is read through `self._monotonic_ms`, so a test moves it
+# without sleeping.
+CAPACITY_ADOPTION_SNAPSHOT_MS = 1000
 
 # `_subscribe` throws away the HTTP status and keeps only Twitch's message, so
 # the kind of failure has to be read back out of the text. Phase 0's throwaway
@@ -605,7 +623,16 @@ class _Connection:
     # cleared, so one report retired a socket from routing for the life of
     # the process -- under ordinary hysteresis churn the pool then opened
     # fresh sockets while drained ones sat idle and unusable.
+    #
+    # It is also not remembered for ever across a SESSION change. `full_at`
+    # records what one session refused at, and a reconnect replaces that
+    # session with one that has refused nothing; keeping the number would
+    # strand slots on a session that never earned it, and with no free
+    # reserve those are the very slots the last channel needs (decision 28,
+    # data-model I27). `full_at_session` is the session the refusal was
+    # observed on, and `_reevaluate_full_at` clears the pair when it moves.
     full_at: Optional[int] = None
+    full_at_session: Optional[str] = None
 
     @property
     def occupancy(self) -> int:
@@ -659,6 +686,22 @@ class _Slot:
     # read before each listen call, so the two halves of a pair created either
     # side of a reconnect carry different, honest stamps.
     session_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _AdoptableRow:
+    """One Helix row the capacity preflight is allowed to adopt.
+
+    Recorded exactly as it was SEEN: the subscription's own id, the session it
+    was on, and the connection that held that session at snapshot time. It is
+    never adopted straight from here -- the session is revalidated against the
+    connections the pool holds now, because a snapshot is a reading of the
+    past and a reconnect makes every row on the old session worthless.
+    """
+
+    subscription_id: str
+    session_id: str
+    connection_id: int
 
 
 @dataclass(frozen=True)
@@ -755,6 +798,25 @@ class EventSubPoolTransport(SubscriptionTransport):
         # Serialises routing, reservations and growth. Held only around
         # bookkeeping and the one blocking `start()`, never around a create.
         self._lock = asyncio.Lock()
+        # The capacity preflight's own lock, deliberately NOT `_lock`: it is
+        # held across a Helix walk, and holding the routing lock across a
+        # network round trip would stall every other worker's placement. Only
+        # one caller populates the snapshot; the rest wait here and read it.
+        self._adoption_lock = asyncio.Lock()
+        # (broadcaster, coverage type) -> `_AdoptableRow`, the shared bounded
+        # preflight snapshot. `None` means "nothing cached"; the types walked
+        # so far are tracked separately so a caller missing only one half does
+        # not force a second walk of the other.
+        self._adoption_rows: Optional[Dict[Tuple[int, CoverageType], _AdoptableRow]] = None
+        self._adoption_types: Set[CoverageType] = set()
+        self._adoption_expires_ms = 0
+        # The connections and sessions the snapshot was taken against. A grow,
+        # a retirement or a reconnect changes it, and each of those makes the
+        # snapshot a reading of a pool that no longer exists.
+        self._adoption_fingerprint: Tuple[Tuple[int, Optional[str]], ...] = ()
+        # Bumped by every invalidation, so a walk that was overtaken by a
+        # delete is discarded instead of cached.
+        self._adoption_generation = 0
         self._supervisor: Optional[asyncio.Task] = None
         # The service's event loop. Callbacks arrive on a socket's own loop,
         # on another thread, and must hop back here before touching anything
@@ -815,6 +877,7 @@ class EventSubPoolTransport(SubscriptionTransport):
         self._slots = {}
         self._by_subscription = {}
         self._auxiliary_refused_until = {}
+        self._invalidate_adoption_snapshot("transport closed")
         # `_retire` schedules each socket's teardown on its own loop and does
         # not await it, so delivery has not actually stopped when this returns.
         # An event already dispatched runs the message handler -- and its
@@ -845,14 +908,26 @@ class EventSubPoolTransport(SubscriptionTransport):
         if not to_create:
             return self._handle_for(broadcaster_id)
 
-        connection = await self._reserve(broadcaster_id, slots=len(to_create))
+        try:
+            placement = await self._reserve_placement(broadcaster_id, to_create)
+        except PoolCapacityError as error:
+            # The pool has no slot. Before reporting that, check whether these
+            # subscriptions already EXIST -- at exact capacity that is not a
+            # remote possibility, it is the ordinary shape of a stale index
+            # against a full account. Adoption creates nothing and consumes no
+            # slot (decision 27), so it is the one thing that can still
+            # succeed here.
+            return await self._adopt_at_capacity(broadcaster_id, to_create, error)
+
+        # Each half is placed on its OWN connection -- the same one twice when
+        # the pair is co-located, two different ones when it is split -- and
         # `_create_one` consumes exactly one reserved subscription on every
-        # path it can take, so what is left to release here is only the types
-        # it never got to.
-        unattempted = len(to_create)
+        # path it can take. What is left here is only the types it never got
+        # to, each released on the connection its slot was actually held on.
+        unattempted = dict(placement)
         try:
             for coverage_type in to_create:
-                unattempted -= 1
+                connection = unattempted.pop(coverage_type)
                 try:
                     await self._create_one(broadcaster_id, coverage_type, connection)
                 except SubscriptionRefusedError as error:
@@ -867,10 +942,329 @@ class EventSubPoolTransport(SubscriptionTransport):
                     # bounded, pool-local hold-off instead and keep the chat.
                     self._record_auxiliary_refusal(broadcaster_id, error)
         finally:
-            if unattempted:
-                await self._release(connection, slots=unattempted)
+            # A failure after reservation KEEPS the successful half: a
+            # chat-only channel is a convergent state, and at 900 of 900 the
+            # slot it would cost to recreate may not be there on the next pass
+            # (decision 28). Only the reservations nothing was attempted on
+            # are given back, and each on its own connection.
+            for connection in unattempted.values():
+                await self._release(connection, slots=1)
 
         return self._handle_for(broadcaster_id)
+
+    async def _reserve_placement(
+        self, broadcaster_id: int, to_create: List[CoverageType]
+    ) -> Dict[CoverageType, _Connection]:
+        """Hold a slot for each type this channel is missing.
+
+        Two missing types are a PAIR and are reserved as one atomic
+        all-or-nothing placement; one missing type is a repair and takes the
+        ordinary single-slot reservation, which is unchanged.
+        """
+        if len(to_create) == 2:
+            return await self._reserve_pair(broadcaster_id)
+        coverage_type = to_create[0]
+        return {coverage_type: await self._reserve(broadcaster_id, slots=1)}
+
+    async def _adopt_at_capacity(
+        self,
+        broadcaster_id: int,
+        to_create: List[CoverageType],
+        error: PoolCapacityError,
+    ) -> str:
+        """Last resort when there is no slot: is it already subscribed?
+
+        A bounded preflight adoption, and ONLY on the capacity path -- never
+        on an ordinary create, which reaches `_adopt_conflict` through Twitch's
+        own 409 after the listen call. Here there is no listen call to make and
+        no slot to reserve: a subscription that already exists is already
+        counted against the 900, so recording it changes occupancy by nothing.
+        That is exactly why decision 27 could release the free reserve.
+
+        The enumeration is SHARED. A full pool blocks every channel in the
+        batch, and each blocked channel asking Twitch on its own cost two
+        type-filtered Helix walks -- so one saturated account turned a single
+        pass into hundreds of walks and spent the rate-limit budget on
+        questions with one answer. `_adoption_snapshot` answers them all from
+        one bounded reading: at most one walk per `CoverageType` per snapshot
+        window, whether the callers arrive together or one after another.
+
+        The rules are unchanged and still applied per row: `enabled`, exact
+        type match, and on a session this pool holds RIGHT NOW rather than
+        when the snapshot was taken. Nothing foreign is claimed either -- only
+        the broadcaster and the types this channel is actually missing are
+        ever looked up, so another channel's row is never recorded under this
+        one. An enumeration that finds nothing is not an error in its own
+        right -- the capacity condition is the answer -- so it is logged and
+        the original error is raised.
+        """
+        try:
+            rows = await self._adoption_snapshot(to_create)
+        except Exception as enumeration_error:
+            # A preflight that cannot enumerate has not found anything, which
+            # is the same outcome as an enumeration that found nothing.
+            logger.debug(
+                "Capacity preflight could not enumerate, reporting capacity",
+                extra={
+                    "broadcaster_id": broadcaster_id,
+                    "error": str(enumeration_error),
+                },
+            )
+            rows = {}
+
+        for coverage_type in to_create:
+            if self._holds(broadcaster_id, coverage_type):
+                # Already adopted -- by a concurrent caller, or by the direct
+                # `_slots` answer the ordinary path gives. Nothing to do, and
+                # nothing to enumerate for.
+                continue
+            row = rows.get((broadcaster_id, coverage_type))
+            if row is not None and self._adopt_snapshot_row(
+                broadcaster_id, coverage_type, row
+            ):
+                continue
+            logger.debug(
+                "Nothing adoptable for a channel the pool has no slot for",
+                extra={
+                    "broadcaster_id": broadcaster_id,
+                    "coverage_type": coverage_type.value,
+                    "in_snapshot": row is not None,
+                },
+            )
+
+        remaining = self._coverage_to_create(broadcaster_id)
+        if not remaining:
+            # Everything this channel was missing already existed on a session
+            # this pool receives from. Nothing was created and the occupancy is
+            # exactly what it was.
+            return self._handle_for(broadcaster_id)
+
+        logger.warning(
+            "No free subscription slot for this channel, and nothing to adopt",
+            extra={
+                "broadcaster_id": broadcaster_id,
+                "missing": [coverage_type.value for coverage_type in remaining],
+                "subscriptions": sum(
+                    connection.occupancy for connection in self._connections
+                ),
+                "connections": len(self._connections),
+                "free_slots": self._usable_free_slots(),
+            },
+        )
+        raise error
+
+    async def _adoption_snapshot(
+        self, coverage_types: List[CoverageType]
+    ) -> Dict[Tuple[int, CoverageType], _AdoptableRow]:
+        """The shared preflight reading, walking each type at most once.
+
+        One snapshot serves the callers that are blocked together AND the ones
+        that arrive immediately afterwards, because both are asking about the
+        same full account. `_adoption_lock` is what makes that true: the first
+        caller through walks, everyone behind it reads what that walk found.
+
+        The window is short and monotonic (`CAPACITY_ADOPTION_SNAPSHOT_MS`),
+        and three things end it early, because each makes the reading a
+        description of a pool that no longer exists:
+
+        * a GROW or a RETIREMENT, and a SESSION transition on any connection --
+          all three show up in `_session_fingerprint()`, which is compared here
+          rather than hooked into every site that could cause one;
+        * a DELETE or a revocation, which turns a row into a stale POSITIVE:
+          the id is still in the snapshot while Twitch no longer holds it, and
+          adopting it would record a slot nothing delivers for. Those bump
+          `_adoption_generation`.
+
+        A caller ADOPTING from the snapshot does none of that on purpose. The
+        row it took was true, the ones its neighbours need are still true, and
+        invalidating there would put the walk back on every blocked channel --
+        which is the cost this snapshot exists to remove.
+
+        A create is deliberately not an invalidation either: it can only make
+        the snapshot MISS a row (a stale negative), and a miss reports the
+        capacity condition that was already true.
+        """
+        async with self._adoption_lock:
+            generation = self._adoption_generation
+            now = self._monotonic_ms()
+            fingerprint = self._session_fingerprint()
+            reusable = (
+                self._adoption_rows is not None
+                and now < self._adoption_expires_ms
+                and fingerprint == self._adoption_fingerprint
+            )
+            walked = set(self._adoption_types) if reusable else set()
+            missing = [
+                coverage_type
+                for coverage_type in coverage_types
+                if coverage_type not in walked
+            ]
+            if reusable and not missing:
+                # Every type this caller needs was walked inside this window,
+                # so there is nothing to ask Twitch. That IS the point.
+                return self._adoption_rows
+            rows = dict(self._adoption_rows) if reusable else {}
+            if missing:
+                live_sessions = self._live_session_ids()
+                for coverage_type in missing:
+                    try:
+                        await self._collect_adoptable(
+                            coverage_type, live_sessions, rows
+                        )
+                    except Exception as e:
+                        # The type is still marked as walked. A Helix that is
+                        # refusing must not be asked again by every remaining
+                        # blocked channel in the batch -- the window expires on
+                        # its own, and until then the answer is "nothing
+                        # adoptable", which is the safe one.
+                        logger.warning(
+                            "Capacity preflight walk failed, treating this type "
+                            "as unadoptable for the rest of the window",
+                            extra={
+                                "coverage_type": coverage_type.value,
+                                "error": str(e),
+                            },
+                        )
+                    walked.add(coverage_type)
+
+            if self._adoption_generation != generation:
+                # A delete or a revocation landed while this walk was in
+                # flight, so some row here may name a subscription Twitch has
+                # already collected. Cache nothing and adopt nothing: the
+                # caller reports the capacity condition it already had, and
+                # the next pass re-enumerates against a settled pool.
+                self._adoption_rows = None
+                self._adoption_types = set()
+                return {}
+
+            self._adoption_rows = rows
+            self._adoption_types = walked
+            # A fresh snapshot gets its full reuse window AFTER the Helix
+            # walks complete. Starting the clock before ten paginated requests
+            # made a slow-but-successful snapshot expire before it was stored,
+            # putting every blocked channel back on its own pair of walks.
+            self._adoption_expires_ms = (
+                self._adoption_expires_ms
+                if reusable
+                else self._monotonic_ms() + CAPACITY_ADOPTION_SNAPSHOT_MS
+            )
+            self._adoption_fingerprint = fingerprint
+            return rows
+
+    async def _collect_adoptable(
+        self,
+        coverage_type: CoverageType,
+        live_sessions: Set[str],
+        rows: Dict[Tuple[int, CoverageType], _AdoptableRow],
+    ) -> None:
+        """One type-filtered Helix walk, keeping only what may be adopted.
+
+        The same filter `_adopt_conflict` applies, row by row: Twitch's own
+        `sub_type` filter is not trusted on its own, `enabled` is required, and
+        the transport's session has to be one this pool holds. Anything else --
+        revoked, disconnected, or living on a session that belongs to somebody
+        else's process -- never enters the snapshot at all, so it cannot be
+        adopted later by a lookup that has forgotten why it was there.
+        """
+        result = await self.twitch.get_eventsub_subscriptions(
+            sub_type=coverage_type.subscription_type, target_token=AuthType.USER
+        )
+        async for subscription in result:
+            row_type = getattr(subscription, "type", None)
+            if row_type is not None and row_type != coverage_type.subscription_type:
+                continue
+            if getattr(subscription, "status", None) not in ADOPTABLE_STATUSES:
+                continue
+            transport = getattr(subscription, "transport", None) or {}
+            session_id = transport.get("session_id")
+            if session_id not in live_sessions:
+                continue
+            connection = self._connection_by_session(session_id)
+            if connection is None:
+                continue
+            broadcaster_id = (getattr(subscription, "condition", None) or {}).get(
+                "broadcaster_user_id"
+            )
+            if broadcaster_id is None:
+                continue
+            try:
+                key = (int(broadcaster_id), coverage_type)
+            except (TypeError, ValueError):
+                continue
+            # First row wins, so one channel cannot be recorded twice under
+            # one key and the snapshot stays the size of the account.
+            rows.setdefault(
+                key,
+                _AdoptableRow(
+                    subscription_id=subscription.id,
+                    session_id=session_id,
+                    connection_id=connection.connection_id,
+                ),
+            )
+
+    def _adopt_snapshot_row(
+        self, broadcaster_id: int, coverage_type: CoverageType, row: _AdoptableRow
+    ) -> bool:
+        """Record one snapshot row, but only if its session is still current.
+
+        The revalidation is the whole safety of reading a snapshot at all:
+        `_connection_by_session` answers from the sessions the pool holds NOW,
+        so a row whose session has been retired or replaced by a reconnect
+        resolves to nothing and is refused. Recording it instead would count a
+        subscription Twitch dropped with the old session, and the channel
+        would read as covered while nothing delivered for it.
+        """
+        connection = self._connection_by_session(row.session_id)
+        if connection is None:
+            return False
+        slot = _Slot(
+            broadcaster_id=broadcaster_id,
+            coverage_type=coverage_type,
+            connection_id=connection.connection_id,
+            subscription_id=row.subscription_id,
+            session_id=row.session_id,
+        )
+        connection.subscription_ids.add(row.subscription_id)
+        self._record_slot(slot)
+        logger.info(
+            "Adopted an existing subscription for a channel the pool has no slot for",
+            extra={
+                "broadcaster_id": broadcaster_id,
+                "coverage_type": coverage_type.value,
+                "subscription_id": row.subscription_id,
+                "connection": connection.connection_id,
+            },
+        )
+        return True
+
+    def _session_fingerprint(self) -> Tuple[Tuple[int, Optional[str]], ...]:
+        """The connections the pool holds and the session each is on now."""
+        return tuple(
+            (connection.connection_id, self._session_id(connection))
+            for connection in self._connections
+        )
+
+    def _invalidate_adoption_snapshot(self, reason: str) -> None:
+        """Drop the preflight snapshot: something made its rows untrue.
+
+        Called where a row can become a stale POSITIVE -- a delete, a
+        revocation, a retirement -- and on growth, whose new session no
+        snapshot describes. NOT called when a caller adopts from the snapshot:
+        that leaves every other row exactly as true as it was, and dropping it
+        there would put a Helix walk back on every blocked channel.
+        """
+        if self._adoption_rows is None and not self._adoption_types:
+            # Nothing cached, but a walk may be in flight, and its rows are
+            # exactly as stale as the ones this call would have dropped.
+            self._adoption_generation += 1
+            return
+        self._adoption_rows = None
+        self._adoption_types = set()
+        self._adoption_expires_ms = 0
+        self._adoption_generation += 1
+        logger.debug(
+            "Capacity preflight snapshot invalidated", extra={"reason": reason}
+        )
 
     async def _create_one(
         self, broadcaster_id: int, coverage_type: CoverageType, connection: _Connection
@@ -1097,8 +1491,8 @@ class EventSubPoolTransport(SubscriptionTransport):
 
         The unit is the whole point (data-model I4). `occupancy()` answers in
         subscriptions and is bounded by 300 per connection; this answers in
-        channels and is bounded by the 400-channel ceiling. Mixing them is how
-        a 400-channel pool reads as 800 against a 400 limit, or a 300-
+        channels and is bounded by the 450-channel maximum. Mixing them is how
+        a 450-channel pool reads as 900 against a 450 limit, or a 300-
         subscription session reads as full at 150.
         """
         counts = {state: 0 for state in COVERAGE_STATES}
@@ -1199,6 +1593,10 @@ class EventSubPoolTransport(SubscriptionTransport):
                 # A reconnect. Twitch holds nothing from the old session, and
                 # the refusal that started any hold-off may have been specific
                 # to it -- so this is a free opportunity to retest it (I17).
+                # The same is true of anything that session reported about its
+                # own capacity, so `full_at` is re-evaluated here too, BEFORE
+                # this channel is routed anywhere (decision 28, I27).
+                self._reevaluate_full_at()
                 logger.warning(
                     "Recorded subscription is on a replaced session, recreating",
                     extra={
@@ -1655,6 +2053,34 @@ class EventSubPoolTransport(SubscriptionTransport):
             for connection in self._connections
         }
 
+    def connection_capacity(self) -> Dict[str, dict]:
+        """Per-connection capacity, including full BELOW the cap (I27).
+
+        The same shape and the same keys as `occupancy()`, so the reconciler
+        can publish a bounded per-connection gauge from it and the two views
+        can never disagree about which connections exist. A retired connection
+        disappears from both.
+
+        `free` is USABLE free -- it counts reservations and honours `full_at`,
+        because at 900 of 900 the difference between `occupancy` and `load`,
+        and between the cap and the level Twitch actually refused at, is the
+        entire margin. `full_below_cap` is the stranded-capacity condition:
+        slots the capacity model counts on that this connection will not give.
+        """
+        self._reevaluate_full_at()
+        return {
+            str(connection.connection_id): {
+                "occupancy": connection.occupancy,
+                "cap": self.cap,
+                "full_at": connection.full_at,
+                "free": self._free_slots(connection),
+                "full_below_cap": (
+                    connection.full_at is not None and connection.full_at < self.cap
+                ),
+            }
+            for connection in self._connections
+        }
+
     # -- routing and growth -----------------------------------------------
 
     def route(self, broadcaster_id: int, slots: int = 1) -> Optional[_Connection]:
@@ -1676,19 +2102,36 @@ class EventSubPoolTransport(SubscriptionTransport):
         (T019a): the same broadcaster must come back to the same connection
         across reconciles.
         """
-        for connection in self._connections_holding(broadcaster_id):
-            if self._has_room(connection, slots):
-                return connection
-
-        ordered = sorted(
-            self._connections,
-            key=lambda connection: _score(broadcaster_id, connection.connection_id),
-            reverse=True,
-        )
-        for connection in ordered:
+        # Before anything is placed, not after: a `full_at` left over from a
+        # session that has since been replaced would take a connection with
+        # room out of routing, and with no free reserve that is exactly the
+        # capacity the last channel needs (decision 28).
+        self._reevaluate_full_at()
+        for connection in self._ordered_for(broadcaster_id):
             if self._has_room(connection, slots):
                 return connection
         return None
+
+    def _ordered_for(self, broadcaster_id: int) -> List[_Connection]:
+        """Every connection, in the order this channel prefers them.
+
+        Locality first -- the connections already carrying part of this
+        channel's pair -- then rendezvous order. Deterministic, and shared by
+        whole-pair routing and the split fallback so the two cannot disagree
+        about which connection a channel prefers.
+        """
+        ordered = self._connections_holding(broadcaster_id)
+        seen = {connection.connection_id for connection in ordered}
+        ordered.extend(
+            connection
+            for connection in sorted(
+                self._connections,
+                key=lambda connection: _score(broadcaster_id, connection.connection_id),
+                reverse=True,
+            )
+            if connection.connection_id not in seen
+        )
+        return ordered
 
     def _connections_holding(self, broadcaster_id: int) -> List[_Connection]:
         """The connections already carrying part of this channel's pair."""
@@ -1702,6 +2145,28 @@ class EventSubPoolTransport(SubscriptionTransport):
                 holding.append(connection)
         return holding
 
+    def _free_slots(self, connection: _Connection) -> int:
+        """Subscriptions this connection can still take, right now.
+
+        `load`, not `occupancy`: a reserved slot is spoken for. And the
+        ceiling is the level Twitch actually refused at when there is one,
+        because a connection full below the cap offers fewer slots than the
+        capacity model counts on (decision 28).
+        """
+        ceiling = (
+            self.cap if connection.full_at is None else min(self.cap, connection.full_at)
+        )
+        return max(0, ceiling - connection.load)
+
+    def _usable_free_slots(self) -> int:
+        """Free subscriptions across the OPEN connections.
+
+        A connection that has not been opened is not a free slot, so this is
+        deliberately not `max_connections * cap - occupancy`: growth is a
+        separate decision from placement.
+        """
+        return sum(self._free_slots(connection) for connection in self._connections)
+
     def _has_room(self, connection: _Connection, slots: int) -> bool:
         """Can this connection take `slots` more subscriptions right now?
 
@@ -1709,36 +2174,195 @@ class EventSubPoolTransport(SubscriptionTransport):
         answer for a worker that has not created anything yet as for one that
         has.
         """
-        if connection.full_at is not None and connection.load + slots > connection.full_at:
-            return False
-        return connection.load + slots <= self.cap
+        return self._free_slots(connection) >= slots
+
+    def _reevaluate_full_at(self) -> None:
+        """Forget a `full_at` whose session is gone (decision 28, I27).
+
+        `full_at` is one session's observation, not a property of the socket.
+        A reconnect gives the connection a new session that has refused
+        nothing and holds nothing Twitch counts against the old one, so the
+        number is re-evaluated there rather than remembered -- otherwise the
+        connection stays out of routing for the life of the process while the
+        pool opens sockets around it.
+
+        Time alone never clears it. Only a session transition does, because
+        only a session transition invalidates the observation. Retirement
+        needs nothing here: the whole connection goes.
+        """
+        for connection in self._connections:
+            if connection.full_at is None:
+                continue
+            session = self._session_id(connection)
+            if session == connection.full_at_session:
+                continue
+            logger.info(
+                "EventSub session changed, re-evaluating the level it was full at",
+                extra={
+                    "connection": connection.connection_id,
+                    "occupancy": connection.occupancy,
+                    "was_full_at": connection.full_at,
+                    "session_at_refusal": connection.full_at_session,
+                    "session_now": session,
+                },
+            )
+            connection.full_at = None
+            connection.full_at_session = None
 
     async def _reserve(self, broadcaster_id: int, slots: int = 1) -> _Connection:
-        """Pick the connection for this channel and hold `slots` on it."""
+        """Pick ONE connection for this channel and hold `slots` on it.
+
+        The single-connection reservation: a repair needs one slot, and a
+        whole pair still comes here when one connection can hold both.
+        `_reserve_pair` is the entry point for a new channel, because a pair
+        may also be placed as one slot on each of two connections.
+        """
         async with self._lock:
             connection = self.route(broadcaster_id, slots=slots)
             if connection is None:
-                # Growth runs under the lock, and a connect can take up to
-                # `connect_timeout_seconds` to give up. Without the guard below
-                # every remaining channel in the batch queued behind its own
-                # 30 s attempt, one after another: 200 channels waiting on a
-                # hung Twitch handshake froze the reconciler for about an hour,
-                # with `reconcile_last_success_timestamp` stopped throughout.
-                # One failure now fails the rest of the batch fast, and the
-                # next pass tries again.
-                if time.monotonic() < self._growth_blocked_until:
-                    raise TransportError(
-                        "pool growth failed recently, not retrying this pass"
-                    )
-                try:
-                    connection = await self._grow()
-                except Exception:
-                    self._growth_blocked_until = (
-                        time.monotonic() + self.connect_timeout_seconds
-                    )
-                    raise
+                connection = await self._grow_under_lock()
             connection.reserved += slots
             return connection
+
+    async def _reserve_pair(
+        self, broadcaster_id: int
+    ) -> Dict[CoverageType, _Connection]:
+        """Hold BOTH of a channel's slots, atomically (decision 28, I25).
+
+        Returns one connection per coverage type -- the same connection twice
+        when the pair is co-located, two different ones when it is split.
+
+        Three steps, in this order, all inside ONE critical section:
+
+        1. **Co-location first.** The ordinary `route()` answer for two slots:
+           the connection already holding part of the channel, else rendezvous
+           order. A pair kept together means a socket death costs the whole
+           channel at once instead of leaving a partial state behind.
+        2. **Growth second**, while the pool is BELOW `max_connections`. A new
+           session can hold the pair together, so growing preserves locality
+           AND leaves the one-slot holes for the one-slot repairs that are the
+           only thing able to use them. Splitting here instead spent both
+           holes, permanently fragmented a channel, and still left the pool
+           needing the connection it had declined to open.
+        3. **Split last**, and only when growth is not available: at the
+           connection ceiling, or when a connect has just failed and two
+           existing connections have room for one slot each. Two free slots on
+           two different connections are two free slots; refusing the pair
+           because neither alone can hold it turns a full pool into a falsely
+           full one, and at the ceiling that is the difference between
+           converging at 450 and stalling at 449.
+
+        A growth failure is not silently absorbed. The backoff `_grow_under_lock`
+        arms stays armed, so the rest of the batch still fails fast rather than
+        queueing behind its own connect; the split is a fallback for THIS
+        placement only, and with no two one-slot homes to fall back on the
+        error is re-raised unchanged.
+
+        The atomicity is the point, and it is why every branch runs under one
+        `_lock` acquisition. Reserving the two halves one at a time lets two
+        concurrent pairs each take half of the same two free slots: both then
+        fail on create, at the exact moment there is no slack to recover with.
+        Either both halves are held here or neither is.
+        """
+        async with self._lock:
+            connection = self.route(broadcaster_id, slots=2)
+            if connection is not None:
+                connection.reserved += 2
+                return {coverage_type: connection for coverage_type in CoverageType}
+
+            if len(self._connections) < self.max_connections:
+                try:
+                    connection = await self._grow_under_lock()
+                except Exception as growth_error:
+                    # The backoff this armed is deliberately left alone: it
+                    # belongs to the pool, not to this placement.
+                    split = self._split_candidates(broadcaster_id)
+                    if split is None:
+                        raise
+                    logger.warning(
+                        "Could not open a connection for a whole pair, splitting "
+                        "it across the free slots that already exist",
+                        extra={
+                            "broadcaster_id": broadcaster_id,
+                            "connections": len(self._connections),
+                            "error": str(growth_error),
+                        },
+                    )
+                    for half in split:
+                        half.reserved += 1
+                    return dict(zip(CoverageType, split))
+                connection.reserved += 2
+                return {coverage_type: connection for coverage_type in CoverageType}
+
+            split = self._split_candidates(broadcaster_id)
+            if split is None:
+                # At the connection ceiling with fewer than two usable free
+                # slots -- which, since `route()` just refused, is the same
+                # statement as "no two connections have room for one each".
+                # `_grow_under_lock` is where that hard ceiling becomes a
+                # capacity error rather than something to wait out.
+                connection = await self._grow_under_lock()
+                connection.reserved += 2
+                return {coverage_type: connection for coverage_type in CoverageType}
+
+            for half in split:
+                half.reserved += 1
+            return dict(zip(CoverageType, split))
+
+    def _split_candidates(
+        self, broadcaster_id: int
+    ) -> Optional[List[_Connection]]:
+        """Two DIFFERENT connections with room for one slot each, or None.
+
+        `None` means the pool holds fewer than two usable free slots. That
+        equivalence is exact rather than convenient: a connection with two
+        free slots would have been returned by `route(slots=2)`, so once that
+        has refused, every connection has at most one free slot and "at least
+        two free in total" and "at least two connections with room for one"
+        are the same statement.
+        """
+        usable = [
+            connection
+            for connection in self._ordered_for(broadcaster_id)
+            if self._has_room(connection, 1)
+        ]
+        return usable[:2] if len(usable) >= 2 else None
+
+    async def _grow_under_lock(self) -> _Connection:
+        """Open one more session for a placement. Called with the lock held.
+
+        The two ways growth fails are not the same failure, and keeping them
+        apart is what makes a full account legible (decision 28):
+
+        * At `max_connections` there is nothing to wait for. `_grow` raises
+          `PoolCapacityError`, and it is checked BEFORE the recent-growth
+          backoff so a full pool always reports capacity distinctly instead of
+          reporting whatever a much earlier connect failure left behind.
+        * A connect that did not come up may recover, and that one still arms
+          the backoff. Growth runs under the lock and a connect can take up to
+          `connect_timeout_seconds` to give up, so without the guard every
+          remaining channel in the batch queued behind its own 30 s attempt:
+          200 channels waiting on a hung Twitch handshake froze the reconciler
+          for about an hour, with `reconcile_last_success_timestamp` stopped
+          throughout. One failure fails the rest of the batch fast, and the
+          next pass tries again.
+
+        A capacity refusal must NOT arm the backoff: waiting cannot empty a
+        full account, and the timer would delay the next legitimate placement
+        after a delete or a retirement -- which is available immediately.
+        """
+        if (
+            len(self._connections) < self.max_connections
+            and time.monotonic() < self._growth_blocked_until
+        ):
+            raise TransportError("pool growth failed recently, not retrying this pass")
+        try:
+            return await self._grow()
+        except PoolCapacityError:
+            raise
+        except Exception:
+            self._growth_blocked_until = time.monotonic() + self.connect_timeout_seconds
+            raise
 
     async def _release(self, connection: _Connection, slots: int = 1):
         async with self._lock:
@@ -1747,21 +2371,26 @@ class EventSubPoolTransport(SubscriptionTransport):
     async def _grow(self) -> _Connection:
         """Open one more session. Called with the lock held.
 
-        Refuses past `MAX_CONNECTIONS`. Twitch allows three websocket
-        connections with enabled subscriptions per client-id/user-id pair, so
-        this transport tops out at `MAX_SUBSCRIPTIONS` channels. Opening a
-        fourth socket does not fail at connect time -- it fails later, per
-        subscription, with an error this module cannot classify, and rendezvous
-        routing keeps sending the same channels back to it. A clear refusal
-        here is the difference between "the pool is full" in the log and a
-        silent retry loop.
+        Refuses past `MAX_CONNECTIONS` with `PoolCapacityError`. Twitch allows
+        three websocket connections with enabled subscriptions per
+        client-id/user-id pair, so this transport tops out at
+        `MAX_SUBSCRIPTIONS` subscriptions. Opening a fourth socket does not
+        fail at connect time -- it fails later, per subscription, with an
+        error this module cannot classify, and rendezvous routing keeps
+        sending the same channels back to it. A clear refusal here is the
+        difference between "the pool is full" in the log and a silent retry
+        loop.
+
+        The error TYPE is what makes that legible now that there is no free
+        reserve: a hard ceiling is neither a provider refusal nor a transient
+        fault, and the caller must not arm a backoff for it (decision 28).
 
         `EventSubWebsocket.start()` blocks the calling thread until the
         session_welcome arrives, so it runs on the default executor rather
         than stalling the service's event loop for the length of a connect.
         """
         if len(self._connections) >= self.max_connections:
-            raise TransportError(
+            raise PoolCapacityError(
                 f"pool is at its {self.max_connections}-connection limit "
                 f"({self.max_connections * self.cap} subscriptions, "
                 f"{MAX_SUBSCRIPTIONS} at the documented Twitch caps); "
@@ -1803,6 +2432,9 @@ class EventSubPoolTransport(SubscriptionTransport):
         connection = _Connection(connection_id=self._next_connection_id, websocket=websocket)
         self._next_connection_id += 1
         self._connections.append(connection)
+        # A session no snapshot has walked. Any preflight reading taken before
+        # this one describes a pool that no longer exists.
+        self._invalidate_adoption_snapshot("connection opened")
         logger.info(
             "Opened an EventSub connection",
             extra={
@@ -1934,6 +2566,9 @@ class EventSubPoolTransport(SubscriptionTransport):
         broadcaster_id: Optional[str] = None,
         subscription_type: Optional[str] = None,
     ):
+        # Twitch has withdrawn this subscription, so any preflight row naming
+        # it is a stale positive nothing else would clear.
+        self._invalidate_adoption_snapshot("subscription revoked")
         slot = self._by_subscription.pop(subscription_id, None)
         if slot is None:
             # An id this pool does not recognise is NOT an id that is not ours.
@@ -2023,8 +2658,12 @@ class EventSubPoolTransport(SubscriptionTransport):
                 self._retire(connection)
                 return TransportError(f"connection unusable: {message}")
             # Remember the level it refused at, not a permanent flag, so
-            # deletes can bring the connection back into routing.
+            # deletes can bring the connection back into routing -- and
+            # remember the SESSION it refused on, so a reconnect clears it
+            # rather than stranding slots on a session that never refused
+            # anything (decision 28, `_reevaluate_full_at`).
             connection.full_at = connection.occupancy
+            connection.full_at_session = self._session_id(connection)
             logger.error(
                 "EventSub connection reported full below the configured cap",
                 extra={
@@ -2140,6 +2779,11 @@ class EventSubPoolTransport(SubscriptionTransport):
     # -- deletes ----------------------------------------------------------
 
     async def _delete_one(self, subscription_id: str) -> None:
+        # Every DELETE this module issues passes through here, which makes it
+        # the one place a preflight row can become a stale POSITIVE: still in
+        # the snapshot, no longer on Twitch. Invalidating here rather than at
+        # each caller means no delete path can forget to.
+        self._invalidate_adoption_snapshot("subscription deleted")
         try:
             await self.twitch.delete_eventsub_subscription(
                 subscription_id, target_token=AuthType.USER
@@ -2508,6 +3152,8 @@ class EventSubPoolTransport(SubscriptionTransport):
         websocket = connection.websocket
         websocket._running = False
         self._tear_down_socket(websocket)
+        # Every preflight row on this connection's session is now unadoptable.
+        self._invalidate_adoption_snapshot("connection retired")
 
         self._connections = [
             live for live in self._connections if live.connection_id != connection.connection_id

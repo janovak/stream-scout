@@ -135,10 +135,12 @@ Twitch call:
     retained, and the desired set never exceeds 450; at the maximum, 450
     channels ⇒ exactly 900 subscriptions, no connection above 300, zero free
     slots, and the 451st candidate is not admitted (FR-013, FR-014, SC-006).
-12a. **Exact-capacity placement and legibility** — a pair is placed one slot on
-    each of two connections when no connection holds two free but the pool has
-    at least two, atomically and with the successful half retained on partial
-    failure; a hard capacity exhaustion raises the distinct capacity error and
+12a. **Exact-capacity placement and legibility** — placement co-locates a pair
+    on an existing connection, grows while fewer than three connections exist,
+    and only at the maximum or after growth fails places one slot on each of
+    two connections when the pool has at least two usable slots. The split
+    reservation is atomic and retains the successful half on partial failure;
+    a hard capacity exhaustion raises the distinct capacity error and
     classification without arming a transient growth backoff and without
     writing the durable refusal cache; `full_at` is cleared and re-evaluated on
     reconnect and retirement, and a below-cap full connection is exposed
@@ -302,10 +304,11 @@ python -m pytest -q test_stream_monitoring.py -k "Threshold or Compose"
 
 This stream-monitoring selection owns:
 
-- `docker-compose.yml` `stream-monitoring` carries the checked-in target
-  `JOIN_THRESHOLD=400`, `LEAVE_THRESHOLD=450`, and
-  `AUXILIARY_REFUSAL_RETRY_SECONDS=3600`. The entry/retention split is asserted
-  as two different numbers, not one: entry 400, retention and maximum 450.
+- `docker-compose.yml` `stream-monitoring` carries the checked-in safe default
+  `JOIN_THRESHOLD=400`, `LEAVE_THRESHOLD=${LEAVE_THRESHOLD:-400}`, and
+  `AUXILIARY_REFUSAL_RETRY_SECONDS=3600`. Pure desired-set tests separately
+  assert the operator-selected final target: entry 400, retention and maximum
+  450.
 - The pure desired-set assertions cover the asymmetry the thresholds create —
   a channel ranked 401-450 does not enter a set it is not already in, an
   incumbent at that rank is retained, and the set never exceeds 450 — plus
@@ -399,13 +402,14 @@ Deploy the feature revision. `SUPPRESSION_GATING_ENABLED=false` is already
 checked into both Flink blocks in `docker-compose.yml`, so no operator action is
 required to keep gating off; leave it alone.
 
-**Override `LEAVE_THRESHOLD` to `400` for this stage**, even though the
-checked-in target is `450`. First dual-coverage convergence is then 400
-channels / 800 subscriptions, with roughly 100 slots of cushion, which is where
-E1 and E2a are taken. Proving the dual transport and reaching exact capacity are
-two separate risks and are never taken in the same step (decision 27). The pool
-converges to ~800 subscriptions over the same 400 channels, and detection
-behaviour must be indistinguishable from before the deploy.
+Leave the checked-in safe default
+`LEAVE_THRESHOLD=${LEAVE_THRESHOLD:-400}` in force for this stage. First
+dual-coverage convergence is then 400 channels / 800 subscriptions, with
+roughly 100 slots of cushion, which is where E1 and E2a are taken. Proving the
+dual transport and reaching exact capacity are two separate risks and are never
+taken in the same step (decision 27). The pool converges to ~800 subscriptions
+over the same 400 channels, and detection behaviour must be indistinguishable
+from before the deploy.
 
 ### B2. E1 — capacity and cost, at the first opportunity
 
@@ -419,8 +423,7 @@ reversed.
 
 ### B3. Confirm the ramp is in effect
 
-Thresholds are 400/400 at this stage — 400 from B0, with the retention
-threshold deliberately still overridden below its checked-in target. Confirm
+Thresholds are 400/400 at this stage — the checked-in safe default. Confirm
 they survived the deploy and that the desired set is capped at 400.
 
 ### B4. E2a — dual coverage at 400 channels, with a cushion
@@ -447,28 +450,39 @@ earlier revision's leftovers, an orphan from a failed delete, another process's
 subscription. At exact capacity such a subscription is indistinguishable from a
 defect and consumes a slot the model has already allocated (research R15, R17).
 
-Then set `LEAVE_THRESHOLD=450`, the checked-in target, and let the monitored set
-converge to 450 channels and 900 subscriptions. Only incumbents ranked 401-450
-are added, so the set grows gradually rather than in one jump.
+Then set the deployment environment to `LEAVE_THRESHOLD=450`, the
+operator-selected final target; the checked-in safe default remains 400.
+Changing only the leave threshold admits no current rank-401-450 channel.
+Starting from 400, the retained band grows only through ranking turnover — new
+top-400 channels enter while displaced incumbents remain at ranks 401-450 — or
+through an explicit safe validation seed.
 
-### B4b. E2b — exact-capacity drills
+### B4b. E2b — relational convergence and conditional exact-capacity drills
 
-Read these as **relations, not approximations**. "About 900" is not a passing
-result:
+Read these as **relations, not approximations** at every desired count ≤450:
 
-- `eventsub_subscription_count` **== 900**;
+- `eventsub_channel_coverage{state="complete"}` **== desired**;
 - `eventsub_subscription_count` **== 2 ×**
   `eventsub_channel_coverage{state="complete"}`;
-- every `eventsub_connection_occupancy` **≤ 300**, and their sum **== 900**;
-- free subscription slots **== 0**;
-- the 451st qualifying channel is **excluded**, and the monitored set stays at
-  450.
+- every `eventsub_connection_occupancy{connection}` **≤ 300**, and their sum
+  **== `eventsub_subscription_count`**;
+- summed `eventsub_connection_free_slots{connection}` **== 900 −
+  `eventsub_subscription_count`**;
+- `eventsub_connection_full{connection}` and
+  `eventsub_connection_full_below_cap{connection}` agree with usable free
+  slots and provider-reported stranded capacity;
+- the 451st qualifying channel is **excluded**.
 
-Then exercise the exact-capacity paths (decision 28):
+Exact-450 validation is conditional on 450 valid incumbents accumulating
+through ranking turnover or being supplied by an explicit safe validation
+seed. Once that condition holds, additionally require
+`eventsub_subscription_count == 900`, summed free slots `== 0`, and desired
+`== 450`, then exercise the exact-capacity paths (decision 28):
 
-1. **Split placement.** With no connection holding two free slots but at least
-   two free in the pool, a channel's pair is placed one slot on each of two
-   connections, and both halves are recorded.
+1. **Split placement.** After co-location is unavailable and growth is
+   impossible at the three-connection maximum or has failed, with at least two
+   usable slots in the pool, a channel's pair is placed one slot on each of two
+   connections and both halves are recorded.
 2. **Fragment replacement.** Remove one half of a split pair and confirm the
    channel converges back to `complete` without exceeding 900 subscriptions.
 3. **Capacity classification.** Force a create at a genuinely full pool and
@@ -591,7 +605,7 @@ The topic may be left in place.
 | Assigner-last strategy construction and post-source `assign_timestamps_and_watermarks` attachment on both streams | A3 item 8 | Only as wiring; **not** as proof that the Python assigners execute, that event time follows trusted payload time, or that the two Python stages have an acceptable deployed process/RSS cost |
 | **E1** mixed types live, subscription cost | B2 | **No** |
 | **E2a** dual coverage at 400 channels / 800 subscriptions with a cushion | B4 | **No** |
-| **E2b** exact capacity: 900 == 900, ≤300 per connection, zero free slots, 451st excluded, split placement, fragment replacement, capacity classification, `full_at` re-evaluation (SC-006) | B4b | **No** |
+| **E2b** relational convergence at every desired ≤450, plus conditional exact capacity after 450 valid incumbents accumulate or are safely seeded: 900 subscriptions, ≤300 per connection, zero free slots, 451st excluded, grow-before-split placement, fragment replacement, capacity classification, and `full_at` re-evaluation (SC-006) | B4b | **No** |
 | **E3** two-input watermark/idleness, isolated-notice bound, both streams' exact/type/future fallback behavior without chat loss, proof that assigner-last strategies run post-source with one partition per subtask, and TaskManager Python process-count/RSS impact for the two parallelism-four stages | B5 | **No** |
 | **E4** trusted-record delivery age, downstream malformed-future visibility after source timestamp fallback, real-burst confirmation for SC-003, and notice-bounded window-default tuning/adequacy for SC-005 | B6 | **No** |
 | **E5** rollback rehearsal in the capacity-safe order | B7 | **No** |

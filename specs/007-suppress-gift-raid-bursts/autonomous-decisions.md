@@ -444,9 +444,13 @@ and fixes the rollback ordering documented for operations.
 > written and its selection still stands: the Redis-resident desired set means
 > the ramp reduction must converge on the current single-subscription revision
 > **before** the two-subscription transport ships. Decision 27 adds a third
-> stage after those two. The dual transport is deployed while the retention
-> threshold is still **400**, and only after E1 and E2a — and the account-wide
-> foreign-subscription sweep — does the retention threshold ramp to **450**.
+> stage after those two. The dual transport is deployed with the checked-in
+> safe retention default **400**, and only after E1 and E2a — and the
+> account-wide foreign-subscription sweep — may an operator select **450**.
+> Raising the leave threshold does not itself admit current rank-401-450
+> channels; the band fills through ranking turnover or an explicit safe
+> validation seed, so exact-450 validation is conditional on obtaining 450
+> valid incumbents.
 > The same reasoning drives both: never let the transport observe a desired set
 > larger than the capacity model already proven in force.
 
@@ -662,7 +666,9 @@ T046, and T053.
 > it was derived: the retention threshold is never above **450** while two
 > subscriptions per channel are live, and it must be back at **400** before the
 > dual transport is unwound. The checked-in `SUPPRESSION_GATING_ENABLED=false`
-> and the code-level `true` default are unchanged.
+> and the code-level `true` default are unchanged. Decision 27 also supersedes
+> the historical 24-hour churn prerequisite preserved below: the active gating
+> prerequisites are E1, E2a, E2b, and E3 only.
 
 **Question**: Decision 15 fixed the rollback order as "gating off, restore the
 safe ramp, then unwind the auxiliary subscriptions". With two subscriptions per
@@ -954,7 +960,8 @@ cross-reference; plan topology; quickstart A3/E3; existing tasks
 T038/T041/T045/T058; existing checklist items; and OPERATIONS E3 clock,
 watermark, Python-process, and RSS checks. No task ID, dependency, environment
 variable, runtime dependency, schema, or payload-drop behavior is added.
-T058 and deployed evidence E1-E5 remain pending.
+At that decision point T058 and deployed evidence E1-E5 were pending. T058 is
+now complete; E1-E5 remain pending.
 
 ## 27. Approved capacity amendment: entry 400, retention and maximum 450
 
@@ -988,7 +995,11 @@ class of risk, and the 50-channel band is worth more than a reserve that is
 mostly idle: it removes the boundary-rank thrash that decisions 14 and 19 had
 to measure and gate.
 
-The reserve can be released because the two paths it was justified for do not
+The checked-in compose value remains the safe
+`LEAVE_THRESHOLD=${LEAVE_THRESHOLD:-400}` default. `450` is the final
+operator-selected target after E1/E2a and the account-wide sweep, not a
+checked-in live literal. The reserve can be released because the two paths it
+was justified for do not
 normally consume *new* slots:
 
 - **Reconnect.** Twitch disables every subscription belonging to a session when
@@ -1025,9 +1036,12 @@ explicitly rather than by silence:
 None of these is acceptable unmitigated. They are accepted **only** with
 decision 28's placement, classification, and visibility work in place, and
 **only** on deployed evidence: E2a proves the dual transport converges at
-400 channels / 800 subscriptions before the retention threshold moves, and E2b
-proves exact-capacity behaviour at 450/900 with relational equality rather than
-an approximate reading. Option A was not chosen because the user approved
+400 channels / 800 subscriptions before the operator selects 450. Because
+`compute_desired_set()` admits only fresh top-400 channels, the retained band
+then fills through ranking turnover or an explicit safe validation seed. E2b
+relations apply at every desired count ≤450; its exact 450/900 checks are
+conditional on accumulating or safely seeding 450 valid incumbents. Option A
+was not chosen because the user approved
 otherwise; option C removes the retention band the amendment exists to create,
 and would reintroduce exactly the zero-width thrash decisions 14 and 19 spent
 two artifacts containing; option D is the same arithmetic without the
@@ -1050,8 +1064,9 @@ and exact-convergence risks. Restages the rollout — 400/400 single-subscriptio
 convergence, dual transport at 400/400 with gating off, E1/E2a, a foreign
 subscription sweep, then the ramp to the final 400/450, then E2b, E3, E4, E5 —
 and restages the rollback so a capacity incident lowers retention to 400 and
-reconverges first. Adds amendment tasks T059-T068, all unchecked. The
-suppression event contract is untouched: it is capacity-independent.
+reconverges first. It added amendment tasks T059-T068; T059-T066 are now
+complete and T067-T068 remain open. The suppression event contract is
+untouched: it is capacity-independent.
 
 ## 28. Exact-capacity engineering for the 450-channel ceiling
 
@@ -1064,7 +1079,7 @@ per-connection ceiling. What must change before exact capacity is deployed?
 | Option | Description |
 |--------|-------------|
 | A | Nothing: run exact capacity on the current placement, classification, and `full_at` behaviour. |
-| B | Four changes, together: (1) **co-location first, split second** — `route()` still prefers the connection already holding the channel's other slot and then a single connection with room for the whole pair, but when no connection has two free slots and total free slots across the pool is ≥ 2, it atomically reserves one slot on each of two connections inside the same critical section; (2) a distinct `PoolCapacityError` and a distinct capacity classification on the failure metric, separate from provider refusal and from transient transport errors; (3) hard capacity exhaustion must **not** arm the transient growth backoff, because there is nothing to wait for and arming it delays a legitimate later growth or repair; (4) `full_at` is cleared and re-evaluated on reconnect and retirement, and a connection that is full below the 300 cap is exposed as such. |
+| B | Four changes, together: (1) **co-locate, grow, then split** — `route()` first co-locates on an existing connection, grows while fewer than three connections exist, and only at the three-connection maximum or after growth fails atomically reserves one slot on each of two connections when the pool has at least two usable slots; (2) a distinct `PoolCapacityError` and a distinct capacity classification on the failure metric, separate from provider refusal and from transient transport errors; (3) hard capacity exhaustion must **not** arm the transient growth backoff, because there is nothing to wait for and arming it delays a legitimate later growth or repair; (4) `full_at` is cleared and re-evaluated on reconnect and retirement, and a connection that is full below the 300 cap is exposed as such. |
 | C | Option B plus pair compaction: migrate an existing half-pair between connections to defragment the pool. |
 | D | Option B's placement change only, leaving error classification and `full_at` as they are. |
 
@@ -1075,7 +1090,9 @@ decision 27.
 connection's worth of slack, so every one of these behaviours was harmless. At
 900 of 900 each becomes a way to strand capacity that the model says exists:
 
-- **Split reservation is the load-bearing change.** Two free slots on two
+- **Split reservation is the load-bearing fallback.** Placement first
+  co-locates on an existing connection and grows while fewer than three
+  connections exist. At the maximum or after growth fails, two free slots on two
   different connections are two free slots. Refusing the pair because neither
   connection alone can hold it turns a full pool into a *falsely* full pool,
   and at the ceiling that is the difference between converging at 450 and

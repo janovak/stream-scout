@@ -87,7 +87,8 @@ entry threshold of 400 channels and a retention-and-maximum threshold of 450:
 450 dual-covered channels consume all 900 subscriptions, so at the maximum the
 account is **exactly full and no slot is held in reserve**. The pool refuses to
 open a fourth connection rather than let Twitch reject subscriptions one by
-one, so exhaustion shows up as `pool is at its 3-connection limit`. See
+one, so exhaustion is logged with the prefix
+`The transport has no free subscription slot`. See
 "Feature 007: gift/raid suppression operations" below.
 
 ### Reading the reconciler metrics
@@ -132,11 +133,18 @@ through the top 450, and the set therefore tops out at 450 channels. To run
 near a round number of channels, set `LEAVE_THRESHOLD` to it and
 `JOIN_THRESHOLD` to something below.
 
+This also means that raising only `LEAVE_THRESHOLD` from 400 to 450 does not
+instantly add the channels currently ranked 401-450. Starting from 400, the
+retained band fills only as ranking turnover admits new top-400 channels while
+former top-400 incumbents remain at ranks 401-450, or through an explicit safe
+validation seed.
+
 ### How to change the thresholds
 
 The poller reads both from the environment. `JOIN_THRESHOLD` must not exceed
-`LEAVE_THRESHOLD`; equality is valid but is no longer used by feature 007,
-which deliberately keeps a 50-channel retention band.
+`LEAVE_THRESHOLD`; equality is valid and is used for feature 007's first
+dual-coverage deployment at 400/400. The final target deliberately restores
+the 50-channel retention band at 400/450.
 
 1. Set both variables in the `stream-monitoring` `environment:` block in
    `docker-compose.yml`.
@@ -179,9 +187,12 @@ at 900 ranked, so the poll no longer stalls the way step 5 did.
 |---|---|---|
 | `eventsub_subscription_count` vs `ZCARD chat:desired` | historical single-subscription transport: equal; Feature 007 complete coverage: twice the desired count, within one pass interval | a gap that does not close |
 | `reconcile_duration_seconds` | a converged pass is milliseconds at ~50 channels, ~2–4 s at 300–485 | the median grows faster than the channel count |
-| `subscription_create_failures_total{reason="429"}` | absent, or brief cold-start bursts all retried | keeps rising after convergence |
+| `subscription_create_failures_total{reason="rate_limited"}` | absent, or brief cold-start bursts all retried | keeps rising after convergence |
 | `subscription_create_failures_total{reason="transient_session"}` | a cold-start burst (seen up to ~70), then static | keeps rising during steady state |
-| `eventsub_connection_occupancy` | no connection over 300; the pool grows at the cap | `pool is at its 3-connection limit` (the 900-subscription hard cap) |
+| `eventsub_connection_occupancy{connection}` | each value ≤300; summed occupancy equals `eventsub_subscription_count` | any value >300 or a sum mismatch |
+| `eventsub_connection_full{connection}` / `eventsub_connection_free_slots{connection}` | fullness agrees with zero usable slots; summed free slots equal 900 minus total subscriptions | contradictory fullness/free-slot values |
+| `eventsub_connection_full_below_cap{connection}` | 0 after convergence | 1 means provider-reported fullness is stranding nominal capacity |
+| `subscription_create_failures_total{reason="capacity"}` | static unless a deliberate full-pool drill runs | rises below the intended ceiling; inspect free slots, `full_at`, foreign subscriptions, and failed deletes |
 | Kafka producer lag, Flink source watermark lag | flat | either grows and does not recover |
 | Flink TaskManager heap | flat (measured ~2.6 GB RSS through 485 channels, cap 6 GB) | approaches the cap |
 | Flink TaskManager thread count | flat (~135) | climbing — `ClipCreator` pileup |
@@ -322,12 +333,10 @@ and replay output do **not** establish deployed evidence E1-E5.
 
 **Capacity amendment, 2026-09-05.** The capacity contract below describes the
 approved entry-400 / retention-and-maximum-450 model with exact
-900-subscription occupancy (autonomous decisions 27-28). Its supporting
-implementation and tests are tracked as amendment tasks T059-T068 and are
-**not** complete; until T063 lands, the repository still carries the interim
-`LEAVE_THRESHOLD=400`, which is also the correct value for the first
-dual-coverage deployment. Nothing in this section should be read as a claim
-that the amended pool behaviour has been implemented, tested, or deployed.
+900-subscription occupancy (autonomous decisions 27-28). The amended runtime,
+safe compose default, metrics, and deterministic tests are implemented and
+tested locally. They have not been deployed: E1, E2a, E2b, E3, E4, and E5 all
+remain pending operator evidence.
 
 ### Capacity and coverage contract
 
@@ -338,9 +347,12 @@ that the amended pool behaviour has been implemented, tested, or deployed.
   leaves beyond it. A channel newly ranked 401-450 therefore does **not** join,
   while a channel already monitored at that rank stays. The monitored set never
   exceeds **450 channels**. Do not hide a different hysteresis policy in code.
-- 400/450 is the checked-in target. **The initial dual-coverage deployment runs
-  with `LEAVE_THRESHOLD` overridden to `400`** and only ramps to 450 after E1
-  and E2a pass and the account has been swept — see the rollout below.
+- The safe checked-in compose default is
+  `LEAVE_THRESHOLD=${LEAVE_THRESHOLD:-400}` with literal
+  `JOIN_THRESHOLD=400`. The first dual-coverage deployment therefore runs at
+  400/400 without an override. The operator sets `LEAVE_THRESHOLD=450` only
+  after E1 and E2a pass and the account-wide sweep is clean. `450` is the final
+  operator-selected target, not a checked-in live literal.
 - Each monitored channel needs two independent subscriptions:
   `channel.chat.message` for chat and `channel.chat.notification` for gift/raid
   notices. At the 450-channel maximum this is 450 × 2 = **900 subscriptions** of
@@ -354,10 +366,12 @@ that the amended pool behaviour has been implemented, tested, or deployed.
   that reports itself full below the cap — see the capacity signals and
   troubleshooting below.
 - Each websocket session is capped at 300 **subscriptions**, so it can hold at
-  most **150 complete channel pairs**. A pair may be split across sessions, and
-  at exact capacity that split is how the last channels are placed: when no
-  connection holds two free slots but the pool holds at least two, one slot is
-  reserved on each of two connections, all-or-nothing.
+  most **150 complete channel pairs**. Placement first co-locates a pair on an
+  existing connection, then grows while fewer than three connections exist. A
+  pair may be split across sessions only at the three-connection maximum or
+  after growth fails: when no connection holds two free slots but the pool
+  holds at least two usable slots, one slot is reserved on each of two
+  connections, all-or-nothing.
 - A hard capacity exhaustion is an **expected operating state** at the maximum,
   not an anomaly. It is reported under its own capacity classification —
   distinct from a Twitch refusal and from a transient transport fault — never
@@ -367,6 +381,10 @@ that the amended pool behaviour has been implemented, tested, or deployed.
   reconnects or is retired. A connection reporting itself full **below** 300 is
   stranded capacity and is visible as such; at exact capacity it is the
   difference between converging at 450 and stalling short of it.
+- Capacity preflight shares one bounded account-wide adoption snapshot across
+  blocked creates, preventing a full pool from causing a per-channel Helix
+  enumeration storm. That protection does not replace deployed observation:
+  E2b still checks the live `reason="rate_limited"` failure series.
 - Keep units explicit: `active_stream_count` and
   `eventsub_channel_coverage` count **channels**;
   `eventsub_subscription_count` and `eventsub_connection_occupancy` count
@@ -478,7 +496,10 @@ levels; histogram observations are per trusted record.
 | `clips_suppressed_total{broadcaster_id,notice_type}` | Counter of would-have-clipped decisions stopped by an active window, attributed to channel and the notice that moved the deadline. `increase(...[W])` is suppressions during `W`. `anomalies_detected_total` **still increments** for the same decision |
 | `eventsub_channel_coverage{state}` | Gauge in **channels** for `complete`, `chat_only`, `notification_only`, and `degraded_chat_only`. Compare `state="complete"` with the Redis desired count; inspect partial/degraded series rather than inferring coverage from subscription totals |
 | `eventsub_connection_occupancy{connection}` | Gauge in **subscriptions per websocket connection**, including the connection label. Every value must remain at or below 300, and at the 450-channel maximum their sum is exactly 900 |
-| `eventsub_subscription_count` | Gauge in **subscriptions across the pool**. Complete dual coverage is exactly 2 × desired channels, up to 900 at the maximum. Read it as a relation — `== 2 ×` complete channels, `== 900` at the ceiling — not as "about 900" |
+| `eventsub_connection_full{connection}` | Gauge equal to 1 exactly when that connection has **zero usable free slots**. It includes ordinary fullness at occupancy 300 and provider-reported fullness below 300; use `eventsub_connection_full_below_cap` to distinguish the stranded-capacity case |
+| `eventsub_connection_free_slots{connection}` | Gauge of the exact **usable** subscription slots remaining on that connection after reservations and any provider-reported `full_at` limit. Sum it for pool free capacity; do not derive usable free slots as `300 - occupancy` |
+| `eventsub_connection_full_below_cap{connection}` | Gauge equal to 1 only when Twitch reported the connection full at an occupancy below 300. Those nominal slots are stranded until the observation is cleared and re-evaluated on reconnect or retirement |
+| `eventsub_subscription_count` | Gauge in **subscriptions across the pool**. Complete dual coverage is exactly 2 × desired channels, up to 900 at the maximum. Read it as a relation: `== 2 ×` complete channels, and `== 900` at the ceiling. Both equalities are mandatory when their conditions apply |
 | `active_stream_count` | Gauge in **channels** in the reconciler's actual set after a completed pass. It is not a subscription count; read it with desired count and coverage state |
 | `suppression_notices_ignored_total{notice_type}` | Producer counter for deliberately excluded categories; known categories retain their name and unknown/absent categories use bounded `other`. Traffic here is not malformed |
 | `suppression_notices_malformed_total{reason}` | Producer counter for trigger notices dropped without publication: bounded reasons `identity` or `occurred_at`. Any increase is a producer/input fault, not ordinary excluded traffic |
@@ -486,8 +507,8 @@ levels; histogram observations are per trusted record.
 | `suppression_records_consumed_total{lag_class}` | Counter for trusted records actually consumed/applied. `healthy` means clamped age ≤30 s; `lagging` means >30 s. There is intentionally no `idle` series |
 | `suppression_delivery_age_seconds` | Histogram, one observation per trusted record, in **seconds**, of `max(0, consumer receipt - occurred_at)`. Use its bucket/rate distribution for percentiles; rejected records and silence add no observation |
 | `desired_set_churn_total` | Unlabelled counter in **channel membership changes**: entered + departed after successful publication. **Advisory only** — no bound, no observation window, and no power to block enabling gating |
-| Capacity classification on `subscription_create_failures_total` | The reason series that marks a **hard capacity** condition — no slot anywhere in the pool — as distinct from a Twitch refusal and from a transient transport fault. At the 450-channel maximum this is an expected state, not a defect; below it, treat any occurrence as fragmentation, a foreign subscription, a failed delete, or a below-cap `full_at` until proven otherwise |
-| Connection full state, including full **below** 300 | Shows a connection the pool believes cannot take more subscriptions. A value below the 300 cap is stranded capacity: at exact capacity it is what stops the set converging at 450. It is cleared and re-evaluated when the connection reconnects or is retired |
+| `subscription_create_failures_total{reason="capacity"}` | Counter of create attempts that found no usable slot anywhere in the pool. This is the exact hard-capacity classification, distinct from provider refusal and transient transport failure; it does not arm rate-limit backoff or write a durable refusal |
+| `subscription_create_failures_total{reason="rate_limited"}` | Counter of provider HTTP 429 create responses. A cold-start increment may be retried; continued increase after convergence is a live rate-limit failure, not capacity exhaustion |
 
 For a Prometheus window `W`, read delivery state in this order:
 
@@ -524,7 +545,7 @@ domains:
 | `Suppression delivery lag for broadcaster ...` | Trusted age exceeded 30 s; the line includes channel, type, and age. The notice is late but still applied |
 | `CLIP SUPPRESSED for broadcaster ...` | Suppression decision; includes channel, notice type, peak, interval bounds, notice time, and intensity. It must pair with one `clips_suppressed_total` increment and no clip yield |
 | `Error applying suppression notice for broadcaster ...` | Unexpected consumer exception. Treat as fail-open and inspect the traceback plus rejection/consumption counters |
-| `Subscription operation failed` with `pool is at its 3-connection limit` | Capacity refusal, distinct from malformed or delivery failures. Inspect total subscriptions, per-connection occupancy, coverage, desired count, and thresholds |
+| `The transport has no free subscription slot` | Capacity warning prefix, distinct from malformed, provider-refusal, and delivery failures. Inspect `subscription_create_failures_total{reason="capacity"}`, total subscriptions, all three connection-capacity gauges, coverage, desired count, and thresholds |
 | `Poll finished` | Churn context; `entered` + `left` is that successful publication's increment, with `desired` and `outcome` for advisory reading |
 
 Decode, unknown-version, and ordinary field/category consumer rejections have
@@ -563,16 +584,26 @@ Troubleshoot in this order:
    `clips_suppressed_total`, and the still-incrementing
    `anomalies_detected_total`. If policy is suspect, turn gating off first.
 6. **Capacity/churn:** verify the desired set is within its threshold for the
-   current stage (≤400 while retention is overridden to 400, ≤450 at the final
-   400/450), that subscriptions equal twice the complete-coverage channel
-   count, that every connection is ≤300, and that their sum equals the
-   subscription total. At the 450-channel maximum expect **exactly 900** and
-   **zero** free slots; a 451st channel must be excluded at the desired-set
-   layer. If placement fails below the maximum, look for the four exact-capacity
-   faults in order: a connection full below 300, an enabled subscription the
-   pool does not own, a delete that failed, and pair fragmentation that the
-   split reservation should have handled. `desired_set_churn_total` is advisory
-   context here, not a gate.
+   current stage (≤400 while retention is 400, ≤450 at the final
+   400/450), `complete == desired`,
+   `eventsub_subscription_count == 2 × desired`, every connection occupancy is
+   ≤300, and the sum of occupancies equals `eventsub_subscription_count`.
+   Eligible supply may leave desired below 450; that is healthy when all four
+   relations hold. When a maximum validation reaches 450 desired channels,
+   require **exactly 900** subscriptions and **zero** usable free slots, and
+   exclude a 451st channel at the desired-set layer.
+
+   If convergence fails below the target, first inspect
+   `eventsub_connection_full_below_cap{connection}` together with exact free
+   slots and occupancy. A value of 1 is a stranded provider `full_at`, not
+   ordinary occupancy-300 fullness. Reconnect the affected socket so `full_at`
+   is cleared and re-evaluated; if it persists, restart stream-monitoring using
+   the existing restart procedure and verify the capacity gauges are rebuilt.
+   Then check the account-wide subscription enumeration for foreign enabled
+   rows, failed deletes, and split-pair fragmentation. A rising
+   `reason="capacity"` series confirms the pool had no usable slot; it does not
+   prove Twitch refused a request. `desired_set_churn_total` remains advisory
+   context, never a gate.
 
 ### Forward rollout and pending evidence
 
@@ -580,47 +611,71 @@ Run these gates in order on the configured machine:
 
 1. **B0 — current single-subscription revision:** set 400/400 using the
    threshold procedure above and wait for Redis `chat:desired` and
-   `eventsub_subscription_count` to converge near 400. This is unconditionally
-   safe at 400 × 1; E1 does not block this preliminary ramp-down.
+   `eventsub_subscription_count` to satisfy subscriptions == desired with
+   desired ≤400. Do not proceed unless eligible supply can support the
+   subsequent 400-channel E2a. This is unconditionally safe at 400 × 1; E1 does
+   not block this preliminary ramp-down.
 2. **Deploy with gating off and retention still 400:** ensure `kafka-init` has
    created `suppression-events` **before** starting the feature Flink job.
    Deploy the feature revision with the checked-in
-   `SUPPRESSION_GATING_ENABLED=false`, and with `LEAVE_THRESHOLD` overridden to
-   `400` even though the checked-in target is `450`. First dual convergence is
-   then 400 channels / 800 subscriptions with roughly 100 slots of cushion.
-   Clip behavior remains pre-007.
+   `SUPPRESSION_GATING_ENABLED=false` and the safe checked-in compose default
+   `LEAVE_THRESHOLD=${LEAVE_THRESHOLD:-400}`. First dual convergence is 400
+   channels / 800 subscriptions with exactly 100 usable pool slots. Clip
+   behavior remains pre-007.
 3. **E1 — mixed types and cost:** enumerate live EventSub subscriptions, prove
    both types coexist on live sessions, and prove `total_cost=0` against
    `max_total_cost=10`. Non-zero cost blocks the feature; use the rollback below.
 4. **E2a — dual coverage at 400 channels:** prove 400 complete channels, 800
-   subscriptions, no connection above 300, roughly 100 slots free, and refusal
-   of the 401st channel while retention is still 400. Read
+   subscriptions, no connection above 300, exactly 100 usable pool slots, and
+   exclusion of the 401st channel while retention is still 400. Read
    `desired_set_churn_total` as advisory context; no observation window gates
    progression.
-5. **Sweep the account, then ramp to the final 400/450:** enumerate **every**
-   enabled subscription on the client-id / user-id pair and remove anything the
-   pool does not own — an earlier revision's leftovers, an orphan from a failed
-   delete, another process's subscription. At exact capacity each of those
-   consumes a slot the model has already allocated. Then set
-   `LEAVE_THRESHOLD=450` and let the set converge to 450 channels / 900
-   subscriptions; only incumbents ranked 401-450 are added, so it grows
-   gradually.
-6. **E2b — exact-capacity drills.** Read these as relations, not
-   approximations. "About 900" is not a passing result:
-   - `eventsub_subscription_count` **== 900**;
-   - `eventsub_subscription_count` **== 2 ×**
-     `eventsub_channel_coverage{state="complete"}`;
-   - every `eventsub_connection_occupancy` **≤ 300**, and their sum **== 900**;
-   - free subscription slots **== 0**;
-   - the 451st qualifying channel is **excluded** and the set stays at 450.
+5. **Sweep the account, then ramp to the final 400/450:** enumerate **every
+   enabled subscription of every type on every session** for the client-id /
+   user-id pair and remove anything the pool does not own — an earlier
+   revision's leftovers, an orphan from a failed delete, or another process's
+   subscription. The account-wide enabled total must then equal
+   `eventsub_subscription_count`; otherwise do not ramp. Set the service
+   environment to `LEAVE_THRESHOLD=450` and recreate only stream-monitoring.
+   This is a configuration-only selection of the final operator target; the
+   checked-in safe default remains 400. It does not admit current
+   rank-401-450 channels. The desired set grows beyond 400 only through ranking
+   turnover — new top-400 channels entering while displaced incumbents are
+   retained at ranks 401-450 — or through an explicit safe validation seed.
+6. **E2b — relational convergence and conditional exact-capacity drills.**
+   Read these as relations, not approximations, at every desired count ≤450:
+   - desired **≤450**;
+   - `eventsub_channel_coverage{state="complete"}` **== desired**;
+   - `eventsub_subscription_count` **== 2 × desired**;
+   - every `eventsub_connection_occupancy` **≤300**, and their sum
+     **== `eventsub_subscription_count`**;
+   - summed `eventsub_connection_free_slots{connection}` **== 900 −
+     `eventsub_subscription_count`**, with
+     `eventsub_connection_full{connection}` and
+     `eventsub_connection_full_below_cap{connection}` consistent with usable
+     and stranded capacity;
+   - the account-wide, all-type, all-session enabled subscription total
+     **== `eventsub_subscription_count`**.
 
-   Then exercise: a pair placed one slot on each of two connections when no
-   connection holds two free; removal of one half of a split pair converging
-   back to `complete` without exceeding 900; a create at a genuinely full pool
-   reported under the capacity classification rather than as a provider refusal
-   or transient fault, with no durable refusal written, no coverage evicted,
-   and no transient growth backoff armed; and a connection reporting full below
-   300 being visible and re-evaluated after a reconnect or retirement.
+   Lower eligible supply is not a failure when those relations hold. Exact-450
+   validation is conditional on 450 valid incumbents accumulating through
+   ranking turnover or being supplied by an explicit safe validation seed.
+   Once that condition holds, require desired **==450**, subscriptions
+   **==900**, summed occupancy **==900**, summed usable free slots **==0**, and
+   exclusion of the 451st qualifying channel.
+
+   At that maximum, exercise all exact-capacity paths: co-location first,
+   growth while below three connections, then split placement across two
+   connections only at the maximum or after growth fails;
+   loss and replacement of one split fragment; complete socket loss and
+   convergence back to complete coverage; reconnect and 409 adoption with no
+   additional slot consumed; a failed delete remaining visible as occupied
+   capacity; below-cap `full_at` visibility followed by reconnect/restart
+   re-evaluation; and `reason="capacity"` classification without provider
+   refusal, durable refusal, coverage eviction, or transient backoff. Confirm
+   the shared adoption snapshot prevents a per-channel Helix request storm,
+   while `subscription_create_failures_total{reason="rate_limited"}` does not
+   continue rising after convergence.
 7. **E3 — sparse-source watermark:** keep the topic silent for at least one
    hour and prove chat detection/watermark behavior does not stall. Then observe
    one isolated notice after silence and prove detection resumes and the source
@@ -657,15 +712,15 @@ Run these gates in order on the configured machine:
    makes notices use Kafka record time upstream, then reject downstream and
    therefore fail open. Confirm the original payload remains visible through
    `reason="fields"` and the existing refusal warning.
-7. **E5 — rollback rehearsal:** exercise the exact capacity-safe order below.
+9. **E5 — rollback rehearsal:** exercise the exact capacity-safe order below.
 
 Evidence remains pending until an operator records it:
 
 | Evidence | Required deployed observation | Status |
 |---|---|---|
 | E1 | Live mixed subscription types; cost 0 of 10 | [ ] Pending operator run |
-| E2a | Dual coverage at 400 channels / 800 subscriptions with retention still 400: ≤300 per connection, ~100 slots free, 401st refused. Gates the ramp to 450 | [ ] Pending operator run |
-| E2b | Exact capacity after the account sweep and the ramp to 400/450, read as relations: subscriptions == 900, == 2 × complete channels, every connection ≤300 with sum == 900, free slots == 0, 451st excluded; plus split placement, split-fragment replacement, capacity classification without transient backoff, and below-cap `full_at` re-evaluation | [ ] Pending operator run |
+| E2a | Dual coverage at 400 channels / 800 subscriptions with retention still 400: ≤300 per connection, exactly 100 usable pool slots, 401st excluded. Gates the ramp to 450 | [ ] Pending operator run |
+| E2b | After the all-type/all-session account sweep and operator selection of 400/450: at every desired ≤450, account enabled total == local subscriptions, complete == desired, subscriptions == 2 × desired, summed occupancy == subscriptions, and summed usable free slots == 900 − subscriptions. Exact-450 checks are conditional on 450 valid incumbents accumulating through turnover or an explicit safe seed; then subscriptions == 900 and free slots == 0. Includes grow-before-split placement/replacement, socket loss, reconnect/adoption without an extra slot, failed delete, `subscription_create_failures_total{reason="capacity"}`, below-cap `full_at` recovery, and live rate-limit observation | [ ] Pending operator run |
 | E3 | One-hour silence and isolated-notice bounds pass; both assigner-last strategies run post-source; trusted payload time and exact/+1 ms/type fallbacks behave correctly without chat loss or watermark poisoning; one partition maps to each parallelism-four assignment subtask; and TaskManager Python process count/RSS for the two added stages is recorded | [ ] Pending operator run |
 | E4 | Real gift/raid mapping, age and clock behavior, downstream over-future rejection visibility after source fallback, in-window suppression, and unaffected outside/pre-notice peaks, all read on Twitch-clock event time rather than broker ingestion time | [ ] Pending operator run |
 | E5 | Kill switch and capacity-safe rollback rehearsal, including lowering retention to 400 and reconverging before the transport is unwound | [ ] Pending operator run |
@@ -680,16 +735,17 @@ back at 400 before the dual transport is unwound.**
    response to a detection-policy-only incident; leave subscriptions and topic
    in place while diagnosing. It is **not** the lever for a capacity incident.
 2. For a capacity incident, set `LEAVE_THRESHOLD=400` (`JOIN_THRESHOLD` is
-   already 400) and wait for the monitored set to reconverge at 400 channels /
-   800 subscriptions. This restores a ~100-slot cushion with no code change and
-   keeps dual coverage intact while fragmentation, a stranded below-cap
-   `full_at`, a foreign subscription, or a failed delete is diagnosed.
+   already 400) and wait for the monitored set to reconverge at 400/400:
+   desired ≤400, complete == desired, subscriptions == 2 × desired, and summed
+   occupancy == subscriptions. At 400 desired channels this is exactly
+   400 channels / 800 subscriptions / 100 usable pool slots. Keep dual coverage
+   intact while fragmentation, a stranded below-cap `full_at`, a foreign
+   subscription, or a failed delete is diagnosed.
 3. For a transport rollback, unwind or revert the dual-subscription revision
    while `JOIN_THRESHOLD` and `LEAVE_THRESHOLD` are 400/400.
 4. Wait until subscription enumeration contains no
    `channel.chat.notification`, `eventsub_subscription_count` equals the
-   desired channel count (400 rather than 800), and coverage plus desired
-   metrics are stable.
+   desired channel count, and coverage plus desired metrics are stable.
 5. Only then restore the prior single-subscription ramp.
 
 The `suppression-events` topic may remain. There is no database schema, Redis
@@ -1055,8 +1111,9 @@ curl -s http://localhost:9100/metrics | grep -E '^(eventsub_subscription_count|r
 3. **The count is right but Kafka is empty.** The subscriptions exist and are
    silent, so the problem is downstream — check the Kafka producer logs and
    `kafka_messages_produced`.
-4. **The count has plateaued and the log says `pool is at its 3-connection
-   limit`.** This is not a fault to restart: the monitored set or in-flight
+4. **The count has plateaued and the log starts
+   `The transport has no free subscription slot`.** This is not a fault to
+   restart: the monitored set or in-flight
    work has exceeded transport capacity. Twitch allows 3 websocket connections
    × 300 = **900 subscriptions**, not channels. Feature 007 permits at most 450
    dual-covered channels, which is exactly 900 subscriptions with **no

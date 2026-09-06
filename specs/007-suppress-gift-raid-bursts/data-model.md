@@ -274,20 +274,29 @@ refusals remain the second line of defence and stay loud — but they are now
 classified distinctly, because at exact capacity they are an expected operating
 state rather than an anomaly.
 
+Raising only `LEAVE_THRESHOLD` from the checked-in safe default 400 to the
+operator-selected final target 450 does not admit any current rank-401-450
+channel. Starting from 400, the retained band grows through ranking turnover
+when new top-400 channels enter and displaced incumbents remain in ranks
+401-450, or through an explicit safe validation seed. Relational convergence
+must hold at every desired count ≤450; exact-450 validation is conditional on
+having accumulated or seeded 450 valid incumbents.
+
 Placement rule for a pair:
 
-1. Prefer the connection that already holds either slot for this channel, when
-   it has room for the slot being added.
-2. Otherwise take rendezvous order, choosing the first connection that can hold
-   the number of slots being created (two for a new channel, one for a repair).
-3. If no single connection can hold the whole pair **but the pool has at least
-   two free slots in total**, reserve one slot on each of two connections — as
-   a single all-or-nothing action inside the same critical section, so two
+1. Prefer co-location on an existing connection: for a repair, use the
+   connection already holding the channel's sibling slot when it has room; for
+   a new pair, take the first rendezvous-ordered connection that can hold both.
+2. If no existing connection can co-locate the requested slots and fewer than
+   three connections exist, grow and place them on the new connection.
+3. Only when the pool is already at three connections or growth fails, and no
+   single connection can hold the whole pair **but the pool has at least two
+   usable free slots in total**, reserve one slot on each of two connections —
+   as a single all-or-nothing action inside the same critical section, so two
    concurrent pairs cannot each claim half of the same two slots. A failure
    after reservation keeps the half that succeeded; the channel rests in a
    convergent partial state rather than giving a slot back.
-4. If no connection can, grow — subject to the 3-connection limit — and
-   otherwise refuse.
+4. Otherwise refuse.
 
 A refusal at step 4 is a **hard capacity condition**: it raises a distinct
 `PoolCapacityError`, is counted under a capacity classification separate from
@@ -404,6 +413,6 @@ Each is stated so it can be asserted by a test rather than reasoned about.
 | **I22** | Event time on both inputs comes from a Python timestamp assigner only when two binding conditions hold: each real strategy is built bounded out-of-orderness → `with_idleness()` → `with_timestamp_assigner()` last, and it is attached with `DataStream.assign_timestamps_and_watermarks()` after `env.from_source(source, WatermarkStrategy.no_watermarks(), ...)`. PyFlink 1.18 otherwise silently loses the assigner: `from_source` forwards only the Java strategy, while `with_idleness()` returns a fresh wrapper without a previously stored `_timestamp_assigner`. The correction applies to chat and suppression together. Idleness is generated per assignment subtask and is equivalent to per-split behavior only while topic partitions = source parallelism = assignment parallelism = 4 with a one-to-one edge. The attachment introduces two Python stages at parallelism four; their real process-count/RSS impact is E3-only deployed evidence (FR-003, FR-017, research §4.1.2, R13-R14, decisions 25-26) |
 | **I23** | `SentAtTimestampAssigner` accepts `sent_at` only when `type(sent_at) is int` and `sent_at <= source_clock_ms + SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000`. Equality is accepted. Missing/null, string, float, bool, and +30,001 ms values use Kafka `record_timestamp` for event time. This fallback never rewrites, rejects, or drops the chat payload, preserving chat no-data-loss behavior while preventing the binding chat input watermark from advancing on an untrusted value (FR-003, research R12, autonomous decision 26) |
 | **I24** | A channel that is not already in the monitored set enters only at rank ≤ 400; a channel already in it is retained through rank ≤ 450 and leaves beyond it. The monitored set never exceeds 450 channels, and the 451st qualifying channel is excluded at the intent layer (FR-013, SC-006, autonomous decision 27) |
-| **I25** | Pair placement prefers co-location, then a single connection with room for both slots, and otherwise reserves one slot on **each** of two connections whenever pool-wide free slots ≥ 2. That two-connection reservation is atomic — both halves or neither — and a failure after reservation keeps the successful half rather than releasing it (FR-001, NFR-001, autonomous decision 28) |
+| **I25** | Pair placement prefers co-location on an existing connection, then grows while fewer than three connections exist. Only at the three-connection maximum or after growth fails does it reserve one slot on **each** of two connections when pool-wide usable free slots ≥ 2. That two-connection reservation is atomic — both halves or neither — and a failure after reservation keeps the successful half rather than releasing it (FR-001, NFR-001, autonomous decision 28) |
 | **I26** | A hard capacity exhaustion raises a distinct capacity error, is counted under a capacity classification separate from provider refusal and transient faults, never writes the durable per-channel refusal cache, never evicts existing coverage, and does **not** arm the transient growth backoff (NFR-001, NFR-004, autonomous decision 28) |
 | **I27** | `full_at` is cleared and re-evaluated when its connection reconnects or is retired, and a connection whose `full_at` is below the 300 cap is exposed as stranded capacity rather than left silent (FR-015, NFR-001, autonomous decision 28) |

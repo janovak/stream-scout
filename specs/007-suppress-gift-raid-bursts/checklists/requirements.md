@@ -51,6 +51,11 @@ to planning
   NFR-007, SC-006, and SC-011 each remain a single active requirement. All 16
   items were re-evaluated against the rewritten text and continue to pass: the
   overview, User Story 3, edge cases, entities, assumptions, out-of-scope, and
-  success criteria were updated together, so no section still asserts the
-  retired 400/400 or 100-slot-reserve numbers. This records requirements
-  quality only; no implementation or deployed evidence is claimed by it.
+  success criteria were updated together, so no section still treats 400/400
+  as the final maximum or 100 slots as a permanent reserve. The same 400/400
+  values remain the safe checked-in deployment default. This records
+  requirements quality only; no implementation or deployed evidence is
+  claimed by it.
+- Final artifact review, 2026-09-06: all 16 items remain checked. T058 and
+  amendment tasks T059-T066 are complete; T067-T068 remain open. Deployed
+  evidence E1-E5 remains pending.

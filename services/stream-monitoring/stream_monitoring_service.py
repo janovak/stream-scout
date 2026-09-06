@@ -36,7 +36,13 @@ from twitchAPI.type import InvalidTokenException, MissingScopeException
 from twitchAPI.type import AuthScope
 
 from desired_set_store import DesiredSetStore, RedisDesiredSetStore
-from eventsub_pool import EventSubPoolTransport, map_chat_message, map_suppression_event
+from eventsub_pool import (
+    MAX_SUBSCRIPTIONS,
+    CoverageType,
+    EventSubPoolTransport,
+    map_chat_message,
+    map_suppression_event,
+)
 from reconciler import (
     PostgresRefusalStore,
     Reconciler,
@@ -95,11 +101,12 @@ SCOPE_MAP = {
 # A streamer leaves it only on exiting top LEAVE_THRESHOLD
 # This preserves Flink baseline data during rank fluctuations
 #
-# Two EventSub subscriptions per monitored channel make 400 the hard ceiling:
-# 400 * 2 = 800 of the 900 available slots, preserving 100 for reconnect and
-# adoption overlap. Configuration may lower the ramp, but it must not consume
-# that headroom.
-MAX_MONITORED_CHANNELS = 400
+# The provider ceiling determines the maximum; the entry threshold is separate.
+# With two coverage types, 3 sessions x 300 subscriptions support 450 channels.
+SUBSCRIPTIONS_PER_MONITORED_CHANNEL = len(CoverageType)
+MAX_MONITORED_CHANNELS = (
+    MAX_SUBSCRIPTIONS // SUBSCRIPTIONS_PER_MONITORED_CHANNEL
+)
 
 
 def resolve_thresholds(env=None):
@@ -130,7 +137,7 @@ def resolve_thresholds(env=None):
     if leave > MAX_MONITORED_CHANNELS:
         raise ValueError(
             f"LEAVE_THRESHOLD ({leave}) must be <= "
-            f"{MAX_MONITORED_CHANNELS} to preserve EventSub reconnect headroom"
+            f"{MAX_MONITORED_CHANNELS}, the dual-coverage subscription ceiling"
         )
     return join, leave
 
@@ -307,10 +314,10 @@ suppression_notices_malformed_total = Counter(
 )
 # Channels entering plus channels leaving the desired set, summed over polls
 # whose publication succeeded. Unlabelled on purpose: a per-channel label would
-# add one series per broadcaster that ever churned, and the NFR-007 bound is a
-# rate over the whole set rather than a per-channel question. `active_stream_count`
+# add one series per broadcaster that ever churned. `active_stream_count`
 # answers "how many now"; this answers "how much movement", and neither can be
-# derived from the other.
+# derived from the other. The counter is advisory telemetry, not a release
+# threshold.
 desired_set_churn_total = Counter(
     "desired_set_churn_total",
     "Channels entering plus channels leaving the desired set, over published polls",
@@ -1193,8 +1200,7 @@ class StreamMonitoringService:
 
             # Only now: the desired set is durably published, so these channels
             # really did enter and leave. Counting before the write would keep
-            # counting churn that a failed publication rolled back, and the
-            # NFR-007 bound is read off this counter.
+            # counting churn that a failed publication rolled back.
             desired_set_churn_total.inc(entered_count + left_count)
 
             if self.reconciler is not None:

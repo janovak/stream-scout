@@ -1337,7 +1337,7 @@ class TestDockerComposeSuppressionWiring:
     def test_both_flink_blocks_check_in_gating_disabled(self, service):
         # D11 / decision 21: the checked-in value is false even though the code
         # default is true, so deploying the feature changes no clip behaviour
-        # until an operator flips it after E1-E3 and the 24-hour E2 churn pass.
+        # until an operator flips it after E1, E2a, E2b, and E3 pass.
         env = compose_env(service)
         assert env.get("SUPPRESSION_GATING_ENABLED") == "false"
         settings = spike_detector.SuppressionSourceSettings()

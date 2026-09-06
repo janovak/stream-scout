@@ -104,10 +104,10 @@ CHANNEL_COVERAGE_STATES = (
 #
 # Units are the thing to keep straight (FR-015). A monitored channel needs two
 # subscriptions -- `channel.chat.message` and `channel.chat.notification` --
-# so 400 channels are 800 subscriptions. Every gauge below answers in
+# so 450 channels are 900 subscriptions at the exact ceiling. Every gauge below answers in
 # SUBSCRIPTIONS except `eventsub_channel_coverage`, which answers in CHANNELS,
 # and `active_stream_count` in the service module, which does too. Mixing them
-# is how a healthy 400-channel pool reads as double its ceiling.
+# is how a healthy 450-channel pool reads as 900 against a 450 limit.
 eventsub_subscription_count = Gauge(
     "eventsub_subscription_count",
     "Live EventSub subscriptions held across every transport connection "
@@ -137,6 +137,27 @@ eventsub_channel_coverage = Gauge(
     "Monitored channels by coverage state, counted in channels not "
     "subscriptions (FR-015)",
     ["state"],
+)
+eventsub_connection_full = Gauge(
+    "eventsub_connection_full",
+    "eventsub_connection_full: 1 when a transport connection has no usable "
+    "free subscription slot, whether it is full at the cap or full BELOW it "
+    "(decision 28)",
+    ["connection"],
+)
+eventsub_connection_free_slots = Gauge(
+    "eventsub_connection_free_slots",
+    "eventsub_connection_free_slots: usable free subscription slots on a "
+    "transport connection -- reservations counted, and capped at the level "
+    "Twitch actually refused at when it refused below the cap (decision 28)",
+    ["connection"],
+)
+eventsub_connection_full_below_cap = Gauge(
+    "eventsub_connection_full_below_cap",
+    "eventsub_connection_full_below_cap: 1 when Twitch called a connection "
+    "full BELOW the configured cap, so the slots between the two are stranded "
+    "capacity the model still counts on (decision 28, data-model I27)",
+    ["connection"],
 )
 reconcile_last_success_timestamp = Gauge(
     "reconcile_last_success_timestamp",
@@ -264,6 +285,28 @@ class TransientSessionError(TransportError):
     """
 
 
+class PoolCapacityError(TransportError):
+    """The transport has no free slot anywhere. The account is full.
+
+    Decision 28. With the entry-400 / retention-450 model there is no
+    guaranteed free reserve, so "no slot anywhere" is an expected, reportable
+    operating state rather than an anomaly -- and it is neither of the two
+    things it would otherwise be mistaken for:
+
+    * NOT a `SubscriptionRefusedError`. That path writes
+      `streamers.eventsub_refused_at`, which stands for seven days, so an
+      arithmetic condition would evict a channel for a week.
+    * NOT a `RateLimitedError` and not a `TransientSessionError`. Waiting
+      cannot make a full account emptier, so it must not enter the 429 retry
+      rounds and must not arm the transport's transient growth backoff.
+
+    It lives here, beside the rest of the taxonomy the transport raises and the
+    reconciler classifies, and `eventsub_pool` re-exports it: two classes
+    sharing one name would mean a capacity error raised by the pool is caught
+    by nothing (data-model I26).
+    """
+
+
 @dataclass(frozen=True)
 class ExistingSubscription:
     """One subscription that already exists, as the transport reports it."""
@@ -340,6 +383,21 @@ class SubscriptionTransport(ABC):
         may return `absent` or any other private state without growing the
         gauge's label set. The default is for transports that have no notion
         of split coverage.
+        """
+        return {}
+
+    def connection_capacity(self) -> Dict[str, dict]:
+        """Report per-connection capacity, for the FR-015 fullness gauge.
+
+        Keyed like `occupancy()`, so the label set stays bounded by the
+        transport's own connection limit, and each value carries
+        `occupancy`, `cap`, `full_at`, `free` and `full_below_cap`. `free` is
+        USABLE free: it counts reservations and honours a connection Twitch
+        has called full BELOW the cap, which at exact capacity is the
+        difference between stranded slots and slots the model can spend
+        (decision 28, data-model I27).
+
+        The default is empty, for transports with no notion of a connection.
         """
         return {}
 
@@ -1146,6 +1204,24 @@ class Reconciler:
                     return
                 try:
                     await handler(broadcaster_id)
+                except PoolCapacityError as e:
+                    # Decision 28. The account is full: not a provider refusal
+                    # and not a transient fault. Caught FIRST, and ahead of the
+                    # generic handler, because every other branch here does
+                    # something a capacity condition must not do -- write the
+                    # durable seven-day refusal, enter the 429 retry rounds, or
+                    # bury it in the undifferentiated "error" count that an
+                    # operator cannot read a full account out of (I26).
+                    count_failure("capacity")
+                    logger.warning(
+                        "The transport has no free subscription slot for this "
+                        "channel, carrying it to the next pass",
+                        extra={
+                            "operation": operation,
+                            "broadcaster_id": broadcaster_id,
+                            "error": str(e),
+                        },
+                    )
                 except RateLimitedError as e:
                     rate_limited.append((broadcaster_id, e))
                     count_failure("rate_limited")
@@ -1296,7 +1372,7 @@ class Reconciler:
 
         It is NOT `len(self._actual)`. That is a count of CHANNELS the
         reconciler believes in, so on the two-slot pool it reads half the truth
-        (400 channels, 800 subscriptions), and it is a belief rather than an
+        (450 channels, 900 subscriptions at the ceiling), and it is a belief rather than an
         observation between a loss and the walk that confirms it -- which is
         precisely the window the FR-012 dip has to be visible in.
         """
@@ -1335,6 +1411,50 @@ class Reconciler:
                 float(counts.get(state, 0))
             )
 
+    def _publish_connection_capacity(self):
+        """The three per-connection capacity gauges, from ONE snapshot.
+
+        `eventsub_connection_full{connection}` -- who has no slot left.
+        `eventsub_connection_free_slots{connection}` -- how many it has.
+        `eventsub_connection_full_below_cap{connection}` -- whose remaining
+        slots are stranded.
+
+        All three are published from the same `connection_capacity()` reading,
+        so they can never disagree about which connections exist or about how
+        much room one has: an operator reading "full" and "3 free" on the same
+        connection would trust neither. One series each per open connection, so
+        the label set stays bounded by the transport's connection limit
+        (NFR-004), and the previous labels are dropped first for the same
+        reason `_publish_subscription_count` drops them: a retired connection
+        must not go on reporting itself full.
+
+        `full` is 1 when the connection has NO usable free slot, which covers
+        both readings an operator needs without conflating them with anything
+        else: ordinary fullness at the cap, and a connection Twitch called full
+        BELOW the cap. `full_below_cap` is what separates those two, and
+        `free_slots` is the exact number the capacity model can still spend --
+        reservations counted (decision 28, data-model I27).
+        """
+        try:
+            capacity = self.transport.connection_capacity()
+        except Exception as e:
+            logger.warning("Could not read transport capacity", extra={"error": str(e)})
+            return
+        eventsub_connection_full.clear()
+        eventsub_connection_free_slots.clear()
+        eventsub_connection_full_below_cap.clear()
+        for connection, entry in capacity.items():
+            free = int(entry.get("free", 0) or 0)
+            eventsub_connection_free_slots.labels(connection=connection).set(
+                float(free)
+            )
+            eventsub_connection_full.labels(connection=connection).set(
+                1.0 if free <= 0 else 0.0
+            )
+            eventsub_connection_full_below_cap.labels(connection=connection).set(
+                1.0 if entry.get("full_below_cap") else 0.0
+            )
+
     def _publish_transport_metrics(self):
         """Republish everything the transport can be asked for.
 
@@ -1346,3 +1466,4 @@ class Reconciler:
         """
         self._publish_subscription_count()
         self._publish_channel_coverage()
+        self._publish_connection_capacity()

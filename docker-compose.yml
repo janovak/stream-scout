@@ -225,8 +225,8 @@ services:
       - SUPPRESSION_RAID_WINDOW_SECONDS=180
       # The kill switch, checked in as false even though the SuppressionConfig
       # code default is true: deploying this feature must change no clip
-      # behaviour. Flip it to true operationally only after E1-E3 and the
-      # 24-hour E2 churn observation gate pass.
+      # behaviour. Flip it to true operationally only after E1, E2a, E2b,
+      # and E3 pass.
       - SUPPRESSION_GATING_ENABLED=false
       # Reporting threshold only. A record older than this is still applied;
       # it is counted as lagging and logged.
@@ -393,8 +393,8 @@ services:
       - SUPPRESSION_RAID_WINDOW_SECONDS=180
       # The kill switch, checked in as false even though the SuppressionConfig
       # code default is true: deploying this feature must change no clip
-      # behaviour. Flip it to true operationally only after E1-E3 and the
-      # 24-hour E2 churn observation gate pass.
+      # behaviour. Flip it to true operationally only after E1, E2a, E2b,
+      # and E3 pass.
       - SUPPRESSION_GATING_ENABLED=false
       # Reporting threshold only. A record older than this is still applied;
       # it is counted as lagging and logged.
@@ -445,21 +445,29 @@ services:
       - PROMETHEUS_PORT=9100
       - HEALTH_CHECK_PORT=8080
       - LOG_LEVEL=INFO
-      # Monitored channel band, lowered to a firm 400/400 ceiling for feature
-      # 007. The arithmetic is explicit and checked in: every monitored channel
-      # now costs TWO EventSub subscriptions (chat message + chat
-      # notification), and Twitch allows 3 sessions x 300 = 900 subscriptions
-      # on this client-id/user-id pair. So 400 channels = 800 subscriptions,
-      # leaving 100 subscriptions of global headroom for reconnects and 409
-      # adoption across the whole pool.
-      # The band is deliberately zero-width: 400/400 is a locked, measured
-      # ceiling rather than a hysteresis range, and resolve_thresholds accepts
-      # LEAVE == JOIN for exactly this case.
-      # The 24-hour churn bound (NFR-007 / SC-011) is DEPLOYED evidence: it is
-      # read from desired_set_churn_total on the configured machine and is not
-      # claimed here.
+      # Feature 007 entry/retention band. New channels enter in the top 400;
+      # incumbents remain through rank 450. Two EventSub subscriptions per
+      # channel make 450 x 2 = 900, the exact 3-session x 300 ceiling, with no
+      # guaranteed free reserve.
+      #
+      # What is checked in below -- and the default when the environment sets
+      # nothing -- is a retention threshold of 400. That is what the FIRST
+      # deploy runs at: 400 x 2 = 800 leaves 100 subscription slots of slack
+      # while dual coverage is still unproven in production.
+      #
+      # The operator ramps retention to the final target only after E1 and E2a
+      # have passed AND an account-wide sweep has removed every foreign
+      # EventSub subscription on this client-id/user-id pair (they are counted
+      # against the same 900, so one left behind makes the ceiling unreachable
+      # arithmetic rather than a bug). The ramp is one explicit environment
+      # variable on this service, LEAVE_THRESHOLD=450, and E2b then runs
+      # against it.
+      #
+      # Entry stays a literal 400 throughout, so a missing override can never
+      # admit more channels than the band allows. The final target for the
+      # band is unchanged: 400 entry, 450 retention.
       - JOIN_THRESHOLD=400
-      - LEAVE_THRESHOLD=400
+      - LEAVE_THRESHOLD=${LEAVE_THRESHOLD:-400}
       # How long a channel stays degraded_chat_only after Twitch refuses its
       # notification subscription while chat is live. Bounded rather than
       # permanent, so one auxiliary 403 cannot cost that channel its chat.
@@ -467,7 +475,7 @@ services:
       # Pad, as a fraction of LEAVE_THRESHOLD, so channels with clipping
       # disabled don't shrink the candidate pool below LEAVE_THRESHOLD. Measured
       # disabled rate near the top is ~22% and thins with depth; 0.30 keeps
-      # margin at any threshold (120 extra at 400). Raise if the "Fewer than
+      # margin at any threshold (135 extra at 450). Raise if the "Fewer than
       # LEAVE_THRESHOLD" warning fires.
       - CLIPPING_DISABLED_FETCH_PAD_FRACTION=0.30
     volumes:

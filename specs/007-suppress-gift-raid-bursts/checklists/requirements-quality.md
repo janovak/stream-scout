@@ -17,7 +17,7 @@ requirements-quality defect; its `Gap` note is part of the release gate.
 - [x] CHK001 Is the account limit re-derived explicitly as 3 sessions x 300 enabled subscriptions = 900 subscriptions for the existing client-id/user-id pair? [Completeness, Spec §Overview, NFR-001; Research §1.1, §1.4]
 - [x] CHK002 Are monitored channels and individual subscriptions defined as different units, with two independently tracked coverage subscriptions required per monitored channel? [Clarity, Spec §FR-001, §FR-002, §FR-015; Data Model §1.1-§1.4]
 - [x] CHK003 Is the ceiling arithmetic complete and internally consistent: 450 channels x 2 subscriptions = 900 subscriptions, i.e. exactly the account limit with 0 guaranteed free slots, and is it explained as the halved analogue of the pre-007 800/900 ramp? [Consistency, Spec §Overview, §FR-013-§FR-015, §SC-006; Research §1.4, §6; Autonomous Decisions §27]
-- [x] CHK004 Is the per-session packing consequence specified as at most 150 co-located channel pairs per 300-subscription session, with pair splitting across sessions defined as a supported placement — including the atomic one-slot-per-connection reservation when no single connection can hold the pair and the retention of the successful half after a post-reservation failure? [Coverage, Data Model §4, I25; Research §3 R2, R5; Autonomous Decisions §28; Tasks T061-T062]
+- [x] CHK004 Is the per-session packing consequence specified as at most 150 co-located channel pairs per 300-subscription session, with placement ordered as co-locate on an existing connection → grow while below three connections → atomic one-slot-per-connection split only at the maximum or after growth fails, including retention of the successful half after a post-reservation failure? [Coverage, Data Model §4, I25; Research §3 R2, R5; Autonomous Decisions §28; Tasks T061-T062]
 - [x] CHK005 Are the entry threshold of 400, the retention-and-maximum threshold of 450, the fresh-versus-incumbent asymmetry at rank 401-450, and the 451st-channel exclusion stated objectively? [Measurability, Spec §FR-013, §SC-006, §Edge Cases, US3 scenarios 3-4; Data Model §4, I24; Research §6]
 - [x] CHK006 Are capacity-reporting requirements explicit about connection occupancy and total occupancy using subscription units while desired-set and coverage signals use channel units, and is connection-full state — including full below the 300 cap — reportable? [Clarity, Spec §FR-015; Data Model §1.4, I4-I5, I27; Plan §Design at a glance]
 - [x] CHK007 Are reconnect, adoption, reservation, and mid-ramp capacity requirements written so that exact capacity is engineered rather than assumed: reconnect and adoption normally consume no new slot, and the exceptional zero-slack cases are enumerated and mitigated instead of absorbed by a reserve? [Completeness, Spec §FR-014, §NFR-001, §Assumptions; Data Model §4, I25-I27; Research §1.4, §3, R5, R15-R18; Autonomous Decisions §27-§28]
@@ -65,9 +65,9 @@ requirements-quality defect; its `Gap` note is part of the release gate.
 
 ## Dependencies and Assumptions - Release and Scope Gates
 
-- [x] CHK037 Is forward deployment ordering consistent about reducing the ramp on the current single-subscription revision, then deploying dual coverage with gating off and the retention threshold still 400, then E1 and E2a, then the account-wide foreign-subscription sweep, then the ramp to the checked-in 400/450 and E2b, and about when E1 may block progression? [Conflict resolved, Plan §Rollout and rollback; Quickstart §B0-§B4b; Research §8 R6, R9, R15, §9 E1, E2a, E2b, D12; Autonomous Decisions §16, §21, §27]
+- [x] CHK037 Is forward deployment ordering consistent about reducing the ramp on the current single-subscription revision, then deploying dual coverage with gating off and the checked-in safe retention default 400, then E1 and E2a, then the account-wide foreign-subscription sweep, then operator selection of the final 450 target and E2b; and does it state that the retained band grows only through ranking turnover or an explicit safe seed, with exact-450 validation conditional on 450 valid incumbents? [Conflict resolved, Plan §Rollout and rollback; Quickstart §B0-§B4b; Research §8 R6, R9, R15, §9 E1, E2a, E2b, D12; Autonomous Decisions §16, §21, §27]
 - [x] CHK038 Is rollback ordering capacity-safe and unambiguous about the retention threshold value in force before auxiliary subscriptions are unwound — lowered to 400 and reconverged on a capacity incident, never above 450 while dual coverage is live, and back at 400 before the transport is unwound? [Conflict resolved, Plan §Rollback order, capacity-safe by construction; Autonomous Decisions §15 (superseded), §21, §27; Quickstart §B7; Research R11a; Tasks T065]
-- [x] CHK039 Are local/offline claims sharply separated from deployed E1-E5 evidence, with each deployed gate, actor, order, and prohibition on satisfying it from fixtures, replay, static assertions, or reasoning stated explicitly, is exact-capacity evidence (E2b) required to be read as relational equality rather than an approximate subscription total, and is conditional PyFlink evidence scoped so it is never treated as covered by the always-run pure suites? [Assumption, Quickstart §A3, §A6, §Part B, §Evidence status; Research §9; Tasks T038, T047, T056, T067, §Deferred Deployed Evidence]
+- [x] CHK039 Are local/offline claims sharply separated from deployed E1-E5 evidence, with each deployed gate, actor, order, and prohibition on satisfying it from fixtures, replay, static assertions, or reasoning stated explicitly; are E2b relations required at every desired count ≤450 while exact-450 evidence is conditional on accumulating or safely seeding 450 valid incumbents; and is conditional PyFlink evidence scoped so it is never treated as covered by the always-run pure suites? [Assumption, Quickstart §A3, §A6, §Part B, §Evidence status; Research §9; Tasks T038, T047, T056, T067, §Deferred Deployed Evidence]
 - [x] CHK040 Are scope boundaries consistent across artifacts: no second application identity, token reseed or scope expansion, dependency or persistence migration, separate raid subscription, partial rollout, viewer-derived duration, chat-schema change, ranking-policy change, heartbeat or synthetic-record protocol, hidden code-level hysteresis band, pair compaction/migration between connections, monitored maximum above 450 or fourth connection, or weakening of acceptance due to local constraints? [Consistency, Spec §FR-004, §FR-016, §NFR-007, §Out of Scope; Plan §Technical Context, §Deployment wiring, §Complexity Tracking; Tasks T054, §Notes]
 
 ## Notes
@@ -79,9 +79,9 @@ requirements-quality defect; its `Gap` note is part of the release gate.
   implementation or deployed behavior. In particular, CHK008 now assesses that
   the churn signal's *advisory* disposition is specified; CHK003-CHK007 assess
   that the amended capacity model and its exact-capacity engineering are
-  *specified*, not that any of it is implemented. E1, E2a, E2b, E3, E4, and E5
-  all remain pending deployed evidence, and amendment tasks T059-T068 remain
-  unchecked.
+  specified consistently. Implementation, deterministic tests, safe-default
+  configuration, and runbook work T059-T066 are now complete; T067-T068 remain
+  open. E1, E2a, E2b, E3, E4, and E5 all remain pending deployed evidence.
 - Remediation pass, 2026-09-04: CHK008, CHK018, CHK033, CHK035, CHK037, and
   CHK038 moved from unresolved to checked after their owning artifacts were
   amended — respectively by NFR-007/SC-011, the bounded auxiliary-refusal
@@ -100,8 +100,8 @@ requirements-quality defect; its `Gap` note is part of the release gate.
 - Final code-review correction, 2026-09-04: CHK020, CHK031, and CHK035 were
   strengthened so the same fixed trust boundary protects source watermark
   assignment before the unchanged original payload is rejected downstream.
-  The checklist remains exactly 40/40 checked; T058 and deployed evidence
-  E1-E5 remain pending.
+  The checklist remains exactly 40/40 checked. T058 was pending at that review
+  point and is now closed; deployed evidence E1-E5 remains pending.
 - Final code-review correction, 2026-09-05: CHK019, CHK020, CHK021, and CHK035
   were strengthened for autonomous decision 25 — the Python timestamp assigners
   must be attached with `assign_timestamps_and_watermarks()` after
@@ -110,27 +110,31 @@ requirements-quality defect; its `Gap` note is part of the release gate.
   partitions = source parallelism = assignment parallelism = 4 one-to-one
   invariant. The checklist remains exactly 40/40 checked; this records artifact
   quality only. No Flink task is completed by it, the amended T038/T041/T045/
-  T050 keep their existing marks with the outstanding work carried by T058, and
-  deployed evidence E1-E5 remains pending.
+  T050 keep their existing marks; their outstanding work was carried by T058,
+  which is now closed. Deployed evidence E1-E5 remains pending.
 - Final code-review hardening, 2026-09-05: the same existing items now capture
   decision 26's bounded → idleness → assigner-last binding invariant, strict
   plain-int/non-bool chat timestamp rule, symmetric +30-second source bound,
   chat no-data-loss fallback, and deployed-only process/RSS evidence for the
   two parallelism-four Python stages. The checklist remains exactly 40/40;
-  T038/T041/T045 retain their existing marks, T058 remains open, and E1-E5
+  T038/T041/T045 retain their existing marks, T058 is now closed, and E1-E5
   remain pending.
 - Approved capacity amendment, 2026-09-05: CHK003, CHK004, CHK005, CHK006,
   CHK007, CHK008, CHK018, CHK032, CHK037, CHK038, CHK039, and CHK040 were
   rewritten for autonomous decisions 27 and 28 — entry 400 with
   retention-and-maximum 450, exact 900-of-900 subscription capacity with no
-  guaranteed reserve, co-location-first placement with an atomic
-  one-slot-per-connection split fallback, a distinct capacity classification
-  with no transient growth backoff, `full_at` cleared/re-evaluated with
-  below-cap full state exposed, the removal of the numeric churn release gate,
-  the staged rollout through E2a and E2b, and the amended rollback order. The
+  guaranteed reserve, placement ordered as co-location on an existing
+  connection, growth while below three connections, then an atomic
+  one-slot-per-connection split fallback only at the maximum or after growth
+  fails, a distinct capacity classification with no transient growth backoff,
+  `full_at` cleared/re-evaluated with below-cap full state exposed, the removal
+  of the numeric churn release gate, the staged rollout through E2a and E2b,
+  and the amended rollback order. The
   checklist remains exactly **40/40 checked**: each item was re-read against
   the rewritten spec, plan, research, data-model, quickstart, decision log, and
-  runbook, and the retired 400/400 and 100-slot-reserve numbers no longer
-  appear as active requirements anywhere in them. This records requirements
-  quality only. It completes no task: T059-T068 are unchecked, T058 remains
-  open, and deployed evidence E1, E2a, E2b, E3, E4, and E5 remains pending.
+  runbook, and none treats 400/400 as the final maximum or 100 slots as a
+  permanent reserve; 400/400 remains only the safe checked-in deployment
+  default. This records requirements quality only. Current task status is T058
+  and T059-T066 complete, with
+  T067-T068 open; deployed evidence E1, E2a, E2b, E3, E4, and E5 remains
+  pending.
