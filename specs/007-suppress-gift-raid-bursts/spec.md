@@ -11,7 +11,11 @@ fixed 30-second future-time trust bound (§22-§23), then by final code-review
 corrections that apply that bound before source watermark generation as well
 as in the operator (§24), attach the timestamp assigners after `from_source`
 on both streams so they run at all (§25), and preserve the assigners through
-the required builder order while hardening chat event time (§26)
+the required builder order while hardening chat event time (§26), then by an
+approved capacity amendment on 2026-09-05 that replaces the firm 400/400
+ceiling with an entry threshold of 400, a retention-and-maximum threshold of
+450, and exact 900-subscription capacity conditioned on exact-capacity
+engineering (§27-§28)
 **Input**: Suppress gift- and raid-driven chat bursts from clip emission while
 preserving complete chat counting, dual notification coverage for every
 monitored channel, and safe operation within existing account capacity.
@@ -33,10 +37,23 @@ future detector accuracy while preventing known false-positive clips.
 
 Adding a second subscription for every monitored channel doubles subscription
 use. The existing account allowance is three sessions of 300 subscriptions
-each. The monitored-set ceiling therefore changes from the current 800/900
-ramp to a firm 400 channels, with effective join and leave thresholds both set
-to 400. Four hundred channels consume 800 subscriptions and retain 100
-subscription slots as reconnect and adoption safety headroom.
+each, so 900 subscriptions in total. The monitored-set thresholds therefore
+change from the current 800/900 single-subscription ramp to an **entry
+threshold of 400** and a **retention-and-maximum threshold of 450**. A channel
+that is not already monitored enters only inside the top 400 by rank; a channel
+already monitored is retained through rank 450; beyond 450 it leaves. At the
+450-channel maximum, dual coverage consumes all 900 subscriptions — capacity is
+exact and no free slot is guaranteed.
+
+That is deliberately the same shape as the 800/900 ramp it replaces: a deep
+entry gate, a retention band above it, and a ceiling that consumes the account
+exactly. It is halved because every channel now costs two subscriptions instead
+of one. Reconnect and adoption do not normally need spare slots — a closed
+session's subscriptions are disabled and stop counting, and adopting an
+existing subscription creates nothing — so the exceptional cases are what
+zero slack exposes. Operating at exact capacity is therefore accepted only
+alongside the placement and capacity-visibility requirements below, and only on
+deployed evidence.
 
 ## Clarifications
 
@@ -49,7 +66,28 @@ subscription slots as reconnect and adoption safety headroom.
 
 - Q: When notification coverage is absent or lagging, or the suppression topic is delayed, how should clip detection behave? → A: Fail open by continuing normal clip eligibility, expose the degraded condition operationally, and never retroactively retract an emitted clip.
 - Q: What operator visibility is required when an otherwise qualifying spike is suppressed? → A: Every suppressed would-have-clipped spike emits both an operator-visible metric and a structured log; it does not create a clip.
-- Q: What final monitored-set capacity and ramp thresholds apply? → A: The locked firm maximum is 400 monitored channels, with effective join and leave thresholds both set to 400; this feature does not revisit the existing session-capacity assumptions.
+- Q: What final monitored-set capacity and ramp thresholds apply? → A: The locked firm maximum is 400 monitored channels, with effective join and leave thresholds both set to 400; this feature does not revisit the existing session-capacity assumptions. *(Superseded 2026-09-05 — see the capacity amendment below.)*
+
+### Capacity amendment, 2026-09-05
+
+The approved amendment replaces the 400/400 capacity answer above. It changes
+capacity numbers only; suppression, window, event-time, and topic behavior are
+untouched, and the suppression event contract is capacity-independent.
+
+| Superseded text | Replaced by |
+|---|---|
+| FR-013 "no more than 400 channels … effective join and leave thresholds MUST both be 400" | FR-013 entry 400 / retention-and-maximum 450 |
+| FR-014 "no more than 800 of the existing 900 allowed subscription slots, preserving at least 100 slots" | FR-014 exactly 900 of 900 at the maximum, no reserve guarantee |
+| FR-015 "verify both the 400-channel ceiling and two-coverages-per-channel invariant" | FR-015 entry boundary 400, maximum 450, ≤300 per session, ≤900 total |
+| NFR-001 "refuse growth beyond the 400-channel monitored ceiling rather than consume the reconnect/adoption safety headroom" | NFR-001 refuse growth beyond 450, exact capacity permitted only with placement and capacity observability |
+| NFR-007 "MUST NOT exceed 2% of the 400-channel ceiling — that is, 8 membership changes per poll … Exceeding that bound blocks enabling suppression gating" | NFR-007 advisory bounded-label churn telemetry with no numeric release gate |
+| SC-006 "exactly 400 channels … using 800 subscriptions … at least 100 subscription slots remain … a 401st channel" | SC-006 entry 400, retained band to 450, exact 450/900, 451st excluded, split-fragment replacement converges |
+| SC-011 "Across a 24-hour deployed observation … average at most 8 membership changes per poll" | SC-011 churn-metric correctness and visibility, no 24-hour bound |
+
+The original wording of each superseded requirement is preserved in the git
+history of this file and in autonomous decisions 5, 14, and 19, which are
+marked superseded rather than rewritten. No superseded requirement keeps an
+active identifier here.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -123,34 +161,51 @@ message-derived detection state after the window.
 ### User Story 3 - Maintain complete, capacity-safe channel coverage (Priority: P1)
 
 As an operator, I want every monitored channel to have both chat-message and
-chat-notification coverage without exhausting subscription capacity, so that
-suppression is consistently available and reconnects can recover safely.
+chat-notification coverage without exceeding subscription capacity, so that
+suppression is consistently available and the pool stays correct and legible
+even when the account is exactly full.
 
 **Why this priority**: Partial coverage would make suppression unpredictable,
-while using all available subscription slots would remove the safety margin
-needed for adoption and reconnect operations.
+while an over-committed or falsely-full pool would strand capacity the capacity
+model depends on.
 
-**Independent Test**: Audit a desired set of 400 channels and verify two
-distinct active coverage types per channel, no deliberate partial rollout, no
-more than 800 steady-state subscriptions, and refusal of a 401st monitored
-channel.
+**Independent Test**: Audit a desired set at the 450-channel maximum and verify
+two distinct active coverage types per channel, no deliberate partial rollout,
+exactly 900 steady-state subscriptions with no session above 300, refusal of a
+451st monitored channel, and that a channel newly ranked 401-450 does not enter
+while an incumbent at that rank is retained.
 
 **Acceptance Scenarios**:
 
 1. **Given** any channel in the monitored set, **When** coverage converges,
    **Then** that channel has both chat-message and chat-notification coverage.
-2. **Given** 400 monitored channels, **When** coverage is complete, **Then**
-   exactly 800 channel subscriptions are in use and 100 of the 900 allowed
-   slots remain available for safe adoption and reconnect operations.
-3. **Given** 400 monitored channels and another eligible channel, **When** the
-   system evaluates adding or retaining that channel under the effective
-   400/400 join and leave thresholds, **Then** the monitored set remains at 400
-   or fewer and the additional channel is not admitted until capacity is
-   available.
-4. **Given** only one coverage type exists for a monitored channel, **When**
+2. **Given** 450 monitored channels, **When** coverage is complete, **Then**
+   exactly 900 channel subscriptions are in use, no session holds more than
+   300, and no free subscription slot is promised or reserved.
+3. **Given** a monitored set of 450 channels and another eligible channel,
+   **When** the system evaluates adding it, **Then** the monitored set remains
+   at 450 or fewer and the additional channel is not admitted.
+4. **Given** a channel that is not currently monitored and ranks between 401
+   and 450, **When** membership is evaluated, **Then** it does not enter;
+   **and given** a currently monitored channel at the same rank, **Then** it is
+   retained until its rank falls beyond 450.
+5. **Given** only one coverage type exists for a monitored channel, **When**
    coverage is reconciled, **Then** the missing type is restored without
    duplicating the existing type.
-5. **Given** the provider refuses chat-notification coverage for a channel
+6. **Given** no single connection has two free subscription slots but at least
+   two free slots exist across the pool, **When** a channel's pair is placed,
+   **Then** one slot is reserved on each of two connections as a single
+   all-or-nothing action, and a failure after reservation keeps the coverage
+   half that succeeded.
+7. **Given** the account is exactly full, **When** another subscription is
+   required, **Then** the refusal is reported as a capacity condition
+   distinguishable from a provider refusal and from a transient failure, it
+   does not evict existing coverage, and it does not impose a transient wait
+   before the next legitimate placement opportunity.
+8. **Given** a connection reports itself full below the 300-subscription cap,
+   **When** that condition exists, **Then** it is operationally visible, and it
+   is cleared and re-evaluated when that connection reconnects or is retired.
+9. **Given** the provider refuses chat-notification coverage for a channel
    whose chat-message coverage is live, **When** reconciliation continues,
    **Then** chat coverage is preserved, the channel is reported as
    covered-but-degraded rather than as complete, further notification attempts
@@ -231,8 +286,29 @@ and notices at or after the deadline start a new interval at their occurrence.
   channel-specific suppression state no longer justify a monitored slot.
 - A channel later re-enters the monitored set. A previous, already-expired
   suppression window does not suppress new activity.
-- A 401st channel qualifies while 400 are monitored. It is not admitted by
-  exceeding the firm ceiling.
+- A 451st channel qualifies while 450 are monitored. It is not admitted by
+  exceeding the maximum.
+- A channel that is not monitored reaches rank 401-450. It does not enter,
+  because entry requires rank inside the top 400; an already-monitored channel
+  at the same rank is retained until its rank falls beyond 450.
+- The account is exactly full at 900 subscriptions and one more subscription is
+  required. The condition is reported as capacity, distinctly from a provider
+  refusal and from a transient failure; existing coverage is never evicted to
+  make room, and no transient wait is imposed before the next legitimate
+  placement opportunity.
+- Two free subscription slots exist but on two different connections, so no
+  single connection can hold a whole pair. The pair is placed by reserving one
+  slot on each connection in a single all-or-nothing action; if one half then
+  fails to be created, the successful half is kept and the channel converges
+  through ordinary partial-coverage repair.
+- A connection reports itself full at an occupancy below the 300-subscription
+  cap. That stranded capacity is operationally visible rather than silent, and
+  the condition is cleared and re-evaluated when the connection reconnects or
+  is retired.
+- An enabled subscription exists on the account that this feature did not
+  create, or a delete that was reported as failed left one behind. At exact
+  capacity it consumes a slot the model has allocated, so it is treated as a
+  capacity fault to be found and removed rather than as headroom to absorb it.
 - A relevant notification lacks a trustworthy channel identity or occurrence
   time. It cannot create a guessed suppression deadline; the malformed input
   is made operationally visible.
@@ -308,15 +384,25 @@ and notices at or after the deadline start a new interval at their occurrence.
   operationally distinguishable from healthy dual coverage.
 - **FR-012**: Every suppressed would-have-clipped spike MUST emit both an
   operator-visible metric and a structured log and MUST NOT emit a clip.
-- **FR-013**: The monitored set MUST contain no more than 400 channels. The
-  effective join and leave thresholds MUST both be 400 so no operating mode
-  exceeds that ceiling.
-- **FR-014**: At the 400-channel ceiling, complete dual coverage MUST use no
-  more than 800 of the existing 900 allowed subscription slots, preserving at
-  least 100 slots for reconnect and adoption safety.
+- **FR-013**: The monitored set MUST be bounded by two distinct thresholds: an
+  entry threshold of 400 and a retention-and-maximum threshold of 450. A
+  channel that is not already monitored MUST enter only while its rank is
+  inside the top 400. A channel already monitored MUST be retained while its
+  rank remains inside the top 450, and MUST leave once its rank falls beyond
+  450. Consequently a freshly qualifying channel ranked 401-450 MUST NOT enter,
+  while a retained incumbent at those ranks MAY remain. The monitored set MUST
+  NEVER exceed 450 channels.
+- **FR-014**: At the 450-channel maximum, complete dual coverage MAY consume
+  all 900 allowed subscription slots. The system MUST NOT promise, reserve, or
+  depend on any guaranteed free subscription slot. Admission beyond 450
+  channels MUST be refused at the intent layer that computes the monitored set,
+  so the transport is never asked for a 901st subscription; transport-level
+  refusal remains a loud second line of defence, not the primary control.
 - **FR-015**: Capacity and coverage reporting MUST distinguish monitored
-  channels from individual subscriptions so operators can verify both the
-  400-channel ceiling and two-coverages-per-channel invariant.
+  channels from individual subscriptions, so operators can verify the
+  400-channel entry boundary, the 450-channel maximum, per-connection occupancy
+  of at most 300 subscriptions, total occupancy of at most 900 subscriptions,
+  and the two-coverages-per-channel invariant.
 - **FR-016**: The feature MUST continue using the existing application identity
   and operator authorization, whose current permissions already cover both
   chat coverage types. It MUST NOT require authorization reseeding or expanded
@@ -347,10 +433,16 @@ and notices at or after the deadline start a new interval at their occurrence.
 
 ### Non-Functional Requirements
 
-- **NFR-001**: The system MUST preserve the existing three-session,
-  300-subscription-per-session limit and MUST refuse growth beyond the
-  400-channel monitored ceiling rather than consume the reconnect/adoption
-  safety headroom.
+- **NFR-001**: The system MUST preserve the existing three-connection,
+  300-subscription-per-connection limit — a maximum of 900 subscriptions and
+  therefore at most 450 dual-covered channels — and MUST refuse growth beyond
+  the 450-channel maximum rather than over-commit the account. Operating at
+  exact capacity is permitted only while the supporting behaviour exists: pair
+  placement that can reserve one slot on each of two connections when no single
+  connection can hold the pair, a capacity refusal that is distinguishable from
+  a provider refusal and from a transient failure, and observable per-connection
+  full state including a connection that reports itself full below the
+  300-subscription cap.
 - **NFR-002**: Suppression MUST be isolated by channel; a notice for one channel
   MUST NOT alter clip eligibility or detector state for another channel.
 - **NFR-003**: Coverage reconciliation MUST converge safely from either partial
@@ -383,19 +475,21 @@ and notices at or after the deadline start a new interval at their occurrence.
   would-have-clipped spike MUST be attributable to the affected channel and
   distinguishable from coverage, delivery, malformed-input, and capacity
   signals.
-- **NFR-007**: Monitored-set churn caused by the locked zero-width 400/400
-  hysteresis band MUST be bounded and measured, not assumed. Desired-set
-  entries plus departures attributable to that band, averaged per poll across a
-  24-hour deployed observation, MUST NOT exceed 2% of the 400-channel ceiling —
-  that is, 8 membership changes per poll. Exceeding that bound blocks enabling
-  suppression gating and requires a specification change to a narrower join
-  threshold inside the firm 400 ceiling; it MUST NOT be worked around by hidden
-  code behaviour that differs from the configured thresholds.
+- **NFR-007**: Monitored-set churn attributable to the 400/450 entry-retention
+  band MUST be observable as bounded-label telemetry: desired-set entries plus
+  departures per poll, with no per-channel label growth. This telemetry is
+  **advisory**. It carries no numeric release gate, it MUST NOT block enabling
+  suppression gating, and no observation window is required before release. Any
+  change to the configured entry or retention thresholds remains a
+  specification change and MUST NOT be worked around by hidden code behaviour
+  that differs from the configured thresholds.
 
 ### Key Entities
 
 - **Monitored channel**: A broadcaster currently selected for chat monitoring;
-  it occupies two subscription slots and is subject to the 400-channel ceiling.
+  it occupies two subscription slots, enters only inside the top 400 by rank,
+  and is retained through rank 450, which is also the maximum size of the
+  monitored set.
 - **Channel coverage**: The independently tracked chat-message and
   chat-notification coverage associated with one monitored channel.
 - **Suppression signal**: A relevant gift or raid notice associated with a
@@ -442,10 +536,15 @@ and notices at or after the deadline start a new interval at their occurrence.
   unchanged, and a notice at or after the deadline starts a new interval at its
   occurrence. Default-duration validation uses 120 seconds for gifts and 180
   seconds for raids.
-- **SC-006**: At maximum capacity, exactly 400 channels receive complete dual
-  coverage using 800 subscriptions, the effective join and leave thresholds
-  are both 400, at least 100 subscription slots remain as safety headroom, and
-  attempts to admit a 401st channel do not exceed the ceiling.
+- **SC-006**: Capacity behaviour holds across the entry band and at the
+  maximum. From an empty monitored set, admission stops at 400 channels because
+  entry requires a rank inside the top 400. Retained incumbents extend the set
+  through rank 450, so it can reach but never exceed 450 channels. At 450
+  channels, exactly 900 subscriptions are in use, no connection holds more than
+  300, and no free slot is promised. A 451st qualifying channel is excluded.
+  When a pair split across two connections loses one fragment, replacement of
+  the missing half converges back to complete coverage without exceeding 900
+  subscriptions.
 - **SC-007**: Existing clip-eligible scenarios with no active suppression
   produce the same emission decisions as before this feature.
 - **SC-008**: Operators can distinguish complete dual coverage, partial
@@ -465,25 +564,30 @@ and notices at or after the deadline start a new interval at their occurrence.
   Records one millisecond beyond use the Kafka record timestamp for source
   watermark assignment, without payload rewriting, and are rejected, counted,
   and logged downstream before any delivery observation or state access.
-- **SC-011**: Across a 24-hour deployed observation with the 400/400
-  thresholds in force, desired-set entries plus departures attributable to the
-  zero-width band average at most 8 membership changes per poll — 2% of the
-  400-channel ceiling. A higher observed rate blocks enabling suppression
-  gating and is resolved by a specification change, not by code. This outcome
-  is produced only on the deployed system and MUST NOT be claimed from offline
-  tests, fixtures, replay, or reasoning.
+- **SC-011**: The desired-set churn signal is correct and operator-visible: it
+  increments by entered plus departed channels for each successful desired-set
+  publication, keeps bounded labels with no per-channel growth, and can be read
+  against poll history. No numeric bound, observation window, or release gate
+  is attached to it.
 
 ## Assumptions & Dependencies
 
 - The existing Twitch application identity and operator authorization remain
   valid and already permit both required channel coverage types.
-- The account continues to allow three concurrent sessions with up to 300
-  enabled subscriptions each. The 400-channel ceiling deliberately does not
-  consume the final 100 slots. This feature does not revisit those
-  session-capacity assumptions.
+- The account continues to allow three concurrent connections with up to 300
+  enabled subscriptions each, so 900 subscriptions in total. At the
+  450-channel maximum, dual coverage consumes all 900: there is no reserve.
+  Reconnect and adoption normally consume no new slots — a closed session's
+  subscriptions are disabled and stop counting against the limit, and adopting
+  an existing subscription creates nothing — so the exceptional cases are what
+  exact capacity exposes: parity fragmentation across connections, in-flight
+  create/delete overlap, enabled subscriptions this feature did not create,
+  failed deletes, and a connection reporting itself full below the cap. Those
+  are accepted only with the placement and capacity-visibility behaviour in
+  NFR-001 and with deployed evidence.
 - Existing ranking and desired-set behavior determines which channels qualify
-  for monitoring; this feature changes the maximum admitted count, not ranking
-  order or eligibility.
+  for monitoring; this feature changes the entry and retention thresholds, not
+  ranking order or eligibility.
 - Existing chat-message ingestion, spike qualification, and clip creation
   behavior remain the comparison baseline except where suppression explicitly
   gates emission.
@@ -503,9 +607,10 @@ and notices at or after the deadline start a new interval at their occurrence.
 - Suppression delivery health can only be judged from records that actually
   arrive. A silent window is idle/unknown; the feature deliberately does not add
   a heartbeat or synthetic traffic to make silence provably healthy.
-- The locked 400/400 thresholds remove the hysteresis band, so a bounded amount
-  of desired-set churn is expected; the accepted bound is measured on the
-  deployed system rather than assumed (NFR-007, SC-011).
+- The 400/450 entry-retention band produces the same kind of desired-set
+  behaviour as the pre-007 800/900 ramp: a boundary-rank channel is retained
+  rather than re-admitted each poll. The resulting churn is observed as
+  advisory telemetry rather than gated on a number (NFR-007, SC-011).
 - Every suppressed would-have-clipped spike produces both an operator-visible
   metric and a structured log without creating a clip.
 
@@ -529,14 +634,16 @@ requirement or success criterion above.
 - Viewer-count-derived raid suppression durations.
 - Thresholded, sampled, opt-in, or otherwise partial chat-notification rollout;
   every monitored channel receives both coverage types.
-- Raising the monitored ceiling above 400 or consuming the 100-slot
-  reconnect/adoption safety headroom.
+- Raising the monitored maximum above 450 channels, exceeding 900
+  subscriptions, or opening a fourth websocket connection.
+- Migrating or compacting existing subscriptions between connections to
+  defragment the pool; a pair may be split across connections instead.
 - A heartbeat, keep-alive, or synthetic-record protocol on the suppression path
   to make legitimate silence distinguishable from a stalled delivery path.
 - A configurable future-time allowance; the 30-second maximum future skew is a
   fixed contract bound and introduces no environment variable.
 - A hidden code-level hysteresis band or any other in-code deviation from the
-  configured 400/400 thresholds.
+  configured 400/450 entry and retention thresholds.
 - Changing channel ranking, clipping eligibility, anomaly thresholds, or clip
   content selection beyond gating emission during suppression.
 - Weakening acceptance requirements because live-service validation is not

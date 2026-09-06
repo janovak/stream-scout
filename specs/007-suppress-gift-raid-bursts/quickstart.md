@@ -1,6 +1,6 @@
 # Validation Quickstart: Suppress Gift and Raid Chat Bursts
 
-**Feature**: `007-suppress-gift-raid-bursts` | **Date**: 2026-09-04
+**Feature**: `007-suppress-gift-raid-bursts` | **Date**: 2026-09-04 (capacity amendment 2026-09-05)
 **Companions**: [plan.md](./plan.md), [research.md](./research.md),
 [data-model.md](./data-model.md),
 [contracts/suppression-events.schema.md](./contracts/suppression-events.schema.md)
@@ -130,8 +130,19 @@ Twitch call:
     (FR-001, NFR-003, SC-001).
 11. **Units** — occupancy counts subscriptions; the coverage gauge counts
     channels; the two never mix (FR-015, data-model I4).
-12. **Capacity arithmetic** — 400 channels ⇒ 800 subscriptions ≤ 900 with ≥100
-    free; the desired set never exceeds 400; a 401st candidate is not admitted.
+12. **Capacity arithmetic** — entry 400, retention and maximum 450: a fresh
+    channel ranked 401-450 does not enter, an incumbent at that rank is
+    retained, and the desired set never exceeds 450; at the maximum, 450
+    channels ⇒ exactly 900 subscriptions, no connection above 300, zero free
+    slots, and the 451st candidate is not admitted (FR-013, FR-014, SC-006).
+12a. **Exact-capacity placement and legibility** — a pair is placed one slot on
+    each of two connections when no connection holds two free but the pool has
+    at least two, atomically and with the successful half retained on partial
+    failure; a hard capacity exhaustion raises the distinct capacity error and
+    classification without arming a transient growth backoff and without
+    writing the durable refusal cache; `full_at` is cleared and re-evaluated on
+    reconnect and retirement, and a below-cap full connection is exposed
+    (NFR-001, data-model I25-I27, decision 28).
 13. **Mapping and publication** — the three trigger notices map to contract
     records keyed by `broadcaster_id`; `unraid`, `sub`, `resub`, an unknown
     category, and an absent `notice_type` produce nothing; missing identity or
@@ -291,8 +302,15 @@ python -m pytest -q test_stream_monitoring.py -k "Threshold or Compose"
 
 This stream-monitoring selection owns:
 
-- `docker-compose.yml` `stream-monitoring` has `JOIN_THRESHOLD=400`,
-  `LEAVE_THRESHOLD=400`, and `AUXILIARY_REFUSAL_RETRY_SECONDS=3600`.
+- `docker-compose.yml` `stream-monitoring` carries the checked-in target
+  `JOIN_THRESHOLD=400`, `LEAVE_THRESHOLD=450`, and
+  `AUXILIARY_REFUSAL_RETRY_SECONDS=3600`. The entry/retention split is asserted
+  as two different numbers, not one: entry 400, retention and maximum 450.
+- The pure desired-set assertions cover the asymmetry the thresholds create —
+  a channel ranked 401-450 does not enter a set it is not already in, an
+  incumbent at that rank is retained, and the set never exceeds 450 — plus
+  exact capacity: 450 × 2 = 900, no connection above 300, zero free slots, and
+  the 451st channel excluded.
 - `kafka-init` creates `suppression-events` with **4** partitions, matching
   `FLINK_PARALLELISM=4`.
 
@@ -310,7 +328,7 @@ This PyFlink-free Flink selection owns:
 - The checked-in value of `SUPPRESSION_GATING_ENABLED` is **`false`** on both
   blocks, while the code-level `SuppressionConfig` default is `true`. A deploy
   is therefore inert until an operator flips the compose value, and only after
-  E1-E3 and the 24-hour E2 churn observation have passed (decision 21).
+  E1, E2a, E2b, and E3 have passed (decisions 21 and 27).
 - The pure `SuppressionSourceSettings` fields are
   `delivery_lag_warn_seconds=30` and
   `checked_in_gating_enabled=False`; expected partitions and expected
@@ -325,14 +343,17 @@ Neither selection starts a service or infrastructure process.
 
 Part A can conclude: the pool's two-slot state machine is correct and
 capacity-safe under deterministic fixtures, including the bounded
-auxiliary-refusal hold-off; the mapping and the contract agree and the producer
-keeps key/payload equality; the gate arithmetic is correct; the suppression
-source settings are exactly as designed; and gating changes emission and nothing
-else.
+auxiliary-refusal hold-off, the 400/450 entry-retention asymmetry, exact
+450 × 2 = 900 occupancy, split-pair reservation and its atomicity, the distinct
+capacity classification, and `full_at` clearing/exposure; the mapping and the
+contract agree and the producer keeps key/payload equality; the gate arithmetic
+is correct; the suppression source settings are exactly as designed; and gating
+changes emission and nothing else.
 
 Part A **cannot** conclude anything about: real Twitch behaviour with mixed
-subscription types, subscription cost, real convergence at 400 channels, the
-actual desired-set churn rate against NFR-007, PyFlink's actual two-input
+subscription types, subscription cost, real convergence at 400 or 450 channels,
+whether the account holds enabled subscriptions this feature did not create,
+real desired-set churn, PyFlink's actual two-input
 watermark and idleness behaviour — including the idle → active re-entry bound,
 which A4 exercises only in the harness's simplified model, whether the
 assigner-last builder order and post-source attachment cause the Python
@@ -372,13 +393,19 @@ deployment-ordering hazard").
 arithmetic is unconditionally safe regardless of what E1 later shows. E1 gates
 dual-coverage sign-off and enabling gating — B2 onward — not this ramp-down.
 
-### B1. Deploy the feature revision with gating off
+### B1. Deploy the feature revision with gating off — and with retention still 400
 
 Deploy the feature revision. `SUPPRESSION_GATING_ENABLED=false` is already
 checked into both Flink blocks in `docker-compose.yml`, so no operator action is
-required to keep gating off; leave it alone. The pool converges to ~800
-subscriptions over the same 400 channels. Detection behaviour must be
-indistinguishable from before the deploy.
+required to keep gating off; leave it alone.
+
+**Override `LEAVE_THRESHOLD` to `400` for this stage**, even though the
+checked-in target is `450`. First dual-coverage convergence is then 400
+channels / 800 subscriptions, with roughly 100 slots of cushion, which is where
+E1 and E2a are taken. Proving the dual transport and reaching exact capacity are
+two separate risks and are never taken in the same step (decision 27). The pool
+converges to ~800 subscriptions over the same 400 channels, and detection
+behaviour must be indistinguishable from before the deploy.
 
 ### B2. E1 — capacity and cost, at the first opportunity
 
@@ -392,37 +419,66 @@ reversed.
 
 ### B3. Confirm the ramp is in effect
 
-Thresholds are already 400/400 from B0; confirm they survived the deploy and
-that the desired set is still capped at 400.
+Thresholds are 400/400 at this stage — 400 from B0, with the retention
+threshold deliberately still overridden below its checked-in target. Confirm
+they survived the deploy and that the desired set is capped at 400.
 
-### B4. E2 — coverage and capacity at the ceiling
+### B4. E2a — dual coverage at 400 channels, with a cushion
 
 Confirm:
 
 - `eventsub_channel_coverage{state="complete"}` equals `ZCARD chat:desired`;
 - `eventsub_subscription_count` is twice that and no more than 800;
 - no connection exceeds 300 (`eventsub_connection_occupancy`);
-- at least 100 subscription slots stay free;
+- roughly 100 subscription slots remain free at this stage;
 - partial-coverage series settle back to zero after convergence;
-- the monitored set does not exceed 400 (SC-006).
+- the monitored set does not exceed 400 while retention is still 400.
 
-Watch `desired_set_churn_total` here specifically: 400/400 is a zero-width
-hysteresis band, so boundary-rank churn is the expected cost of the locked
-threshold decision (research D10). Record what it actually is, and hold it
-against the NFR-007 bound:
+Read `desired_set_churn_total` here as **advisory context only**: it shows how
+much the monitored set moves, and nothing about it gates progression. The
+amended thresholds restore a 50-channel retention band, so no observation
+window and no numeric bound apply (NFR-007, SC-011, decision 27).
 
-- Observe for a **full 24 hours** at 400/400.
-- Compute entries plus departures averaged **per poll** over that window.
-- The bound is **8 membership changes per poll**, i.e. 2% of the 400-channel
-  ceiling (SC-011).
-- Under the bound: proceed. Over the bound: **do not enable gating.** The
-  resolution is a specification change to a narrower join threshold inside the
-  firm 400 ceiling — never a code workaround that deviates from the configured
-  thresholds.
+### B4a. Sweep the account, then ramp retention to 450
 
-This observation is deployed evidence. It cannot be produced or approximated
-offline; offline tests pin only that the counter increments by entered plus
-departed channels.
+Before spending the last 100 slots, enumerate **every** enabled subscription on
+the client-id / user-id pair and remove anything the pool does not own — an
+earlier revision's leftovers, an orphan from a failed delete, another process's
+subscription. At exact capacity such a subscription is indistinguishable from a
+defect and consumes a slot the model has already allocated (research R15, R17).
+
+Then set `LEAVE_THRESHOLD=450`, the checked-in target, and let the monitored set
+converge to 450 channels and 900 subscriptions. Only incumbents ranked 401-450
+are added, so the set grows gradually rather than in one jump.
+
+### B4b. E2b — exact-capacity drills
+
+Read these as **relations, not approximations**. "About 900" is not a passing
+result:
+
+- `eventsub_subscription_count` **== 900**;
+- `eventsub_subscription_count` **== 2 ×**
+  `eventsub_channel_coverage{state="complete"}`;
+- every `eventsub_connection_occupancy` **≤ 300**, and their sum **== 900**;
+- free subscription slots **== 0**;
+- the 451st qualifying channel is **excluded**, and the monitored set stays at
+  450.
+
+Then exercise the exact-capacity paths (decision 28):
+
+1. **Split placement.** With no connection holding two free slots but at least
+   two free in the pool, a channel's pair is placed one slot on each of two
+   connections, and both halves are recorded.
+2. **Fragment replacement.** Remove one half of a split pair and confirm the
+   channel converges back to `complete` without exceeding 900 subscriptions.
+3. **Capacity classification.** Force a create at a genuinely full pool and
+   confirm it is reported under its own capacity classification — not as a
+   provider refusal, and not as a transient fault — that no channel is written
+   to the durable refusal cache, that no existing coverage is evicted, and that
+   no transient growth backoff is armed.
+4. **`full_at` re-evaluation.** Confirm a connection reporting full **below**
+   300 is visible as stranded capacity, and that reconnecting or retiring that
+   connection clears and re-evaluates the condition.
 
 ### B5. E3 — the watermark gate
 
@@ -464,8 +520,8 @@ Four measurements, all required:
 
 ### B6. Enable gating, then E4
 
-Only after E1, E2 — including the full 24-hour churn observation against
-NFR-007 — and all four parts of E3 have passed, change the checked-in compose value
+Only after E1, E2a, E2b — including every exact-capacity drill — and all four
+parts of E3 have passed, change the checked-in compose value
 to `SUPPRESSION_GATING_ENABLED=true` on both Flink blocks and recreate them.
 Then capture a real gift-bomb and raid slice and confirm:
 
@@ -490,21 +546,30 @@ Set `SUPPRESSION_GATING_ENABLED=false` and confirm emission behaviour returns
 to pre-007 with no other change. Then confirm the capacity-safe rollback order
 is executable, in exactly this sequence:
 
-1. **Gating off** — `SUPPRESSION_GATING_ENABLED=false`.
-2. **Unwind the transport with thresholds still at 400/400** — revert the
-   two-subscription revision while `JOIN_THRESHOLD`/`LEAVE_THRESHOLD` remain
+1. **Gating off** — `SUPPRESSION_GATING_ENABLED=false`. For a
+   detection-policy-only incident this is the whole rollback.
+2. **For a capacity incident, lower retention to 400 first and reconverge** —
+   set `LEAVE_THRESHOLD=400` (`JOIN_THRESHOLD` is already 400) and wait for the
+   monitored set to fall to 400 channels and 800 subscriptions. This restores a
+   ~100-slot cushion with no code change and leaves dual coverage intact while
+   fragmentation, a stranded below-cap `full_at`, a foreign subscription, or a
+   failed delete is diagnosed.
+3. **Unwind the transport with thresholds at 400/400** — revert the
+   two-subscription revision while `JOIN_THRESHOLD`/`LEAVE_THRESHOLD` are
    `400`/`400`. The single-subscription revision needs 400 of 900 slots, so
    every instant of this step is inside capacity.
-3. **Wait for convergence** — continue only once `channel.chat.notification`
+4. **Wait for convergence** — continue only once `channel.chat.notification`
    subscriptions no longer appear in the enumeration,
-   `eventsub_subscription_count` has fallen to approximately the desired channel
-   count (~400, not ~800), and coverage and desired-set metrics are stable.
-4. **Only then raise thresholds** back toward the single-subscription ramp.
+   `eventsub_subscription_count` has fallen to the desired channel count (400,
+   not 800), and coverage and desired-set metrics are stable.
+5. **Only then restore the single-subscription ramp.**
 
-The governing invariant: **thresholds are never raised above 400 while any
-`channel.chat.notification` subscription still exists.** Raising them first is
-the unsafe reverse order — at two subscriptions per channel it permits more than
-800 subscriptions and can cross the 900 ceiling (research R11).
+The governing invariant: **the retention threshold is never above 450 while two
+subscriptions per channel are live, and it must be back at 400 before the dual
+transport is unwound.** Relaxing the threshold first is the unsafe reverse
+order — at two subscriptions per channel a retention threshold above 450
+permits more than 900 subscriptions, and unwinding from a 450-channel set hands
+the single-subscription revision a set larger than its ramp (research R11a).
 
 The topic may be left in place.
 
@@ -514,7 +579,7 @@ The topic may be left in place.
 
 | Evidence | Where it is produced | May be claimed from Part A? |
 |---|---|---|
-| Pool two-slot correctness and capacity arithmetic | A2 | Yes |
+| Pool two-slot correctness and capacity arithmetic, including the 400/450 entry-retention asymmetry, exact 450 × 2 = 900, split-pair reservation, capacity classification, and `full_at` handling | A2 | Yes |
 | Bounded auxiliary-refusal hold-off, expiry, and reconnect re-eligibility | A2 | Yes |
 | Notice mapping, contract conformance, malformed handling, producer key/payload equality | A2 | Yes |
 | Gate arithmetic, notice-bounded overlap, duplicates, both interval boundaries, and fixed future-time trust bound | A3 | Yes |
@@ -525,8 +590,8 @@ The topic may be left in place.
 | PyFlink operator/topology wiring against fakes | A3 (`test_clip_detector.py`) | Only when the pinned `apache-flink==1.18.0` is already installed; otherwise it is pending, and it is never a substitute for the A3 pure assertions |
 | Assigner-last strategy construction and post-source `assign_timestamps_and_watermarks` attachment on both streams | A3 item 8 | Only as wiring; **not** as proof that the Python assigners execute, that event time follows trusted payload time, or that the two Python stages have an acceptable deployed process/RSS cost |
 | **E1** mixed types live, subscription cost | B2 | **No** |
-| **E2** 400-channel convergence, 800 subscriptions, headroom (SC-006) | B4 | **No** |
-| **E2 churn** 24-hour desired-set churn against the NFR-007 bound (SC-011) | B4 | **No** |
+| **E2a** dual coverage at 400 channels / 800 subscriptions with a cushion | B4 | **No** |
+| **E2b** exact capacity: 900 == 900, ≤300 per connection, zero free slots, 451st excluded, split placement, fragment replacement, capacity classification, `full_at` re-evaluation (SC-006) | B4b | **No** |
 | **E3** two-input watermark/idleness, isolated-notice bound, both streams' exact/type/future fallback behavior without chat loss, proof that assigner-last strategies run post-source with one partition per subtask, and TaskManager Python process-count/RSS impact for the two parallelism-four stages | B5 | **No** |
 | **E4** trusted-record delivery age, downstream malformed-future visibility after source timestamp fallback, real-burst confirmation for SC-003, and notice-bounded window-default tuning/adequacy for SC-005 | B6 | **No** |
 | **E5** rollback rehearsal in the capacity-safe order | B7 | **No** |

@@ -232,6 +232,35 @@ remain pending.
 
 ---
 
+## Phase 8: Approved Capacity Amendment (Decisions 27-28)
+
+**Purpose**: Carry the approved capacity amendment — entry `JOIN_THRESHOLD=400`,
+retention-and-maximum `LEAVE_THRESHOLD=450`, exact 900-of-900 subscription
+occupancy with no guaranteed reserve, and the exact-capacity engineering that
+makes it safe. This is plan phase 9; it depends on phases 1-7 and precedes the
+deployed validation in plan phase 8.
+
+**Tests**: Required, and first. T060 and T061 must be observed failing for the
+intended reason before T062 and T063 change behaviour or configuration, exactly
+as T027 preceded T028.
+
+- [x] T059 Record the approved capacity amendment in the specification artifacts — autonomous decisions 27 and 28, supersession banners on decisions 5, 14, and 19, amendment banners on decisions 16 and 21, rewritten FR-013/FR-014/FR-015, NFR-001, NFR-007, SC-006, SC-011, overview, User Story 3, edge cases, entities, assumptions and out-of-scope text, the entry-400/maximum-450/900-steady/0-free capacity tables, the split-reservation placement rule, the capacity-error and `full_at` rules, the fragmentation/foreign-subscription/below-cap-`full_at`/failed-delete/exact-convergence risks, and the staged rollout and rollback — in `specs\007-suppress-gift-raid-bursts\spec.md`, `specs\007-suppress-gift-raid-bursts\plan.md`, `specs\007-suppress-gift-raid-bursts\research.md`, `specs\007-suppress-gift-raid-bursts\data-model.md`, `specs\007-suppress-gift-raid-bursts\quickstart.md`, and `specs\007-suppress-gift-raid-bursts\autonomous-decisions.md`
+- [ ] T060 [US3] Add failing threshold and ceiling tests for entry 400 with retention-and-maximum 450: a channel absent from the previous set and ranked 401-450 does not enter, an incumbent at the same rank is retained, a channel beyond rank 450 leaves, the desired set never exceeds 450, 450 complete channels occupy exactly 900 subscriptions with no connection above 300 and zero free slots, and the 451st qualifying channel is excluded at the intent layer, in `services\stream-monitoring\test_stream_monitoring.py`
+- [ ] T061 [US3] Add failing exact-capacity behaviour tests for slot fragmentation and legibility: a pair placed as one slot on each of two connections when no connection holds two free but the pool holds at least two, atomic all-or-nothing reservation of that pair under concurrency, retention of the successful half after a post-reservation failure, replacement of a lost split fragment converging back to complete without exceeding 900, reconnect and adoption consuming no additional slot, a hard capacity exhaustion raising the distinct capacity error with its own metric classification rather than a provider refusal or transient fault and without arming the transient growth backoff or writing the durable refusal cache, and `full_at` being cleared and re-evaluated on reconnect and retirement with below-cap full state exposed, in `services\stream-monitoring\test_stream_monitoring.py`
+- [ ] T062 [US3] After T060 and T061 fail for the intended reasons, implement co-location-first placement with the atomic two-connection split-pair reservation fallback, the distinct `PoolCapacityError` and its capacity metric classification, suppression of transient growth backoff for a hard capacity condition, and `full_at` clearing, re-evaluation, and below-cap exposure, keeping `reconciler.py` channel-keyed and unchanged, in `services\stream-monitoring\eventsub_pool.py`
+- [ ] T063 [US3] After T062 passes, set the checked-in `JOIN_THRESHOLD=400` and `LEAVE_THRESHOLD=450` with a comment stating the entry/retention split, the 450 × 2 = 900 exact ceiling, the absence of a guaranteed reserve, and the requirement to deploy with the retention threshold overridden to `400` until E1 and E2a pass, in `docker-compose.yml`, and align the runtime capacity constants and comments with the amended model in `services\stream-monitoring\eventsub_pool.py` and `services\stream-monitoring\stream_monitoring_service.py`
+- [ ] T064 Keep `desired_set_churn_total` as advisory bounded-label telemetry and remove every numeric release gate attached to it — the 2%/8-changes-per-poll bound, the 24-hour observation window, and any assertion or comment treating it as blocking — in `services\stream-monitoring\stream_monitoring_service.py` and `services\stream-monitoring\test_stream_monitoring.py`
+- [ ] T065 Update the operator runbook for the amended capacity model: entry 400 and maximum 450, exact 900-of-900 occupancy with no reserve, the connection-full and capacity-classification signals, the advisory churn reading with no release gate, the staged rollout (400/400 single-subscription convergence, dual transport at 400/400 with gating off, E1 and E2a, account-wide foreign-subscription sweep, ramp to the checked-in 400/450, E2b exact-capacity drills read as relational equality, then E3, E4, E5), and the capacity-safe rollback that lowers retention to 400 and reconverges before the transport is unwound, in `OPERATIONS.md`
+- [x] T066 Update the requirements checklists and the requirements-to-task traceability for the amended requirements and the T059-T068 phase, including the supersession map from the original ledger, in `specs\007-suppress-gift-raid-bursts\checklists\requirements.md`, `specs\007-suppress-gift-raid-bursts\checklists\requirements-quality.md`, and `specs\007-suppress-gift-raid-bursts\tasks.md`
+- [ ] T067 Run the complete locally permitted suites after the amendment and resolve only amendment regressions, then obtain fresh reviews of the changed surfaces, in `services\stream-monitoring\test_stream_monitoring.py`, `services\stream-monitoring\test_desired_set_store.py`, `services\flink-job\test_spike_detector.py`, `services\flink-job\test_replay.py`, and `services\flink-job\test_clip_detector.py`, reporting the PyFlink-importing file as pending rather than passed when the pinned `apache-flink==1.18.0` is absent
+- [ ] T068 Update the pull request #55 summary and its decision log with the approved capacity amendment: the entry-400 / retention-450 model and its exact analogy to the pre-007 800/900 ramp, the removal of the guaranteed reserve, decision 28's exact-capacity engineering, the removal of decision 19's churn release gate, the staged rollout and amended rollback order, and the still-pending deployed evidence E1, E2a, E2b, E3, E4, and E5
+
+**Checkpoint**: The amended capacity model is specified, proved by
+deterministic tests, implemented, configured, documented, and reviewed, while
+every deployed gate remains pending.
+
+---
+
 ## Dependencies and Execution Order
 
 ### Phase and Story Dependency Graph
@@ -261,6 +290,9 @@ US3 complete pool + capacity proof   US4 pure suppression arithmetic
                        |
                        v
               Polish/local closure
+                       |
+                       v
+        Capacity amendment T059-T068 (decisions 27-28)
 ```
 
 ### Hard Safety Dependencies
@@ -283,6 +315,19 @@ US3 complete pool + capacity proof   US4 pure suppression arithmetic
 - US2 depends on completed US1 because it compares the implemented job gate
   with the offline harness.
 - T053-T058 close only after the desired story phases are complete.
+- T059 precedes T060-T068: the amended requirements are written before work is
+  proved against them.
+- T060 and T061 precede T062, and T062 precedes T063 — the amended capacity
+  behaviour is proved by failing deterministic tests before the pool changes,
+  and the pool change lands before the checked-in retention threshold moves to
+  450. This is the same ordering rule that made T026/T027 precede T028, and it
+  must not be relaxed.
+- T064 may proceed in parallel with T060-T063; it touches the churn accounting
+  and its assertions only.
+- T065-T067 close after T063 and T064. T068 closes last.
+- No amendment task closes any deployed evidence. E1, E2a, E2b, E3, E4, and E5
+  remain pending operator runs, and the deployed ramp to retention 450 happens
+  only after E1 and E2a.
 
 ### Logical Commit Boundaries
 
@@ -291,6 +336,9 @@ US3 complete pool + capacity proof   US4 pure suppression arithmetic
    T033-T036.
 3. **Flink detector**: T002, T029-T032, T037-T047.
 4. **Replay, operations, and integration**: T003, T048-T058.
+5. **Capacity amendment**: T059-T068 — artifacts (T059), failing tests
+   (T060-T061), pool implementation (T062), configuration (T063), churn
+   telemetry (T064), operations and closure (T065-T068).
 
 ---
 
@@ -354,44 +402,64 @@ T057 follows the replay implementation; T058 follows every local closure task.
 | FR-010 | T031-T032, T039, T043, T048-T052 |
 | FR-011 | T011, T016, T019, T024-T025, T035, T039-T044, T046-T047, T050-T053 |
 | FR-012 | T040, T042, T044, T047, T050-T053 |
-| FR-013 | T017, T026-T028, T053 |
-| FR-014 | T008-T009, T017, T026, T028 |
-| FR-015 | T017, T025-T026, T053 |
+| FR-013 | T017, T026-T028, T053 → **amended**: T059-T060, T063, T065-T067 |
+| FR-014 | T008-T009, T017, T026, T028 → **amended**: T059-T063, T065-T067 |
+| FR-015 | T017, T025-T026, T053 → **amended**: T059-T063, T065-T067 |
 | FR-016 | T010, T018, T053-T054 |
 | FR-017 | T004-T005, T029-T031, T033-T035, T037, T039, T041-T042, T046-T047, T050 |
 | FR-018 | T040, T044, T048-T052 |
-| NFR-001 | T008-T009, T017, T026-T028 |
+| NFR-001 | T008-T009, T017, T026-T028 → **amended**: T059-T063, T065-T067 |
 | NFR-002 | T037-T045, T048-T052 |
 | NFR-003 | T006-T007, T010-T011, T016, T018-T019, T024, T028 |
-| NFR-004 | T016-T017, T024-T025, T033-T035, T037-T043, T047, T053 |
+| NFR-004 | T016-T017, T024-T025, T033-T035, T037-T043, T047, T053 → **amended**: T061-T063, T065 |
 | NFR-005 | T033-T035, T039, T042-T043, T046-T047, T050-T053 |
 | NFR-006 | T040, T042, T044, T047, T050-T053 |
-| NFR-007 | T027-T028, T053 |
+| NFR-007 | T027-T028, T053 → **amended**: T059, T064-T067 |
 | SC-001 | T006-T007, T010-T011, T016-T019, T024-T026 |
 | SC-002 | T004-T005, T029-T032, T033-T037, T041, T047 |
 | SC-003 | T040, T042, T044, T047, T050-T052 |
 | SC-004 | T040, T044, T048-T052, T055-T057 |
 | SC-005 | T029-T032, T046, T048-T052, T057 |
-| SC-006 | T017, T026-T028 |
+| SC-006 | T017, T026-T028 → **amended**: T059-T063, T065-T067 |
 | SC-007 | T040, T044, T046, T050-T052, T055-T056 |
 | SC-008 | T016-T017, T024-T025, T033-T035, T039-T043, T053 |
 | SC-009 | T010, T018, T053-T054 |
 | SC-010 | T011, T016, T019, T024-T025, T039-T044, T046-T053 |
-| SC-011 | T027-T028, T053 |
+| SC-011 | T027-T028, T053 → **amended**: T059, T064-T067 |
 
-NFR-007 and SC-011 are a deployed measurement. The local tasks above pin only
-the accounting — that `desired_set_churn_total` increments by entered plus
-departed channels with bounded labels, and that the bound is documented — so
-the 8-changes-per-poll average over 24 hours stays E2/B4 evidence and is never
-claimed from this ledger.
+NFR-007 and SC-011 no longer carry a deployed numeric gate. The amendment
+retains `desired_set_churn_total` as advisory bounded-label telemetry, so the
+local tasks pin only its accounting and T064 removes the 8-changes-per-poll,
+24-hour release gate that decision 19 had attached to it.
 
-SC-006 has the same evidence boundary: T017 and T026-T028 prove capacity
-arithmetic and convergence only with deterministic fakes; live 400-channel
-convergence remains pending E2/B4. T040/T042/T044/T047/T050-T052 establish the
+SC-006 has an evidence boundary that the amendment widens rather than removes:
+T017 and T026-T028 proved the original 400/400 arithmetic with deterministic
+fakes, and T060-T063 extend that proof to entry 400 / retention 450 and exact
+450 × 2 = 900 occupancy — still only with deterministic fakes. Live convergence
+at 400 channels remains E2a/B4, and live exact-capacity behaviour at 450
+channels remains E2b/B4b.
+T040/T042/T044/T047/T050-T052 establish the
 offline mechanics behind SC-003, but real-burst confirmation remains pending
 E4/B6. T029-T032/T046/T048-T052/T057 establish deterministic overlap and
 configuration behavior for SC-005, while tuning and adequacy of the window
 defaults remain pending E4/B6. No live evidence is closed by this task ledger.
+
+### Supersession map from the original ledger
+
+Checked tasks keep their marks; the amendment does not unmark completed
+history. Where an amendment task changes what a completed task established,
+the pairing is recorded here.
+
+| Completed task | What it established | Superseding amendment task |
+|---|---|---|
+| T017 | 150 complete channels per 300-subscription session; channel-versus-subscription units at the 400-channel ceiling | T060 (entry 400 / retention 450, exact 450 × 2 = 900, zero free slots, 451st excluded) |
+| T026 | Deterministic capacity execution at 400 channels / 800 subscriptions with the 401st refused | T060, plus T061 for split placement, capacity classification, and `full_at` |
+| T027 | Failing static/runtime assertions for checked-in 400/400 thresholds and churn accounting | T060 and T064 (400/450 assertions; churn assertions become advisory) |
+| T028 | Checked-in `JOIN_THRESHOLD=400` / `LEAVE_THRESHOLD=400` and bounded churn accounting | T063 (checked-in 400/450 with the deploy-at-400 override note) and T064 |
+| T008-T009 | Pair-aware `route()` and `_reserve()` that never exceed 300 per connection or three connections | T062 (atomic two-connection split-pair reservation, capacity error, no transient backoff, `full_at` handling) |
+| T025 | `eventsub_channel_coverage{state}` in channel units alongside per-connection occupancy | T063 (adds connection-full and capacity-classification visibility) |
+| T053 | The operator runbook for the 400-channel ceiling, signals, rollout, and rollback | T065 (amended capacity contract, staged rollout, amended rollback) |
+| T058 | The FR/NFR/SC traceability audit against the pre-amendment requirement set | T066 and T067 (traceability and suites re-run against the amended requirements) |
 
 ---
 
@@ -399,7 +467,7 @@ defaults remain pending E4/B6. No live evidence is closed by this task ledger.
 
 | Story | Independently complete when |
 |---|---|
-| **US3** | Fake EventSub state converges both partial directions to complete dual coverage, a refused notification subscription is degraded for a bounded hour and repairable afterwards or on reconnect, every lifecycle path is type-aware, 400 channels occupy exactly 800 subscriptions with no connection above 300, units remain distinct, and the 401st channel is refused before 400/400 is written. |
+| **US3** | Fake EventSub state converges both partial directions to complete dual coverage, a refused notification subscription is degraded for a bounded hour and repairable afterwards or on reconnect, every lifecycle path is type-aware, units remain distinct, and — after the capacity amendment — a fresh channel ranked 401-450 does not enter while an incumbent is retained, the monitored set never exceeds 450, 450 complete channels occupy exactly 900 subscriptions with no connection above 300 and zero free slots, the 451st channel is refused, a pair splits atomically across two connections when no connection holds two free slots, a lost split fragment is replaced, and a hard capacity exhaustion is classified distinctly without arming a transient backoff — all before the checked-in retention threshold moves to 450. |
 | **US4** | Pure Python tests prove configurable 120/180 defaults, notice-bounded half-open transition behavior, duplicate idempotence, maximum-deadline ordering without a false full-state-ordering claim, exact start/deadline boundaries, pre-notice eligibility, viewer-count independence, fixed future-skew constant, and the full `SuppressionSourceSettings` value set without importing PyFlink. T029 authors the failing static compose assertions during US4, but the US4 configuration criterion and T029 close only after T046 writes both Flink blocks. |
 | **US1** | Offline producer and keyed-operator tests prove only valid trigger notices publish with key/payload equality held at the producer, malformed/unknown/over-future payloads fail open visibly at the consumer before observation/state, the sparse second source is configured safely, delivery age is classified healthy/lagging per trusted received record with silence left as idle/unknown, and only qualifying output whose peak lies inside the notice-bounded interval is gated with the required metric/log. |
 | **US2** | Paired replays have identical counts, baselines, holds, expiry, timers, and `last_fire_second`; only covered clip outputs and their suppression metric/log differ, including quiet, sparse, idle-to-active re-entry, late, and cross-channel cases. |
@@ -424,6 +492,7 @@ defaults remain pending E4/B6. No live evidence is closed by this task ledger.
 3. **End-to-end offline suppression path**: T033-T047.
 4. **No-learning-regression proof**: T048-T052.
 5. **Operations and local closure**: T053-T058.
+6. **Approved capacity amendment**: T059-T068.
 
 No increment may claim deployed Twitch, Kafka, or PyFlink runtime behavior from
 offline evidence.
@@ -440,24 +509,30 @@ configured machine.
 | Evidence | Pending operator proof |
 |---|---|
 | E1 | Both EventSub types coexist on live sessions and `total_cost` remains 0 of 10. Gates dual-coverage sign-off and enabling gating; it does **not** gate the preliminary 400/400 ramp-down on the single-subscription revision, which is 400 x 1 and safe on its own. |
-| E2 | Live convergence reaches 400 complete channels and 800 subscriptions, no connection exceeds 300, and at least 100 slots remain free. |
-| E2 churn | Across a 24-hour observation at 400/400, desired-set entries plus departures average at most 8 per poll (2% of the 400-channel ceiling). Exceeding it blocks enabling gating and requires a specification change, not a code workaround (NFR-007, SC-011). |
+| E2a | With the retention threshold still 400, live convergence reaches 400 complete channels and 800 subscriptions, no connection exceeds 300, roughly 100 slots remain free, and the 401st channel is not admitted. Gates the ramp to 450. |
+| E2b | After the account-wide foreign-subscription sweep and the ramp to entry 400 / retention 450, exact capacity holds under relational equality: total subscriptions == 900, == 2 x complete-coverage channels, every connection <= 300 with their sum == 900, free slots == 0, and the 451st channel excluded. The split-placement, fragment-replacement, capacity-classification, and below-cap `full_at` drills all pass (SC-006, decisions 27-28). |
 | E3 | A silent suppression topic does not worsen chat watermark lag for one hour; an isolated notice respects the hold bound; both real strategies retain assigners after idleness and drive event time from trusted payload time; exact/+1 ms and chat missing/null/string/float/bool fallbacks cannot poison the combined watermark or lose chat; each of the two Python assignment stages runs at parallelism four with one partition per subtask; and TaskManager Python process count/RSS are recorded. All are deployed-only measurements. |
 | E4 | Real gift/raid capture confirms trusted-record `suppression_delivery_age_seconds` against the 30-second warning threshold, downstream malformed-future rejection/warning visibility after Kafka-record timestamp fallback without payload rewriting, real-burst notice-bounded suppression for SC-003, window-default tuning/adequacy for SC-005, trigger mapping, and unaffected out-of-window/pre-notice clips. |
-| E5 | Disabling `SUPPRESSION_GATING_ENABLED` restores pre-007 emission, and the capacity-safe rollback order is executable: gating off, unwind the transport with thresholds still at 400/400, wait for the notification subscriptions to disappear and subscription count to fall to roughly the desired channel count, and only then raise thresholds. |
+| E5 | Disabling `SUPPRESSION_GATING_ENABLED` restores pre-007 emission, and the capacity-safe rollback order is executable: gating off, retention lowered to 400 and reconverged on a capacity incident, the transport unwound with thresholds at 400/400, a wait for the notification subscriptions to disappear and the subscription count to fall to the desired channel count, and only then the single-subscription ramp restored. |
 
 ---
 
 ## Notes
 
-- This ledger is fixed at **58 tasks, T001-T058**. Later corrections fold work
-  into existing IDs; do not add, split, or renumber them.
+- This ledger was fixed at **58 tasks, T001-T058** for the original scope, and
+  is extended once by the approved capacity amendment to **68 tasks,
+  T001-T068**. Corrections inside a scope fold into existing IDs; do not add,
+  split, or renumber them. T059-T068 are the amendment phase and start
+  unchecked.
 - A checked box records the work that was completed against the task text as it
   stood at the time. Decision 25 amended T038, T041, T045 and T050, and
   decision 26 further amended T038, T041 and T045 after they were checked;
   their existing marks are preserved, and the
   outstanding assignment-path work is carried by the still-open T058 rather
-  than by unchecking completed history.
+  than by unchecking completed history. Decisions 27-28 change what
+  T008-T009, T017, T025-T028, T053, and T058 established; those marks are
+  likewise preserved and the superseding work is carried by T059-T068 under
+  the supersession map above.
 - Do not pass a `WatermarkStrategy` carrying a Python `TimestampAssigner` into
   `env.from_source`; PyFlink 1.18 discards it silently. Attach it with
   `DataStream.assign_timestamps_and_watermarks()` instead, on both the chat and

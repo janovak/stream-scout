@@ -1,6 +1,6 @@
 # Phase 1 Data Model: Suppress Gift and Raid Chat Bursts
 
-**Feature**: `007-suppress-gift-raid-bursts` | **Date**: 2026-09-04
+**Feature**: `007-suppress-gift-raid-bursts` | **Date**: 2026-09-04 (capacity amendment 2026-09-05)
 **Companions**: [plan.md](./plan.md), [research.md](./research.md),
 [contracts/suppression-events.schema.md](./contracts/suppression-events.schema.md)
 
@@ -93,16 +93,20 @@ FR-001 rather than a standing exception to it:
 | `subscription_ids` | **subscriptions** | ≤ 300 enabled per connection |
 | `reserved` | **subscriptions** in flight | included in `load` |
 | `load` | `len(subscription_ids) + reserved` | routing compares this against the cap |
-| `full_at` | occupancy Twitch refused at | unchanged semantics |
+| `full_at` | occupancy Twitch refused at | Cleared and re-evaluated on reconnect and retirement; a value **below** the 300 cap is stranded capacity and is exposed rather than left silent (decision 28) |
 
 **Occupancy is a subscription count. Capacity policy is a channel count.**
 Those two units must never be mixed:
 
 - `eventsub_connection_occupancy` — subscriptions per connection, ≤ 300.
-- `eventsub_subscription_count` — total subscriptions held, ≤ 800 steady state.
+- `eventsub_subscription_count` — total subscriptions held, ≤ 900 and exactly
+  900 at the 450-channel maximum.
 - `eventsub_channel_coverage{state}` — **channels** by coverage state; the
-  `complete` series is what is compared against `ZCARD chat:desired` and against
-  the 400-channel ceiling (FR-015).
+  `complete` series is what is compared against `ZCARD chat:desired` and
+  against the 450-channel maximum (FR-015).
+- Connection full state — including full **below** the cap — and a capacity
+  classification on create failures, distinct from provider refusal and from
+  transient faults (FR-015, NFR-001, NFR-004).
 
 ---
 
@@ -251,17 +255,24 @@ which is what SC-004 asserts. The cost is that a suppressed decision starts the
 | Connections | connections | ≤ 3 | `_grow()` refusal (`MAX_CONNECTIONS`) |
 | Enabled subscriptions per connection | subscriptions | ≤ 300 | `route()` against `cap`, `full_at` |
 | Total subscriptions | subscriptions | ≤ 900 | `MAX_SUBSCRIPTIONS` |
-| Monitored channels | channels | ≤ 400 | `LEAVE_THRESHOLD` = 400 |
-| Steady-state subscriptions at the ceiling | subscriptions | 800 | 400 × 2 |
-| Reserved headroom | subscriptions | ≥ 100 | 900 − 800 |
+| Monitored-channel entry threshold | channels | 400 | `JOIN_THRESHOLD` = 400 |
+| Monitored-channel retention and maximum | channels | 450 | `LEAVE_THRESHOLD` = 450 |
+| Steady-state subscriptions at the maximum | subscriptions | 900 | 450 × 2 |
+| Guaranteed free slots | subscriptions | 0 | 900 − 900 |
 | Channels per connection when a pair is co-located | channels | ≤ 150 | 300 / 2 |
 
-Admission of a 401st channel is refused at the **intent** layer, not the
-transport: `compute_desired_set` never returns more than `LEAVE_THRESHOLD`
-entries, so the monitored set cannot exceed 400 and the transport is never
-asked for a 801st subscription. The transport's own refusals (`route()`
-returning `None`, `_grow()` at the connection limit) remain the second line of
-defence and stay loud.
+Entry and retention are different tests against the same ranking.
+`compute_desired_set()` evaluates `(previous | top_join) & top_leave`, so a
+channel that is not already monitored must be inside the top 400 to enter,
+while a channel already monitored stays until it falls outside the top 450. A
+freshly qualifying channel ranked 401-450 therefore does not enter; an
+incumbent at the same rank is retained. Admission of a 451st channel is refused
+at the **intent** layer, not the transport: `compute_desired_set` never returns
+more than `LEAVE_THRESHOLD` entries, so the monitored set cannot exceed 450 and
+the transport is never asked for a 901st subscription. The transport's own
+refusals remain the second line of defence and stay loud — but they are now
+classified distinctly, because at exact capacity they are an expected operating
+state rather than an anomaly.
 
 Placement rule for a pair:
 
@@ -269,12 +280,26 @@ Placement rule for a pair:
    it has room for the slot being added.
 2. Otherwise take rendezvous order, choosing the first connection that can hold
    the number of slots being created (two for a new channel, one for a repair).
-3. If no connection can, grow — subject to the 3-connection limit — and
-   otherwise refuse, exactly as today.
+3. If no single connection can hold the whole pair **but the pool has at least
+   two free slots in total**, reserve one slot on each of two connections — as
+   a single all-or-nothing action inside the same critical section, so two
+   concurrent pairs cannot each claim half of the same two slots. A failure
+   after reservation keeps the half that succeeded; the channel rests in a
+   convergent partial state rather than giving a slot back.
+4. If no connection can, grow — subject to the 3-connection limit — and
+   otherwise refuse.
 
-Splitting a pair across two connections is legal and modelled (research R2): a
-socket death then leaves the channel in `chat_only` or `notification_only`,
-both of which are already convergent states.
+A refusal at step 4 is a **hard capacity condition**: it raises a distinct
+`PoolCapacityError`, is counted under a capacity classification separate from
+provider refusal and transient faults, and does **not** arm the transient
+growth backoff, because waiting cannot create a slot and arming it would delay
+the next legitimate placement after a delete, retirement, or set contraction.
+
+Splitting a pair across two connections is legal and modelled (research R2, R5):
+a socket death then leaves the channel in `chat_only` or `notification_only`,
+both of which are already convergent states. At exact capacity, split placement
+is not an edge case but the mechanism that makes 450 reachable when parity
+leaves the last free slots on different connections.
 
 ---
 
@@ -334,7 +359,10 @@ The state leaves on its own:
 co-located channels. Affected channels become `absent` (or partial, if the pair
 was split) and are re-created on a surviving or new connection. A library
 reconnect rotates subscription ids; the session stamp on each slot is what
-detects that, per type, independently.
+detects that, per type, independently. Both transitions also clear the
+connection's `full_at`, so a ceiling observed on the previous session cannot
+strand capacity on the new one, and any bounded auxiliary-refusal hold-off on
+that connection's channels becomes eligible again (§5.4.1, decision 28).
 
 ### 5.6 Flink job restart
 
@@ -355,8 +383,8 @@ Each is stated so it can be asserted by a test rather than reasoned about.
 | **I1** | A channel is reported as actual only when both coverage types are present and `enabled` on a live session, or when it is `degraded_chat_only` **and** its bounded auxiliary-refusal hold-off has not yet expired |
 | **I2** | A repair creates only the missing coverage type; the surviving type is never re-created or duplicated (FR-002) |
 | **I3** | The two slots of a channel are tracked independently; deleting, revoking, or losing one never implicitly removes the other from the indexes |
-| **I4** | Connection occupancy counts subscriptions and never exceeds 300; the channel-coverage gauge counts channels and never exceeds 400 (FR-015) |
-| **I5** | Steady-state subscriptions ≤ 800, leaving ≥ 100 of the 900 slots free (FR-014, NFR-001) |
+| **I4** | Connection occupancy counts subscriptions and never exceeds 300; the channel-coverage gauge counts channels and never exceeds 450 (FR-015) |
+| **I5** | Total subscriptions never exceed 900, and at the 450-channel maximum they equal exactly 900 with zero guaranteed free slots (FR-014, NFR-001) |
 | **I6** | Each active interval is half-open: `suppress_from_ms <= peak_ms < suppress_until_ms`. A peak before the notice is eligible, a peak at the notice is gated, and a peak at the deadline is eligible (FR-006, FR-007) |
 | **I7** | An overlapping extension preserves the earliest retained chain start and moves only the deadline and its diagnostics; an earlier/equal candidate is a complete-state no-op; a notice at or after the old deadline starts a new interval at its occurrence (FR-006, FR-010) |
 | **I8** | A notice whose category is outside `{community_sub_gift, sub_gift, raid}` never creates or extends state, at either the producer or the consumer (FR-005) |
@@ -371,7 +399,11 @@ Each is stated so it can be asserted by a test rather than reasoned about.
 | **I17** | `degraded_chat_only` is always time-bounded: a hold-off never exceeds `AUXILIARY_REFUSAL_RETRY_SECONDS`, is cleared early by reconnect, retirement, successful create, or adoption, and never prevents a later repair attempt (FR-001, NFR-003, SC-001) |
 | **I18** | Key/payload agreement is asserted at the producer, where the key exists. The consumer deserializes values only, never observes the key, and derives routing, keying, and state from the payload `broadcaster_id`; a malformed payload is rejected and counted (research D15, contract §5.1) |
 | **I19** | Suppression delivery health has exactly three classifications. For a trusted received record, `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)` from the injected/current consumer clock is the sole threshold input and is observed in `suppression_delivery_age_seconds`; accepted negative raw age is clamped and structured-logged as skew, while optional `received_at_ms` remains diagnostic-only. A window with no record is idle/unknown and reports no value (NFR-005, research D13) |
-| **I20** | `desired_set_churn_total` increments by entered plus departed channels per poll, with no per-channel label growth, so the NFR-007 bound of ≤ 8 changes per poll averaged over 24 deployed hours is directly computable from it (SC-011, research D14) |
+| **I20** | `desired_set_churn_total` increments by entered plus departed channels per poll, with no per-channel label growth. It is advisory telemetry: no numeric bound, observation window, or release gate is attached to it (NFR-007, SC-011, research D10a) |
 | **I21** | `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS` is the fixed value 30 at both event-time trust layers, using the same injectable/current receipt/source wall-clock basis. Before watermark generation, parsed `occurred_at_ms <= source_clock_ms + 30_000` is assigned as event time; missing, unreadable, or one-millisecond-over-bound time uses Kafka `record_timestamp` without rewriting the payload. After decode/field validation, `process_element2` accepts the original value only through `consumer_receipt_ms + 30_000`; beyond that it rejects as `reason="fields"`, counted and logged, with no delivery sample or state access. Thus untrusted occurrence time creates neither state nor a watermark advance from that value; equality uses occurrence time, while +30,001 ms falls back upstream and rejects downstream. The upstream half of this invariant holds only where I22 holds (FR-017, NFR-005, autonomous decisions 23-25) |
 | **I22** | Event time on both inputs comes from a Python timestamp assigner only when two binding conditions hold: each real strategy is built bounded out-of-orderness → `with_idleness()` → `with_timestamp_assigner()` last, and it is attached with `DataStream.assign_timestamps_and_watermarks()` after `env.from_source(source, WatermarkStrategy.no_watermarks(), ...)`. PyFlink 1.18 otherwise silently loses the assigner: `from_source` forwards only the Java strategy, while `with_idleness()` returns a fresh wrapper without a previously stored `_timestamp_assigner`. The correction applies to chat and suppression together. Idleness is generated per assignment subtask and is equivalent to per-split behavior only while topic partitions = source parallelism = assignment parallelism = 4 with a one-to-one edge. The attachment introduces two Python stages at parallelism four; their real process-count/RSS impact is E3-only deployed evidence (FR-003, FR-017, research §4.1.2, R13-R14, decisions 25-26) |
 | **I23** | `SentAtTimestampAssigner` accepts `sent_at` only when `type(sent_at) is int` and `sent_at <= source_clock_ms + SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000`. Equality is accepted. Missing/null, string, float, bool, and +30,001 ms values use Kafka `record_timestamp` for event time. This fallback never rewrites, rejects, or drops the chat payload, preserving chat no-data-loss behavior while preventing the binding chat input watermark from advancing on an untrusted value (FR-003, research R12, autonomous decision 26) |
+| **I24** | A channel that is not already in the monitored set enters only at rank ≤ 400; a channel already in it is retained through rank ≤ 450 and leaves beyond it. The monitored set never exceeds 450 channels, and the 451st qualifying channel is excluded at the intent layer (FR-013, SC-006, autonomous decision 27) |
+| **I25** | Pair placement prefers co-location, then a single connection with room for both slots, and otherwise reserves one slot on **each** of two connections whenever pool-wide free slots ≥ 2. That two-connection reservation is atomic — both halves or neither — and a failure after reservation keeps the successful half rather than releasing it (FR-001, NFR-001, autonomous decision 28) |
+| **I26** | A hard capacity exhaustion raises a distinct capacity error, is counted under a capacity classification separate from provider refusal and transient faults, never writes the durable per-channel refusal cache, never evicts existing coverage, and does **not** arm the transient growth backoff (NFR-001, NFR-004, autonomous decision 28) |
+| **I27** | `full_at` is cleared and re-evaluated when its connection reconnects or is retired, and a connection whose `full_at` is below the 300 cap is exposed as stranded capacity rather than left silent (FR-015, NFR-001, autonomous decision 28) |

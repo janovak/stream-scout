@@ -1,6 +1,6 @@
 # Phase 0 Research: Suppress Gift and Raid Chat Bursts
 
-**Feature**: `007-suppress-gift-raid-bursts` | **Date**: 2026-09-04
+**Feature**: `007-suppress-gift-raid-bursts` | **Date**: 2026-09-04 (capacity amendment 2026-09-05)
 **Input**: [spec.md](./spec.md), [autonomous-decisions.md](./autonomous-decisions.md)
 
 This file records what was verified against primary sources, what was read out
@@ -83,15 +83,44 @@ change, no token reseeding.**
 | Total subscription ceiling | 900 | `MAX_SUBSCRIPTIONS`, `eventsub_pool.py:101` |
 | Subscriptions per monitored channel after 007 | 2 | FR-001 |
 | Channels per connection when a pair is co-located | 150 | 300 / 2 |
-| Monitored-channel ceiling | 400 | FR-013 (locked, decision 5) |
-| Steady-state subscriptions at the ceiling | 800 | 400 × 2 |
-| Reserved headroom | 100 | 900 − 800 (FR-014) |
+| Monitored-channel **entry** threshold | 400 | FR-013 (decision 27) |
+| Monitored-channel **retention and maximum** threshold | 450 | FR-013 (decision 27) |
+| Steady-state subscriptions at the maximum | 900 | 450 × 2 |
+| Guaranteed free slots | 0 | 900 − 900 (FR-014) |
 
-The headroom is **global, not per connection**. Rendezvous routing
-(`_score`, `eventsub_pool.py:164`) does not balance perfectly, so one connection
-can reach 300 while another has room; `route()` already falls through to the
-next connection in rendezvous order, which is what keeps that from becoming a
-failure (see D1/R2).
+The amended model spends the account exactly, which is the **same shape as the
+pre-007 800/900 ramp**: a deep entry gate, a retention band above it, and a
+ceiling equal to the account limit. At one subscription per channel that ramp
+authorised up to 900 channels against 900 slots; at two subscriptions per
+channel the halved 400/450 pair authorises up to 450 channels against the same
+900 slots.
+
+Two paths that a reserve would nominally protect do not normally consume new
+slots at all:
+
+- **Reconnect.** Ending a session automatically disables its subscriptions, and
+  disabled subscriptions do not count against the 300-per-connection limit;
+  reconnect URLs do not add to the websocket count either (§1.1). Re-creating
+  on the new session therefore reuses budget the old session released.
+- **Adoption.** A 409 conflict means the subscription already exists and is
+  already counted; adoption records its id and creates nothing.
+
+What zero slack does change is placement and failure legibility. Three
+connections at 300 hold 450 co-located pairs only under perfect packing, so a
+connection left at an odd occupancy strands a single slot that no whole pair can
+use. Pair placement must therefore be able to take one slot on each of two
+connections, atomically (D14, R5). The remaining exposures — enabled
+subscriptions this feature did not create, failed deletes, and a connection
+that reports itself full below the cap — are risks R15-R17 rather than
+arithmetic, and are why exact capacity is reached only after E2a and the
+account sweep.
+
+The former 100-subscription headroom is **not** global spare capacity in the
+amended model; there is none. Rendezvous routing (`_score`,
+`eventsub_pool.py:164`) still does not balance perfectly, so `route()`'s
+fall-through to the next connection in rendezvous order — and now its
+split-pair fallback — is what keeps imbalance from becoming a failure (see
+D1/R2/D14).
 
 ---
 
@@ -182,8 +211,8 @@ pool work precedes the ramp change.
 | Type constant (`:105`) | single `CHAT_MESSAGE_SUBSCRIPTION_TYPE` | a type set; every filter becomes type-aware |
 | `_Slot` (`:316`) | `broadcaster_id → connection, subscription_id, session_id` | one slot **per (channel, type)**, plus a channel-level coverage view over the pair |
 | `_slots` index (`:368`) | `Dict[int, _Slot]` | `Dict[(int, str), _Slot]` plus `Dict[int, _Coverage]` |
-| `route()` (`:730`) | first connection with `load < cap` | must be able to place **two** subscriptions, and must prefer the connection already holding the channel's other type |
-| `_reserve()` (`:748`) | `reserved += 1` | reserve the number of subscriptions actually about to be created, in one critical section |
+| `route()` (`:730`) | first connection with `load < cap` | must be able to place **two** subscriptions, must prefer the connection already holding the channel's other type, and — at exact capacity — must be able to place one slot on each of two connections when no single connection has two free but the pool has at least two (D14) |
+| `_reserve()` (`:748`) | `reserved += 1` | reserve the number of subscriptions actually about to be created, in one critical section; a split pair reserves **both** halves atomically or neither |
 | `create()` (`:441`) | one listen call, one slot | create only the **missing** types (FR-002: never duplicate the type that exists) |
 | 409 `_adopt_conflict()` (`:1074`) | lists one type, matches by broadcaster | must match **type + broadcaster**, and be reachable for either type independently |
 | `list()` (`:640`) | one Helix walk filtered to chat | two walks (one per type), joined per channel; a channel is "actual" only when **both** types are enabled on a live session |
@@ -682,53 +711,63 @@ Post-design re-check is in `plan.md` §"Constitution re-check after design".
 
 ---
 
-## 6. Capacity and ramp: what the 400/400 change actually does
+## 6. Capacity and ramp: what the 400/450 change actually does
 
-`docker-compose.yml:414-415` currently sets `JOIN_THRESHOLD=800` /
-`LEAVE_THRESHOLD=900`. FR-013 locks both to 400.
+> Replaces the former "what the 400/400 change actually does" section. The
+> zero-width-hysteresis analysis it contained no longer describes the system:
+> autonomous decision 27 splits entry from retention, so the band exists again.
+
+`docker-compose.yml` currently carries the Feature 007 interim value
+`JOIN_THRESHOLD=400` / `LEAVE_THRESHOLD=400`, itself reduced from the pre-007
+`800` / `900`. FR-013 sets the amended target: entry `400`, retention and
+maximum `450`.
 
 `resolve_thresholds()` (`stream_monitoring_service.py:105`) rejects only
-`leave < join`, so 400/400 is accepted. But `compute_desired_set()`
-(`:136`) then computes `(previous | top_join) & top_leave` with
-`join == leave`, which is a **zero-width hysteresis band**: the retained band
-that keeps a boundary channel from leaving and rejoining once per poll no
-longer exists. The module's own comment states the cost — "thrashing the
-desired set once per poll and destroying Flink's baseline".
+`leave < join`, so 400/450 is accepted, and `compute_desired_set()` (`:136`)
+already implements exactly the required semantics without a code change: it
+computes `(previous | top_join) & top_leave`, so a channel enters only via
+`top_join` (rank ≤ 400) but is retained through `top_leave` (rank ≤ 450). That
+is the entry/retention asymmetry FR-013 describes — a fresh channel ranked
+401-450 does not enter, an incumbent at the same rank stays — and it restores
+the 50-channel hysteresis band that 400/400 had removed. The module's own
+warning about "thrashing the desired set once per poll and destroying Flink's
+baseline" applies to `join == leave`, and no longer applies here.
 
-This is a real, accepted consequence of the locked decision, not a defect
-introduced by this plan (D10). It is bounded: churn affects only channels
-oscillating across rank 400, each churn costs two subscription creates/deletes
-and one broadcaster's warm-up, and `DETECTION_MIN_BASELINE_FRACTION=0.8` means a
-churned channel simply produces no detections until it has watched 240 s again.
-The plan adds an observable churn signal so the cost is measurable rather than
-assumed, and records a follow-up option (a narrower join threshold inside the
-same 400 ceiling) that would need a spec change.
+`desired_set_churn_total` is therefore kept as **advisory** telemetry: entries
+plus departures per poll, bounded labels, no per-channel growth. It carries no
+numeric release gate and no observation window; nothing about it can block
+enabling suppression gating (NFR-007, SC-011, D10a). Its purpose is to let an
+operator see monitored-set movement, not to license the threshold choice.
 
-**"Accepted" now has a number attached to it.** NFR-007 and SC-011 turn the
-qualitative acceptance into a release gate: desired-set entries plus departures
-attributable to the zero-width band, averaged per poll across a **24-hour
-deployed observation**, must not exceed **2% of the 400-channel ceiling — 8
-membership changes per poll**. That bound is a disposition, not a hope:
+**What the amendment actually costs is slack, not churn.** At 450 channels the
+pool holds 900 of 900 subscriptions. Three consequences follow, and each is
+engineered rather than absorbed (D14):
 
-- Under the bound, the zero-width band ships as locked and gating may be
-  enabled.
-- Over the bound, enabling gating is **blocked**, and the resolution is a
-  specification change to a narrower join threshold inside the firm 400 ceiling.
-  It is explicitly *not* resolved by a hidden code workaround — that is the
-  option D10 already rejected, and measuring the cost was the entire reason for
-  accepting the locked value in the first place.
-
-The measurement is `desired_set_churn_total` over 24 hours at 400/400 on the
-deployed system (E2/B4). It cannot be produced offline: offline tests can pin
-the accounting — that the counter increments by entered plus departed channels —
-but the rate itself is a property of real ranking movement.
+1. *Perfect packing is not guaranteed.* 3 × 300 holds 450 co-located pairs only
+   if every connection ends at an even occupancy. A connection at 299 strands
+   one slot that no whole pair can use, so placement must be able to split a
+   pair across two connections, reserving both halves atomically.
+2. *Exhaustion becomes an ordinary operating state.* "No slot anywhere" at the
+   ceiling is expected, not anomalous, and must be reported as a distinct
+   capacity condition rather than as a provider refusal (which writes the
+   seven-day per-channel refusal cache) or a transient fault (which arms a
+   growth backoff for a condition that waiting cannot fix).
+3. *Any stranded slot is now load-bearing.* A connection marked `full_at` below
+   300, an enabled subscription this feature did not create, or a delete that
+   silently failed each removes capacity the model has already allocated
+   (R15-R17).
 
 Ordering constraint, from the roadmap risk register and repeated here because
 it is the single most important sequencing rule in the feature: **the pool's
 two-slot capacity behaviour must be proven by deterministic tests before the
 ramp configuration changes.** Lowering the ramp first would hide a pool defect
 behind a smaller set; raising per-channel subscriptions first without the ramp
-change would ask for 1,440–1,600 subscriptions against a 900 ceiling.
+change would ask for far more subscriptions than the 900 ceiling allows. The
+amendment extends the same rule: the amended placement, classification, and
+`full_at` behaviour are proved deterministically before the checked-in
+retention threshold moves to 450, and deployed convergence is proved at
+400 channels / 800 subscriptions (E2a) before the deployed ramp reaches exact
+capacity (E2b).
 
 ---
 
@@ -745,11 +784,13 @@ change would ask for 1,440–1,600 subscriptions against a 900 ceiling.
 | **D7** | Suppression **windows are applied at the consumer** from `SUPPRESSION_GIFT_WINDOW_SECONDS` / `SUPPRESSION_RAID_WINDOW_SECONDS`; the producer publishes only the raw notice (`notice_type`, `occurred_at_ms`). | Producer-computed `suppress_until` (bakes policy into the topic, makes retention replay wrong after a tuning change, and splits the window constants across two services). |
 | **D8** | The contract is **versioned** (`schema_version`) and carries exactly the identity/notice/time fields the consumer needs; `viewer_count` is optional and diagnostic-only. | An unversioned payload (no safe way to add a field later against a live topic). Carrying the full notice payload (user content on an operational topic, no requirement). |
 | **D9** | A notice with no trustworthy channel identity **or** no parseable `occurred_at_ms` is **not published**; it increments a malformed counter and logs, per FR-017. | Publishing with `occurred_at_ms: null` (the consumer would have to invent a time — a fabricated deadline). Substituting the ingest clock (a guessed deadline wearing a trustworthy field name). |
-| **D10** | Ship 400/400 exactly as locked, add a desired-set churn signal so the zero-width band's cost is measured, and record the narrower-join option as a follow-up requiring a spec change. | Silently deviating to 380/400 (contradicts FR-013 and SC-006). Special-casing hysteresis in code (hides policy from configuration). |
-| **D11** | Emission gating has an operator kill switch, `SUPPRESSION_GATING_ENABLED`. The **code default in `SuppressionConfig` is `true`**, while `docker-compose.yml` **checks in `false`**, so a deploy is inert until an operator changes the compose value after E1-E3 and the 24-hour E2 churn observation pass. With it false the detector behaves exactly as pre-007 while both subscriptions and the topic stay in place. | Revert-only rollback (a code deploy to undo a detection-policy problem, at the moment clips are being lost). Checking in `true` (a deploy would start gating before any deployed evidence existed). |
-| **D12** | Deployment is two-step: the ramp is reduced to 400/400 on the **current** single-subscription revision and allowed to converge, **then** the feature revision is deployed. That preliminary ramp-down is 400 × 1 = 400 of 900 and is therefore unconditionally capacity-safe; it is **not** gated by E1, which gates dual-coverage sign-off and enabling gating. Rollback runs the same logic in reverse: gating off, then unwind the transport **while thresholds stay at 400/400**, then wait for the notification subscriptions to disappear, and only then raise thresholds (autonomous decision 21). | One-step deploy of thresholds and transport together (the Redis-resident desired set makes the reconciler chase ~1,600 subscriptions before the first poll rewrites it — R9). Raising thresholds before unwinding the auxiliary subscriptions (at 2 subscriptions per channel, any threshold above 400 can cross the 900 ceiling — R11). |
+| **D10** | ~~Ship 400/400 exactly as locked…~~ **Superseded by autonomous decision 27 and replaced by D10a.** The zero-width band it accepted no longer exists. | (historical) |
+| **D10a** | Ship the approved **entry 400 / retention-and-maximum 450** thresholds exactly as configured. `compute_desired_set()`'s existing `(previous \| top_join) & top_leave` already produces the required asymmetry, so no hysteresis logic is added. `desired_set_churn_total` is retained as advisory bounded-label telemetry with no numeric gate (§6, NFR-007, SC-011). | Silently deviating from the configured thresholds, or special-casing hysteresis in code (hides policy from configuration — the reason decision 14 rejected it stands). Keeping a numeric churn release gate (it existed only to justify a zero-width band). Equal 450/450 thresholds (removes the retention band the amendment exists to restore). |
+| **D11** | Emission gating has an operator kill switch, `SUPPRESSION_GATING_ENABLED`. The **code default in `SuppressionConfig` is `true`**, while `docker-compose.yml` **checks in `false`**, so a deploy is inert until an operator changes the compose value after E1, E2a, E2b and E3 pass. With it false the detector behaves exactly as pre-007 while both subscriptions and the topic stay in place. | Revert-only rollback (a code deploy to undo a detection-policy problem, at the moment clips are being lost). Checking in `true` (a deploy would start gating before any deployed evidence existed). |
+| **D12** | Deployment is staged, and no stage takes two risks at once (autonomous decisions 16 and 27). (1) The ramp is reduced to 400/400 on the **current** single-subscription revision and allowed to converge — 400 × 1 = 400 of 900, unconditionally capacity-safe and **not** gated by E1. (2) The feature revision is deployed with the retention threshold still **400**, so first dual convergence is 400 channels / 800 subscriptions with a cushion; E1 and E2a are taken there. (3) The account is swept for enabled subscriptions the pool does not own. (4) Only then does `LEAVE_THRESHOLD` move to the checked-in target **450**, reaching exact 900-of-900 capacity, followed by E2b. Rollback runs the same logic in reverse: gating off; on a capacity incident lower retention to 400 and reconverge; unwind the transport **while thresholds are 400/400**; wait for the notification subscriptions to disappear; only then restore the single-subscription ramp. | One-step deploy of thresholds and transport together (the Redis-resident desired set makes the reconciler chase far more subscriptions than the ceiling allows before the first poll rewrites it — R9). Deploying the dual transport straight to 450 (first dual convergence and first exact-capacity operation in one step, with no cushion to diagnose from). Raising the retention threshold before unwinding the auxiliary subscriptions during rollback (R11a). |
 | **D13** | **Clarified by autonomous decisions 23-24:** delivery health is classified per trusted received record from `delivery_age_ms = max(0, consumer_receipt_ms - occurred_at_ms)`. The same fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` first protects source timestamp assignment and then, after decode/field validation, rejects the unchanged original payload as malformed fields before observation/state; accepted negative raw age is clamped to zero and structured-logged as clock skew. Compare only the clamped value with `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` = 30 s — healthy at or below, lagging above — and observe it in `suppression_delivery_age_seconds`. Optional `received_at_ms` remains diagnostic-only, and no record means **idle/unknown** (§4.6). | A continuously refreshed per-channel delivery gauge from `on_timer` (must fabricate a value during legitimate silence). A heartbeat or synthetic record (a second protocol, out of scope). No future bound (lets unit mistakes create far-future suppression and poison watermarks). Rejecting every future timestamp (turns harmless skew into avoidable false positives). |
-| **D14** | The zero-width 400/400 band's cost gets a **numeric release disposition**: entries plus departures averaged per poll over 24 deployed hours must not exceed 8, i.e. 2% of the 400-channel ceiling (NFR-007, SC-011). Over the bound blocks enabling gating and is resolved by a spec change to a narrower join threshold inside the firm ceiling. | Leaving the churn signal without a threshold (unfalsifiable acceptance). Blocking on a tighter bound (boundary-rank movement is normal and a tighter bound would fail for reasons unrelated to this feature). Auto-adjusting the threshold in code when churn is high (the hidden-policy option D10 already rejected). |
+| **D14** | ~~The zero-width 400/400 band's cost gets a numeric release disposition…~~ **Superseded by autonomous decisions 27 and 19's banner, and replaced by D14a.** The 8-changes-per-poll, 24-hour gate is removed together with the zero-width band that motivated it. | (historical) |
+| **D14a** | Exact capacity is engineered, not assumed (autonomous decision 28). Four behaviours ship together: co-location-first placement with an **atomic split-pair fallback** — one slot reserved on each of two connections, in one critical section, when no connection has two free but the pool has at least two, with a post-reservation partial failure keeping the successful half; a distinct `PoolCapacityError` and a distinct capacity classification on the create-failure metric, separate from provider refusal and transient faults; **no transient growth backoff** for a hard ceiling, because waiting cannot fix it and arming it delays the next legitimate placement; and `full_at` cleared and re-evaluated on reconnect/retirement with below-cap full state exposed. | Running exact capacity on today's placement and classification (turns parity fragmentation into a false full pool and a capacity ceiling into an unexplained refusal). Pair compaction/migration between connections (deletes and recreates live coverage, needs its own ordering/failure/idempotence rules, only to recover locality that splitting already handles). Placement changes without the error and `full_at` work (the pool reaches 900 but cannot explain itself there). |
 | **D15** | Key/payload agreement is a **producer** invariant, asserted where the key is visible (T033). The job's sources use value-only deserialization, so `process_element2` never sees the record key; consumer routing and state use the payload `broadcaster_id`, and the consumer's duty is malformed-**payload** rejection. | Consumer-side key/payload comparison (asserts something the consumer structurally cannot observe). Switching to a key-and-value deserialization schema purely to enable that check (a change to the source shape for no behavioural gain, on the hot path). |
 | **D16** | The suppression source's configuration — topic, `latest()` offsets, out-of-orderness, `SUPPRESSION_IDLENESS_SECONDS`, expected partitions/parallelism, `delivery_lag_warn_seconds=30`, and `checked_in_gating_enabled=False` — plus fixed contract constant `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` live in pure `spike_detector.py`. `test_spike_detector.py` asserts all pure values and static compose checks assert both required wiring and the absence of a future-skew environment variable; `SuppressionConfig.from_env()` remains the runtime reader with gating defaulting to `true`, and `clip_detector_job.py` builds the real source and the real watermark strategy from the pure settings, attaching that strategy with `assign_timestamps_and_watermarks` per §4.1.2. Stub-level tests may assert that call and the `no_watermarks()` placeholder, but never that the assigner executed (§4.7). | Literals inline in `clip_detector_job.py` (the only assertions would import PyFlink and skip when it is absent, making the highest-risk evidence conditional). A configurable future-skew allowance (unnecessary environment surface for a trust boundary). A new configuration module (new `FLINK_PYFILES` entry and compose mounts). |
 
@@ -760,19 +801,24 @@ change would ask for 1,440–1,600 subscriptions against a 900 ceiling.
 | ID | Risk | Mitigation | Residual |
 |---|---|---|---|
 | **R1** | A two-type `list()` where one walk fails could look "complete" and let the reconciler drop live subscriptions. | The enumeration is complete only if **both** walks finish; either failure marks it incomplete, which already holds drops back (`reconciler.py:723`). Covered by a deterministic pool test. | A channel repaired one pass later than today at worst. |
-| **R2** | Rendezvous imbalance puts one connection at 300 while the pair for a channel needs two slots. | `route()` places a pair only where two slots fit; if the channel's home connection has one slot, the pair splits across connections and both slots are tracked independently. | Slightly less locality; a socket death then touches two channels' partial coverage rather than one channel's whole coverage. Both states are already modelled. |
+| **R2** | Rendezvous imbalance puts one connection at 300 while the pair for a channel needs two slots. | `route()` places a pair where two slots fit; if the channel's home connection has one slot, the pair splits across connections and both slots are tracked independently. At exact capacity that split is reserved atomically across two connections (D14a). | Slightly less locality; a socket death then touches two channels' partial coverage rather than one channel's whole coverage. Both states are already modelled. |
 | **R3** | The suppression stream becomes the binding watermark minimum and stalls all detection. | D4 (real watermarks attached with `assign_timestamps_and_watermarks` per §4.1.2, shorter idleness than chat, `latest()` offsets, partitions == parallelism, and source-level future-time trust before watermark generation). Deterministic replay covers silence and monotonic combined-watermark behavior when an over-future record falls back to Kafka record time before downstream rejection. | PyFlink-level idleness and timestamp-assigner behavior cannot be fully reproduced offline; E3 is the deployed gate, and D11 is the immediate lever if either failure appears. |
 | **R4** | A notification arrives after a decision, or after a spike peaked but before its hold reports. | No buffering or retraction (FR-018). A late notice affects later decisions only, and the lower bound ensures a pre-notice peak remains eligible even if reported afterward. Delivery lag is observable from trusted records via `suppression_delivery_age_seconds`. | False-positive clips caused by notices arriving after the relevant peak/decision remain possible and are measured by E4; genuine hype peaking before a notice is intentionally not counted as an accepted suppression false negative. |
-| **R5** | The auxiliary subscription doubles subscription churn on every desired-set change, and at 400/400 the desired set has no hysteresis band (§6). | D10's churn signal plus D14's numeric bound: ≤ 8 entries-plus-departures per poll averaged over 24 deployed hours (NFR-007, SC-011). The ramp change lands only after pool tests pass; the 100-subscription headroom absorbs in-flight create/delete overlap. | Boundary-rank channels can re-warm their baseline repeatedly; visible as detection gaps for those channels only. If the measured rate exceeds the bound, gating stays off until a spec change narrows the join threshold. |
+| **R5** | **Slot fragmentation at exact capacity.** With 900 of 900 slots spent, parity across three connections can leave the last two free slots on two *different* connections. A placement that only takes whole pairs on one connection reports a pool with room as full and stalls convergence at 449 channels. | D14a's atomic split-pair fallback: when no connection has two free slots and pool-wide free slots ≥ 2, reserve one on each of two connections in a single critical section. Deterministic tests construct the fragmented state directly; E2b exercises it deployed. | Reduced locality for the split channels, and a socket death leaves them partially covered — a state the reconciler already repairs. Repeated split/repair cycles can fragment further; that is visible through coverage state and connection occupancy. |
 | **R6** | `channel.chat.notification` costs more than 0 against `max_total_cost = 10`. | E1 checks `total_cost` on the deployed system as early in dual-coverage convergence as possible; a non-zero cost blocks dual-coverage sign-off and the feature. The preliminary 400/400 ramp-down on the single-subscription revision is 400 × 1 and is **not** blocked by E1. | Feature-level: if non-zero, the two-subscription design is not viable on this token and the plan must stop rather than degrade. The preliminary ramp-down is independently safe and need not be reversed to run the check. |
 | **R7** | An unknown or renamed `notice_type` silently stops triggering suppression. | Trigger set is an explicit allow-list; everything else is counted under an `other` bucket so a vanished category is visible as a distribution change rather than as silence. | Twitch renaming a trigger type is detected operationally, not automatically. |
 | **R8** | The suppressed-emission metric/log is mistaken for a detection outage. | `anomalies_detected_total` still increments for a suppressed decision; the suppression is a separate counter, so "detected but not clipped" is computable and `AnomalyDetectionStalled` keeps its meaning. | Dashboards need the new series added; documented in OPERATIONS.md. |
 | **R9** | Deploying the two-subscription transport while Redis still holds the old ~800-channel desired set asks for ~1,600 subscriptions against a 900 ceiling. `chat:desired` survives a restart, and the reconciler converges to it immediately while the poller only rewrites it up to 120 s later. | Two-step deployment: lower the ramp to 400/400 on the **current** single-subscription revision and let the desired set converge, **then** deploy the feature revision (D12; plan "Rollout and rollback"). | If the two steps are collapsed by mistake, the failure is loud (mass refusals, `pool is at its 3-connection limit`) and recovers by lowering the threshold; no data is lost. |
 | **R10** | A long-idle suppression subtask re-enters the two-input watermark minimum when one isolated notice arrives, briefly holding the operator watermark and delaying per-second evaluation for the keys on that subtask. | Accepted with a conservative bound of `SUPPRESSION_IDLENESS_SECONDS + WATERMARK_OUT_OF_ORDERNESS_SECONDS` (§4.1.1, data-model I16), asserted offline in the replay harness's simplified model (T050) and measured deployed as part of E3, which must exercise **both** prolonged silence and an isolated notice after silence. | A short, bounded evaluation delay on a sparse-notice channel set — far smaller than the 120 s minimum suppression window. Sustained notice traffic never reaches the bound. |
-| **R11** | During rollback, raising thresholds back toward the single-subscription ramp while `channel.chat.notification` subscriptions still exist would permit more than 800 subscriptions and can cross the 900 ceiling. | The rollback order is fixed and invariant-driven: gating off → unwind the transport **with thresholds still at 400/400** → wait until notification subscriptions are gone and total subscriptions ≈ desired channel count (~400) with stable coverage metrics → only then raise thresholds. Thresholds are never above 400 while any notification subscription remains (plan "Rollback order", autonomous decision 21). | If the order is inverted anyway, the failure is the same loud refusal mode as R9 and is recovered by lowering the threshold again. |
+| **R11** | ~~Raising thresholds back toward the single-subscription ramp while notification subscriptions still exist would permit more than 800 subscriptions…~~ **Replaced by R11a**, which restates the same hazard for the amended thresholds. | | |
+| **R11a** | During rollback, relaxing the retention threshold before capacity is unwound over-commits the account. With two subscriptions per channel a retention threshold above 450 permits more than 900 subscriptions, and unwinding the dual transport from a 450-channel set leaves the single-subscription revision converging to a set larger than the ramp it is about to receive. | The rollback order is fixed and invariant-driven: gating off → on a capacity incident lower `LEAVE_THRESHOLD` to **400** and reconverge to 400 channels / 800 subscriptions → unwind the transport **with thresholds at 400/400** → wait until notification subscriptions are gone and total subscriptions equal the desired channel count (400) with stable coverage metrics → only then restore the single-subscription ramp. The retention threshold is never above 450 while dual coverage is live, and must be back at 400 before the transport is unwound (plan "Rollback order", autonomous decisions 21 and 27). | If the order is inverted anyway, the failure is the same loud refusal mode as R9 and is recovered by lowering the threshold again. |
 | **R12** | A corrupt unit, wrong type, or bad clock places source payload time far in the future. On suppression, downstream rejection is too late to undo watermark damage; on chat, there is intentionally no downstream rejection and a poisoned binding watermark can stall real-time timers. | Apply fixed `SUPPRESSION_MAX_FUTURE_SKEW_SECONDS=30` in both source assigners. Suppression retains its second downstream validation. Chat accepts only plain `int` (not `bool`) `sent_at`; missing/null/string/float/bool/over-bound values use Kafka `record_timestamp` without rewriting, rejecting, or dropping chat. Equality is accepted and +30,001 ms falls back. Replay covers monotonic assignment semantics; E3 proves deployment. | A bad but plain-integer timestamp within 30 seconds can shift event time slightly. Suppression remains visible through downstream rejection; chat fallback requires deployed clock/watermark observation because it deliberately emits no malformed-record rejection. |
 | **R13** | PyFlink 1.18's `from_source` silently drops a Python `TimestampAssigner`, so a strategy that looks correct in review can leave event time as Kafka record time on either stream. Fixing it moves idleness generation from per-split inside the source to per-subtask in the assignment operator and adds two Python stages at parallelism four. | Attach every real strategy post-source on both streams (§4.1.2, decision 25), preserve partitions = source parallelism = assignment/operator parallelism = 4 with a one-to-one edge, and measure the deployed job graph, TaskManager Python process count, and RSS in E3. | Topology equivalence and process/RSS cost are deployed properties. A mismatch, rescale, repartition, or unexpected Python-worker footprint must be revalidated rather than inferred from local tests. |
 | **R14** | PyFlink 1.18's `with_idleness()` returns a fresh wrapper without a previously stored Python `_timestamp_assigner`; the visually plausible order assigner → idleness silently disables payload-time assignment and its source trust bound on either stream. | Build every real strategy in the binding order bounded out-of-orderness → `with_idleness(...)` → `with_timestamp_assigner(...)` last. Stub tests inspect the order/result; E3 proves the deployed assigners survive and event time follows trusted payload timestamps. | This is an implementation-detail invariant with no runtime warning. A future PyFlink upgrade must re-check wrapper behavior, and local fakes remain insufficient deployed evidence. |
+| **R15** | **Foreign enabled subscriptions.** Anything enabled on the client-id/user-id pair that this pool does not own — an earlier revision's leftovers, another process, a manual experiment — consumes the same 900 slots. With no reserve, one such subscription makes the 450th channel unplaceable, and the symptom is indistinguishable from a defect in the pool. | An account-wide enumeration and sweep is a required rollout step **before** the retention threshold moves to 450 (plan forward order, D12), and the capacity classification on the create-failure metric plus per-connection occupancy makes the resulting shortfall legible rather than mysterious. | Nothing prevents a new foreign subscription appearing later; it is detected as a gap between complete-coverage channels × 2 and total subscriptions, and by capacity refusals at a channel count below 450. |
+| **R16** | **Below-cap `full_at`.** A connection that recorded a refusal at an occupancy under 300 permanently offers fewer slots than the capacity model counts on, silently converting exact capacity into an unreachable target. | D14a clears and re-evaluates `full_at` on reconnect and retirement, and exposes below-cap full state so stranded capacity is visible rather than inferred from an unexplained refusal (E2b). | Between a below-cap refusal and the next session transition the connection still offers fewer slots; the condition is visible, and lowering the retention threshold to 400 restores the cushion while it is diagnosed. |
+| **R17** | **Failed deletes leak slots.** A delete the pool reports as failed, or one that races a reconnect, can leave an enabled subscription the pool no longer tracks. Previously the 100-slot reserve absorbed this; at exact capacity it is a permanent leak. | Deletion already treats "already gone" as success and retains retryable state after a one-sided failure; the leak is detected as the same total-versus-coverage discrepancy as R15 and is cleared by the same sweep. Capacity refusals are classified distinctly so the leak does not present as a provider refusal. | A leak between sweeps reduces the reachable channel count by one channel per two leaked slots; it is bounded, visible, and recoverable without a code change. |
+| **R18** | **Exact convergence is slower and less forgiving.** At 900 of 900 there is no slack to absorb in-flight create/delete overlap, so a churn event at the boundary can transiently need a slot that a pending delete still holds. | Convergence is proved deterministically before the threshold moves (T060-T062) and deployed at 400/800 first (E2a) before exact capacity (E2b); a hard capacity condition does **not** arm a transient growth backoff, so the next pass retries immediately once the delete lands. | A boundary channel may take an extra reconcile pass to become complete at exact capacity. Visible as a short-lived partial-coverage series, not as data loss. |
 
 ---
 
@@ -784,7 +830,8 @@ claimed from unit tests, fixtures, or reasoning.
 | ID | Evidence | Gate |
 |---|---|---|
 | **E1** | `Get EventSub Subscriptions` shows both types on live sessions with `total_cost` unchanged at 0 against `max_total_cost` 10. | Blocks dual-coverage sign-off and enabling gating, and blocks the feature if cost is non-zero. Does **not** block the preliminary 400/400 ramp-down on the single-subscription revision, which is 400 × 1 and safe on its own |
-| **E2** | 400 channels converge to 800 subscriptions, no connection over 300, `eventsub_channel_coverage{state="complete"}` == desired count, the pool refuses the 401st channel without exceeding the ceiling, and `desired_set_churn_total` over a **24-hour** observation at 400/400 averages ≤ 8 entries-plus-departures per poll. | Blocks the ramp sign-off (SC-006) and, through the churn bound, blocks enabling gating (NFR-007, SC-011) |
+| **E2a** | With the retention threshold still 400: 400 channels converge to 800 subscriptions, no connection over 300, `eventsub_channel_coverage{state="complete"}` == desired count, and the pool refuses the 401st channel. Roughly 100 slots remain free at this stage by construction, which is what makes it the safe place to prove dual coverage. `desired_set_churn_total` is recorded as advisory context only. | Blocks the ramp to 450 and therefore blocks exact capacity (SC-006). No churn observation window gates it (NFR-007, SC-011) |
+| **E2b** | After the account sweep and the ramp to entry 400 / retention 450, prove exact capacity with relational equality: total subscriptions **== 900**; total subscriptions **== 2 ×** complete-coverage channels; every connection occupancy **≤ 300** and their sum **== 900**; free slots **== 0**; the 451st qualifying channel is **excluded**. Then exercise the exact-capacity paths: a pair placed one slot on each of two connections when no connection has two free; a deliberately removed half converging back to complete without exceeding 900; a capacity refusal reported under its own capacity classification, not as a provider refusal, and without arming a transient growth backoff; and a below-cap `full_at` being visible and re-evaluated after reconnect or retirement. | Blocks the amended SC-006 sign-off and enabling gating (FR-013, FR-014, NFR-001, decisions 27-28). "Approximately 900" is not an acceptable reading |
 | **E3** | With suppression silent for one hour, verify unchanged chat watermark lag; then the isolated-notice hold bound. Exercise both assigners at exact +30,000/+30,001 ms and chat missing/null/string/float/bool cases: trusted plain-int chat `sent_at` and trusted suppression occurrence drive event time, while every fallback uses Kafka record time without chat loss or combined-watermark poisoning. Confirm the real strategies retain assigners after idleness, watermarks originate from both post-source Python assignment stages, each stage has parallelism four and one partition per subtask, and record TaskManager Python process count and RSS attributable to the two added stages. All are deployed measurements. | Blocks enabling gating in production (R3, R10, R12-R14) |
 | **E4** | Twitch-occurrence-to-consumer age distribution from trusted records in `suppression_delivery_age_seconds` against `SUPPRESSION_DELIVERY_LAG_WARN_SECONDS` = 30 s, downstream `reason="fields"` rejection/warning visibility for the unchanged original over-future payload after source timestamp fallback, and a captured real gift-bomb/raid slice showing notice-bounded suppression firing on the intended bursts without suppressing pre-notice peaks. | Real-burst confirmation for SC-003, tuning/adequacy evidence for the window defaults under SC-005, and deployed evidence for delivery age, timestamp assignment, and rejection behavior (NFR-005, SC-010); deterministic boundary behavior remains local |
-| **E5** | Rollback rehearsal: `SUPPRESSION_GATING_ENABLED=false` restores pre-007 emission behaviour with no other change, and the capacity-safe rollback order is executable — transport unwound with thresholds still at 400/400, thresholds raised only after the notification subscriptions are gone. | Blocks production enablement (D11, R11) |
+| **E5** | Rollback rehearsal: `SUPPRESSION_GATING_ENABLED=false` restores pre-007 emission behaviour with no other change, and the capacity-safe rollback order is executable — retention lowered to 400 and reconverged on a capacity incident, the transport unwound with thresholds at 400/400, and the single-subscription ramp restored only after the notification subscriptions are gone. | Blocks production enablement (D11, R11a) |

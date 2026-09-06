@@ -12,6 +12,12 @@ Decisions 24-25 are final code-review corrections to event-time handling,
 taken before their code changes landed. Decision 26 is final code-review
 hardening after making the Python assigners effective exposed the remaining
 builder-order and chat-watermark risks.
+Decisions 27-28 are the approved capacity amendment of 2026-09-05. The user
+approved `JOIN_THRESHOLD=400` / `LEAVE_THRESHOLD=450` and asked that every
+cascade from the earlier 400/400 model be revisited rather than patched.
+Decision 27 records the capacity model itself; decision 28 records the
+exact-capacity engineering without which that model must not be deployed.
+
 Where a remediation decision replaces an earlier one, the earlier entry is
 marked **superseded** and left in place with its original text rather than being
 rewritten, so the reasoning that led to the replacement stays readable.
@@ -108,6 +114,14 @@ suppression measurable without creating a clip.
 and operator-facing diagnostic expectations.
 
 ## 5. Monitored-set capacity
+
+> **Superseded by decision 27.** The original text is preserved below exactly
+> as written. What does not stand is option A's firm 400-channel maximum, its
+> equal 400/400 thresholds, and the 100-subscription reserve it justified.
+> Decision 27 replaces them with entry 400 / retention-and-maximum 450 and an
+> exact 900-subscription ceiling with no guaranteed reserve. The reasoning that
+> is *kept* is option A's refusal to redesign session capacity inside this
+> feature: connections, per-session caps, and the 900 total are unchanged.
 
 **Question**: What capacity ceiling and ramp thresholds should apply after
 adding a second subscription per monitored channel?
@@ -356,6 +370,15 @@ documents why the two paths differ.
 
 ## 14. Zero-width hysteresis band at the locked 400/400 thresholds
 
+> **Superseded by decision 27.** The original text is preserved below exactly
+> as written. Its entire premise — that join and leave are the same number, so
+> no hysteresis band exists — is removed by decision 27's entry 400 /
+> retention 450 split, which restores a 50-channel band. Options B and C are
+> still rejected for the reason given here: policy must live in configuration
+> operators read, never in hidden code behaviour. The churn signal option A
+> introduced is kept, but as advisory telemetry rather than as the measurement
+> that justifies a zero-width band.
+
 **Question**: The locked capacity decision sets join and leave thresholds to
 the same value, which removes the hysteresis band that stops a boundary-rank
 channel from leaving and rejoining each poll. How should that be handled?
@@ -416,6 +439,16 @@ sequence (deploy with gating off, verify coverage and watermarks, then enable),
 and fixes the rollback ordering documented for operations.
 
 ## 16. Deployment ordering of the capacity reduction
+
+> **Amended by decision 27.** The original text is preserved below exactly as
+> written and its selection still stands: the Redis-resident desired set means
+> the ramp reduction must converge on the current single-subscription revision
+> **before** the two-subscription transport ships. Decision 27 adds a third
+> stage after those two. The dual transport is deployed while the retention
+> threshold is still **400**, and only after E1 and E2a — and the account-wide
+> foreign-subscription sweep — does the retention threshold ramp to **450**.
+> The same reasoning drives both: never let the transport observe a desired set
+> larger than the capacity model already proven in force.
 
 **Question**: Should the monitored-set reduction to 400 and the
 two-subscriptions-per-channel transport be deployed together, or separately?
@@ -525,6 +558,17 @@ re-entry case is measured rather than assumed.
 
 ## 19. Release disposition for 400/400 desired-set churn
 
+> **Superseded by decision 27.** The original text is preserved below exactly
+> as written. Option B's numeric release gate — 8 membership changes per poll
+> averaged over a 24-hour deployed observation, blocking gating when exceeded —
+> is **removed**, together with the 24-hour wait it imposed on the rollout. It
+> existed to make a zero-width band falsifiable, and decision 27 removes the
+> zero-width band instead. What is kept is option D's rejection: the service
+> must never widen or narrow the band on its own, and any future change to the
+> configured thresholds is a specification change made in the open.
+> `desired_set_churn_total` remains, as advisory bounded-label telemetry with
+> no numeric release gate attached to it.
+
 **Question**: Decision 14 accepted the zero-width hysteresis band and added a
 churn signal so the cost would be measured rather than assumed, but never said
 what measurement would be unacceptable. What disposition applies?
@@ -606,6 +650,19 @@ contract §4.1 rule 7, and research §4.6/D13; folds the work into T039, T042,
 T046, and T053.
 
 ## 21. Capacity-safe rollback order and the checked-in gating value
+
+> **Amended by decision 27.** The original text is preserved below exactly as
+> written. Both of its principles stand: `SUPPRESSION_GATING_ENABLED=false` is
+> the first and often the only rollback step, and capacity is unwound *before*
+> the threshold is relaxed, never after. Only the numbers move. With entry 400 /
+> retention 450, the sequence gains a step in front of option B's step (b): on a
+> capacity incident, lower `LEAVE_THRESHOLD` to **400** first and let the set
+> reconverge, which is what returns the deployment to the 800-of-900 shape that
+> the rest of the order already assumes. The invariant is restated the same way
+> it was derived: the retention threshold is never above **450** while two
+> subscriptions per channel are live, and it must be back at **400** before the
+> dual transport is unwound. The checked-in `SUPPRESSION_GATING_ENABLED=false`
+> and the code-level `true` default are unchanged.
 
 **Question**: Decision 15 fixed the rollback order as "gating off, restore the
 safe ramp, then unwind the auxiliary subscriptions". With two subscriptions per
@@ -898,3 +955,178 @@ T038/T041/T045/T058; existing checklist items; and OPERATIONS E3 clock,
 watermark, Python-process, and RSS checks. No task ID, dependency, environment
 variable, runtime dependency, schema, or payload-drop behavior is added.
 T058 and deployed evidence E1-E5 remain pending.
+
+## 27. Approved capacity amendment: entry 400, retention and maximum 450
+
+**Question**: Decision 5 locked a firm 400-channel ceiling with equal 400/400
+thresholds and a 100-subscription reserve. The user has approved
+`JOIN_THRESHOLD=400` / `LEAVE_THRESHOLD=450` and asked that every consequence
+that cascaded from 400/400 be revisited from first principles rather than
+patched. What capacity model applies, and on what condition?
+
+| Option | Description |
+|--------|-------------|
+| A | Keep decision 5: firm 400 maximum, equal 400/400 thresholds, 800 of 900 subscriptions, 100 slots permanently reserved. |
+| B | Entry threshold `JOIN_THRESHOLD=400`; retention **and** maximum `LEAVE_THRESHOLD=450`. A fresh channel enters only inside the top 400 by rank; an incumbent is retained through rank 450 and exits beyond it. The monitored maximum is 450 channels, which at two subscriptions per channel is exactly 900 of the 900 available slots — **no guaranteed free reserve**. Deployable only together with decision 28's exact-capacity engineering and its deployed evidence. |
+| C | `LEAVE_THRESHOLD=450` with `JOIN_THRESHOLD=450` as well. |
+| D | Option B's thresholds without decision 28: exact capacity on the existing pair placement, error classification, and `full_at` behaviour. |
+
+**Selection**: Option B — the user-approved thresholds, explicitly conditioned
+on decision 28.
+
+**Rationale**: The 400/400 model was never the only defensible one, and the
+100-slot reserve it protected was a margin rather than a structural
+requirement. The approved model is the **exact analogy of the pre-007 800/900
+ramp, halved**: 800/900 admitted fresh channels inside the top 800, retained
+incumbents through rank 900, and at its own ceiling authorised 900 channels ×
+1 subscription = 900 of 900 slots with nothing held back. 400/450 is the same
+shape at two subscriptions per channel — a 400-deep entry gate, a 50-channel
+retention band, and a ceiling that consumes the account exactly. The system ran
+the 800/900 shape in production (OPERATIONS ramp ladder step 6, clean on
+2026-08-31), so exact capacity is a returned-to operating point, not a new
+class of risk, and the 50-channel band is worth more than a reserve that is
+mostly idle: it removes the boundary-rank thrash that decisions 14 and 19 had
+to measure and gate.
+
+The reserve can be released because the two paths it was justified for do not
+normally consume *new* slots:
+
+- **Reconnect.** Twitch disables every subscription belonging to a session when
+  that session ends, and disabled subscriptions do not count against the
+  300-per-connection limit; reconnecting with a reconnect URL does not add to
+  the websocket count either (research §1.1). The pool re-creates on the new
+  session against slots the old session has already released. A reconnect
+  therefore rotates subscription ids inside the same budget rather than
+  requiring a spare 100.
+- **Adoption.** A 409 conflict means the subscription already exists and is
+  already counted. Adoption records the existing id in a `_Slot`; it creates
+  nothing and consumes no additional slot. That is the whole point of the
+  adoption path.
+
+What zero slack does change is the *exceptional* cases, and those are accepted
+explicitly rather than by silence:
+
+1. **Parity fragmentation.** Three connections at 300 each hold 450 co-located
+   pairs only under perfect packing. A connection left at an odd occupancy
+   strands a single free slot that no whole pair can use, so the last channels
+   are reachable only if a pair may be reserved one slot on each of two
+   connections.
+2. **In-flight overlap.** A delete that has not completed while a create is
+   already in flight briefly needs a slot that the old subscription still
+   holds.
+3. **Foreign or orphaned enabled subscriptions.** Anything left on the
+   client-id/user-id pair by an earlier revision or another process consumes
+   the same 900 and, at exact capacity, is indistinguishable from a defect.
+4. **Failed deletes.** An enabled subscription the pool believes is gone is a
+   permanent slot leak once there is no reserve to absorb it.
+5. **Below-cap `full_at`.** A connection marked full at an occupancy under 300
+   strands the very slots the 450th channel needs.
+
+None of these is acceptable unmitigated. They are accepted **only** with
+decision 28's placement, classification, and visibility work in place, and
+**only** on deployed evidence: E2a proves the dual transport converges at
+400 channels / 800 subscriptions before the retention threshold moves, and E2b
+proves exact-capacity behaviour at 450/900 with relational equality rather than
+an approximate reading. Option A was not chosen because the user approved
+otherwise; option C removes the retention band the amendment exists to create,
+and would reintroduce exactly the zero-width thrash decisions 14 and 19 spent
+two artifacts containing; option D is the same arithmetic without the
+engineering, which converts every exceptional case above into a silent,
+unrecoverable coverage hole at the ceiling.
+
+**Stage**: Approved capacity amendment.
+
+**Impact**: Supersedes decisions 5, 14, and 19, and amends 16 and 21 —
+decision 19's 8-changes-per-poll, 24-hour release gate and decision 14's
+zero-width premise are both removed, while the kill switch and the
+unwind-capacity-before-relaxing-thresholds principle are kept. Rewrites
+FR-013, FR-014, FR-015, NFR-001, NFR-007, SC-006, and SC-011, and the overview,
+US3, edge cases, entities, assumptions, and out-of-scope text that quoted the
+old numbers. Replaces the plan/research/data-model capacity tables with entry
+400, maximum 450, 900 steady maximum, 0 guaranteed free, and 150 pairs per
+session. Retires research §6's zero-width section and D10/D14/R5/R11, and adds
+the fragmentation, foreign-subscription, below-cap `full_at`, failed-delete,
+and exact-convergence risks. Restages the rollout — 400/400 single-subscription
+convergence, dual transport at 400/400 with gating off, E1/E2a, a foreign
+subscription sweep, then the ramp to the final 400/450, then E2b, E3, E4, E5 —
+and restages the rollback so a capacity incident lowers retention to 400 and
+reconverges first. Adds amendment tasks T059-T068, all unchecked. The
+suppression event contract is untouched: it is capacity-independent.
+
+## 28. Exact-capacity engineering for the 450-channel ceiling
+
+**Question**: Decision 27 removes the free reserve, so the pool must reach 900
+of 900 subscriptions and stay correct there. Today's placement takes a pair
+only where two slots fit on one connection, a capacity exhaustion is
+indistinguishable from other create failures, and `full_at` is a sticky
+per-connection ceiling. What must change before exact capacity is deployed?
+
+| Option | Description |
+|--------|-------------|
+| A | Nothing: run exact capacity on the current placement, classification, and `full_at` behaviour. |
+| B | Four changes, together: (1) **co-location first, split second** — `route()` still prefers the connection already holding the channel's other slot and then a single connection with room for the whole pair, but when no connection has two free slots and total free slots across the pool is ≥ 2, it atomically reserves one slot on each of two connections inside the same critical section; (2) a distinct `PoolCapacityError` and a distinct capacity classification on the failure metric, separate from provider refusal and from transient transport errors; (3) hard capacity exhaustion must **not** arm the transient growth backoff, because there is nothing to wait for and arming it delays a legitimate later growth or repair; (4) `full_at` is cleared and re-evaluated on reconnect and retirement, and a connection that is full below the 300 cap is exposed as such. |
+| C | Option B plus pair compaction: migrate an existing half-pair between connections to defragment the pool. |
+| D | Option B's placement change only, leaving error classification and `full_at` as they are. |
+
+**Selection**: Option B — selected autonomously as the condition attached to
+decision 27.
+
+**Rationale**: At 800 of 900 subscriptions the pool always had a whole free
+connection's worth of slack, so every one of these behaviours was harmless. At
+900 of 900 each becomes a way to strand capacity that the model says exists:
+
+- **Split reservation is the load-bearing change.** Two free slots on two
+  different connections are two free slots. Refusing the pair because neither
+  connection alone can hold it turns a full pool into a *falsely* full pool,
+  and at the ceiling that is the difference between converging at 450 and
+  stalling at 449. Splitting a pair is already legal and already modelled
+  (research R2, data-model §4): it costs locality, and a socket death then
+  leaves the channel in a partial state that the reconciler already repairs.
+  The reservation must be **atomic under the existing lock** — both slots
+  reserved together or neither — or two concurrent pairs each reserve half of
+  the same two free slots and both fail on create. Partial failure *after*
+  reservation keeps the successful half, because a chat-only or
+  notification-only channel is a convergent state and discarding the surviving
+  half would cost a slot to recreate.
+- **A hard capacity error is not a refusal and not a transient fault.** With no
+  reserve, "no slot anywhere" becomes an expected, reportable operating state
+  rather than an anomaly, and it must never reach the reconciler as a
+  provider refusal — that path writes the durable per-channel refusal cache and
+  would evict a channel for seven days over an arithmetic condition. A distinct
+  `PoolCapacityError` and a distinct capacity label on the failure metric are
+  what let an operator answer "is the account full, or is Twitch refusing us"
+  without reading logs.
+- **Transient backoff for a hard ceiling is a lie with a timer.** Growth
+  backoff exists so the pool stops hammering a transport that may recover. A
+  900-of-900 pool is not going to recover by waiting, and arming the backoff
+  means the next genuine growth opportunity — after a retirement, a delete, or
+  a set contraction — is delayed for no reason. Report it, do not arm it.
+- **`full_at` must be re-evaluated, not remembered forever.** `full_at` records
+  the occupancy Twitch refused at. If that number is below 300, the connection
+  permanently offers fewer slots than the capacity model counts on, which at
+  exact capacity is the whole margin. A session transition — reconnect or
+  retirement — invalidates the observation that produced it, so it is cleared
+  and re-evaluated there, and a below-cap full connection is exposed so an
+  operator sees a stranded-capacity condition instead of an unexplained
+  refusal at 449 channels.
+
+Option A is decision 27's rejected option D by another name. Option C was
+rejected as too complex for the benefit: migration means deleting a live
+subscription and recreating it elsewhere, which opens a real coverage gap on a
+channel that currently has none, needs its own ordering, failure, and
+idempotence rules, and is only ever needed to recover locality that splitting
+already handles correctly. Option D leaves the pool able to reach 900 but
+unable to explain itself there, which is precisely the state in which an
+operator cannot tell an expected ceiling from a defect.
+
+**Stage**: Approved capacity amendment.
+
+**Impact**: Adds the split-reservation fallback and its atomicity requirement to
+the plan, research, and data-model placement rules; adds the distinct capacity
+error and metric classification, the no-transient-backoff rule, and the
+`full_at` clear/re-evaluate/expose behaviour to the same artifacts and to
+OPERATIONS; adds the fragmentation, foreign-subscription, below-cap `full_at`,
+failed-delete, and exact-convergence risks; and is carried by amendment tasks
+T061 and T062 with observability in T063 and T065. No event-schema,
+dependency, authorization, or reconciler-interface change: the reconciler stays
+channel-keyed and the suppression contract stays capacity-independent.
