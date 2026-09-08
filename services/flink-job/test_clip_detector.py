@@ -5,13 +5,24 @@ Unit tests for Clip Detector Job
 Tests the anomaly detection logic, command filtering, and clip creation flow.
 """
 
+import ast
+import inspect
 import json
+import logging
 import os
+import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+# The module itself, alongside the names below: Feature 007's operator surface
+# (AnomalyDetector.process_element2, suppression_key, the suppression source
+# builders, the new metric globals) is written before T041-T045 implement it,
+# and a missing name must fail its own test rather than break collection for
+# the clip-detector tests this file already carries.
+import clip_detector_job
+import spike_detector
 from clip_detector_job import (
     AnomalyEvent,
     ChatMessage,
@@ -418,3 +429,1657 @@ class TestClippingSelfHeal:
         of a row that is already correct."""
         clipping_client.mark_clipping_allowed(1)
         assert read_streamer(clipping_client) == (True, None)
+
+
+# ===========================================================================
+# Feature 007 -- suppress gift and raid chat bursts. The operator half.
+# ===========================================================================
+#
+# Tasks T002, T037-T040. Everything below runs on fakes: no broker, no
+# MiniCluster, no gateway, no Twitch call, and main() is never executed. It is
+# still conditional on the pinned apache-flink==1.18.0 being installed, because
+# this file imports clip_detector_job, which imports PyFlink. That is why the
+# guaranteed-offline half of the same evidence -- SuppressionSourceSettings,
+# the pure decoder, the deadline arithmetic and the docker-compose assertions
+# -- lives in test_spike_detector.py, which imports no PyFlink (research D16,
+# plan "Offline testability"). When PyFlink is absent this file does not
+# collect, and T047 reports it as pending rather than passed.
+#
+# References: specs/007-suppress-gift-raid-bursts/contracts/
+# suppression-events.schema.md §4, data-model.md §3, research D4/D5/D6/D13/D15.
+
+GIFT = "community_sub_gift"
+SUB_GIFT = "sub_gift"
+RAID = "raid"
+EXCLUDED_NOTICE_TYPES = ("unraid", "sub", "resub", "announcement")
+
+# Leave a field out of the payload entirely, which is a different failure from
+# carrying it as null.
+OMIT = object()
+
+BROADCASTER = 123456789
+OCCURRED_AT_MS = 1_772_668_800_123
+
+
+# ---------------------------------------------------------------------------
+# T002 -- record builders
+# ---------------------------------------------------------------------------
+
+def valid_suppression_record(
+    schema_version=1,
+    broadcaster_id=BROADCASTER,
+    notice_type=GIFT,
+    occurred_at_ms=OCCURRED_AT_MS,
+    **optional,
+):
+    """One version-1 `suppression-events` value, as the topic carries it.
+
+    Optional keywords (`notice_id`, `received_at_ms`, `viewer_count`) are added
+    verbatim; pass OMIT for any field to drop it. The producer's own view of
+    the same contract is built in test_stream_monitoring.py -- this builder is
+    the consumer's, and it deliberately depends on nothing but the contract.
+    """
+    payload = {
+        "schema_version": schema_version,
+        "broadcaster_id": broadcaster_id,
+        "notice_type": notice_type,
+        "occurred_at_ms": occurred_at_ms,
+    }
+    payload.update(optional)
+    return json.dumps({k: v for k, v in payload.items() if v is not OMIT})
+
+
+# The invalid records, one per contract §4.1 rejection reason, so a test can
+# name the reason it expects rather than re-deriving it.
+INVALID_SUPPRESSION_RECORDS = {
+    "not-json": ("{not json", "decode"),
+    "empty": ("", "decode"),
+    "json-array": ("[]", "decode"),
+    "json-scalar": ("7", "decode"),
+    "json-null": ("null", "decode"),
+    "schema-missing": (valid_suppression_record(schema_version=OMIT), "schema_version"),
+    "schema-null": (valid_suppression_record(schema_version=None), "schema_version"),
+    "schema-future": (valid_suppression_record(schema_version=2), "schema_version"),
+    "schema-string": (valid_suppression_record(schema_version="1"), "schema_version"),
+    # bool is a subclass of int and True == 1, so a naive version check accepts
+    # this record. It must not.
+    "schema-bool": (valid_suppression_record(schema_version=True), "schema_version"),
+    "id-missing": (valid_suppression_record(broadcaster_id=OMIT), "fields"),
+    "id-string": (valid_suppression_record(broadcaster_id="123456789"), "fields"),
+    "id-float": (valid_suppression_record(broadcaster_id=123456789.0), "fields"),
+    "id-bool": (valid_suppression_record(broadcaster_id=True), "fields"),
+    "id-null": (valid_suppression_record(broadcaster_id=None), "fields"),
+    "time-missing": (valid_suppression_record(occurred_at_ms=OMIT), "fields"),
+    "time-string": (valid_suppression_record(occurred_at_ms="1772668800123"), "fields"),
+    "time-float": (valid_suppression_record(occurred_at_ms=1.772e12), "fields"),
+    "time-bool": (valid_suppression_record(occurred_at_ms=True), "fields"),
+    "time-null": (valid_suppression_record(occurred_at_ms=None), "fields"),
+    "type-missing": (valid_suppression_record(notice_type=OMIT), "fields"),
+    "type-null": (valid_suppression_record(notice_type=None), "fields"),
+    "type-int": (valid_suppression_record(notice_type=7), "fields"),
+    "type-excluded-unraid": (valid_suppression_record(notice_type="unraid"), "fields"),
+    "type-excluded-sub": (valid_suppression_record(notice_type="sub"), "fields"),
+    "type-excluded-resub": (valid_suppression_record(notice_type="resub"), "fields"),
+    "type-unknown": (valid_suppression_record(notice_type="mystery_gift_2"), "fields"),
+}
+
+
+def chat_record(broadcaster_id=BROADCASTER, sent_at=OCCURRED_AT_MS, text="POGGERS"):
+    """A `chat-messages` value, whose schema spec 004 FR-008 freezes."""
+    return json.dumps({
+        "broadcaster_id": broadcaster_id,
+        "sent_at": sent_at,
+        "timestamp": sent_at + 40,
+        "message_id": "uuid-1",
+        "text": text,
+        "user_id": 42,
+        "user_name": "viewer",
+    })
+
+
+# ---------------------------------------------------------------------------
+# T002 -- keyed state, timer, context and metric doubles
+# ---------------------------------------------------------------------------
+
+class FakeValueState:
+    """Flink's ValueState, with the writes visible.
+
+    The write count is load-bearing: contract §4.1 rule 6 requires
+    process_element2 to write only when the deadline actually moved, the same
+    write-on-change rule `hold` already follows.
+    """
+
+    def __init__(self, value=None):
+        self._value = value
+        self.writes = []
+        self.clears = 0
+
+    def value(self):
+        return self._value
+
+    def update(self, value):
+        self._value = value
+        self.writes.append(value)
+
+    def clear(self):
+        self._value = None
+        self.clears += 1
+
+
+class FakeMapState:
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+        self.removed = []
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def put(self, key, value):
+        self.data[key] = value
+
+    def items(self):
+        return list(self.data.items())
+
+    def remove(self, key):
+        self.data.pop(key, None)
+        self.removed.append(key)
+
+
+class FakeTimerService:
+    def __init__(self, watermark=0):
+        self.registered = []
+        self._watermark = watermark
+
+    def register_event_time_timer(self, timestamp):
+        self.registered.append(timestamp)
+
+    def current_watermark(self):
+        return self._watermark
+
+
+class FakeContext:
+    """Serves for both KeyedCoProcessFunction.Context and OnTimerContext."""
+
+    def __init__(self, key, timestamp=None, timer_service=None):
+        self._key = key
+        self._timestamp = timestamp
+        self._timer_service = timer_service or FakeTimerService()
+
+    def get_current_key(self):
+        return self._key
+
+    def timestamp(self):
+        return self._timestamp
+
+    def timer_service(self):
+        return self._timer_service
+
+
+class FakeStateStore:
+    """One set of keyed-state doubles per broadcaster.
+
+    Flink swaps the keyed state under the operator per record; bind() does the
+    same, which is what makes the channel-isolation assertions (NFR-002, I13)
+    mean anything rather than passing by accident on a single shared cell.
+    """
+
+    def __init__(self):
+        self.states = {}
+
+    def for_key(self, key):
+        return self.states.setdefault(key, {
+            "counts": FakeMapState(),
+            "hold": FakeValueState(),
+            "last_fire_second": FakeValueState(),
+            "suppression": FakeValueState(),
+        })
+
+    def bind(self, detector, key):
+        state = self.for_key(key)
+        detector.message_counts = state["counts"]
+        detector.hold = state["hold"]
+        detector.last_fire_second = state["last_fire_second"]
+        detector.suppression = state["suppression"]
+        return state
+
+
+class RecordingMetric:
+    """A Prometheus-shaped double: .labels(...) -> child, then .inc()/.observe()."""
+
+    def __init__(self, name, labelnames=()):
+        self.name = name
+        self.labelnames = tuple(labelnames)
+        self.increments = []      # label dicts, one per inc()
+        self.observations = []    # (label dict, value) per observe()
+
+    def labels(self, *args, **kwargs):
+        if args:
+            kwargs = dict(zip(self.labelnames, args))
+        return _RecordingChild(self, kwargs)
+
+    def inc(self, amount=1):
+        self.increments.append({})
+
+    def observe(self, value):
+        self.observations.append(({}, value))
+
+    def values_for(self, **labels):
+        return [d for d in self.increments if all(d.get(k) == v for k, v in labels.items())]
+
+
+class _RecordingChild:
+    def __init__(self, parent, labels):
+        self.parent = parent
+        self._labels = labels
+
+    def inc(self, amount=1):
+        self.parent.increments.append(dict(self._labels))
+
+    def observe(self, value):
+        self.parent.observations.append((dict(self._labels), value))
+
+
+SUPPRESSION_METRIC_GLOBALS = {
+    "_anomalies_detected_total": "anomalies_detected_total",
+    "_clips_suppressed_total": "clips_suppressed_total",
+    "_suppression_records_rejected_total": "suppression_records_rejected_total",
+    "_suppression_records_consumed_total": "suppression_records_consumed_total",
+    "_suppression_delivery_age_seconds": "suppression_delivery_age_seconds",
+    "_hold_regressed_total": "hold_regressed_total",
+}
+
+
+@pytest.fixture
+def metrics(monkeypatch):
+    """Recording doubles in place of the module's lazy metric globals.
+
+    _init_metrics is stubbed out as well: it binds an HTTP port, which no unit
+    test may do.
+    """
+    monkeypatch.setattr(clip_detector_job, "_init_metrics", lambda subtask_index=0: None)
+    doubles = {}
+    for attr, name in SUPPRESSION_METRIC_GLOBALS.items():
+        double = RecordingMetric(name)
+        doubles[name] = double
+        monkeypatch.setattr(clip_detector_job, attr, double, raising=False)
+    return doubles
+
+
+@pytest.fixture
+def store():
+    return FakeStateStore()
+
+
+def make_detector(clock_ms=None, config=None, suppression_config=None):
+    """A detector with open()'s work done by hand, so no runtime context, no
+    metrics server and no environment read are involved."""
+    detector = clip_detector_job.AnomalyDetector(clock_ms=clock_ms)
+    detector.config = config or spike_detector.DetectorConfig()
+    detector.suppression_config = suppression_config or spike_detector.SuppressionConfig()
+    detector.subtask_index = 0
+    return detector
+
+
+def feed_suppression(detector, store, record, key=BROADCASTER, timer_service=None):
+    """One record through the suppression input, keyed the way the job keys it."""
+    store.bind(detector, key)
+    ctx = FakeContext(key=key, timer_service=timer_service or FakeTimerService())
+    emitted = detector.process_element2((key, record), ctx)
+    return list(emitted or []), ctx
+
+
+def fire_timer(detector, store, timestamp, key=BROADCASTER, watermark=None):
+    store.bind(detector, key)
+    timer_service = FakeTimerService(timestamp if watermark is None else watermark)
+    ctx = FakeContext(key=key, timestamp=timestamp, timer_service=timer_service)
+    return list(detector.on_timer(timestamp, ctx)), ctx
+
+
+def emitting_decision(peak_second, expired_buckets=None, hold=None):
+    """A Decision that reports a spike, so on_timer reaches its output gate."""
+    spike = spike_detector.Spike(
+        message_count=420,
+        baseline_mean=10.0,
+        baseline_std=2.0,
+        intensity=9.5,
+        detected_at_seconds=peak_second,
+    )
+    return spike_detector.Decision(
+        emit=spike,
+        hold=hold,
+        expired_buckets=list(expired_buckets or []),
+        measurement=spike,
+        observed_seconds=300,
+    )
+
+
+def stub_evaluate(monkeypatch, decision):
+    """Pin evaluate()'s answer so the gate, not the arithmetic, is under test."""
+    calls = []
+
+    def _evaluate(counts, second, hold, last_fire_second, config):
+        calls.append((dict(counts), second, hold, last_fire_second))
+        return decision
+
+    monkeypatch.setattr(clip_detector_job, "evaluate", _evaluate)
+    return calls
+
+
+class TestSuppressionDoubles:
+    """T002. The doubles are load-bearing, so they get their own checks; a
+    silently broken fake would make every assertion below vacuous."""
+
+    def test_the_valid_builder_matches_the_version_1_contract(self):
+        payload = json.loads(valid_suppression_record())
+        assert payload == {
+            "schema_version": 1,
+            "broadcaster_id": BROADCASTER,
+            "notice_type": GIFT,
+            "occurred_at_ms": OCCURRED_AT_MS,
+        }
+
+    def test_the_builder_can_drop_a_required_field_and_add_optional_ones(self):
+        assert "occurred_at_ms" not in json.loads(
+            valid_suppression_record(occurred_at_ms=OMIT)
+        )
+        payload = json.loads(valid_suppression_record(
+            notice_type=RAID, notice_id="9c2b", received_at_ms=1, viewer_count=4200
+        ))
+        assert payload["notice_id"] == "9c2b"
+        assert payload["viewer_count"] == 4200
+
+    @pytest.mark.parametrize(
+        "name,expected", [(k, v[1]) for k, v in INVALID_SUPPRESSION_RECORDS.items()]
+    )
+    def test_every_invalid_builder_decodes_to_its_documented_reason(self, name, expected):
+        """The pure decoder is the shared one from spike_detector, so the
+        operator and the offline suite cannot drift apart on what "malformed"
+        means (contract §4.1)."""
+        raw, _ = INVALID_SUPPRESSION_RECORDS[name]
+        result = spike_detector.decode_suppression_record(
+            raw, spike_detector.SuppressionConfig()
+        )
+        assert result.notice is None
+        assert result.rejected_reason == expected
+
+    def test_the_fake_value_state_reports_writes_and_clears(self):
+        state = FakeValueState()
+        assert state.value() is None
+        state.update("a")
+        state.update("b")
+        state.clear()
+        assert state.writes == ["a", "b"]
+        assert state.clears == 1 and state.value() is None
+
+    def test_the_fake_state_store_keeps_channels_apart(self, store):
+        detector = object.__new__(clip_detector_job.AnomalyDetector)
+        store.bind(detector, 1)
+        detector.suppression.update("one")
+        store.bind(detector, 2)
+        assert detector.suppression.value() is None
+        assert store.for_key(1)["suppression"].value() == "one"
+
+
+class TestOperatorShape:
+    """T043. The chat path must survive the conversion untouched: FR-008 and
+    SC-004 are about the gate changing output only."""
+
+    def test_the_detector_is_a_keyed_co_process_function(self):
+        from pyflink.datastream import KeyedCoProcessFunction
+
+        assert issubclass(clip_detector_job.AnomalyDetector, KeyedCoProcessFunction)
+
+    def test_it_exposes_both_inputs_and_the_timer(self):
+        for name in ("process_element1", "process_element2", "on_timer", "open"):
+            assert callable(getattr(clip_detector_job.AnomalyDetector, name, None)), name
+
+    def test_process_element1_buckets_and_arms_its_own_timer(self, metrics, store):
+        detector = make_detector()
+        store.bind(detector, BROADCASTER)
+        timers = FakeTimerService()
+        ctx = FakeContext(key=BROADCASTER, timestamp=OCCURRED_AT_MS, timer_service=timers)
+
+        detector.process_element1((BROADCASTER, chat_record()), ctx)
+        detector.process_element1((BROADCASTER, chat_record(text="LUL")), ctx)
+
+        bucket = OCCURRED_AT_MS // 1000
+        assert store.for_key(BROADCASTER)["counts"].data == {bucket: 2}
+        # Registering the same timestamp twice is a no-op in Flink, so the
+        # operator arms it per message rather than tracking what it armed.
+        assert timers.registered == [bucket * 1000, bucket * 1000]
+
+    def test_a_chat_message_never_touches_suppression_state(self, metrics, store):
+        detector = make_detector()
+        store.bind(detector, BROADCASTER)
+        ctx = FakeContext(key=BROADCASTER, timestamp=OCCURRED_AT_MS)
+        detector.process_element1((BROADCASTER, chat_record()), ctx)
+        assert store.for_key(BROADCASTER)["suppression"].writes == []
+
+    def test_open_registers_the_suppression_state_under_the_same_ttl(self, monkeypatch):
+        """T043. The suppression state is JSON in a Types.STRING() ValueState
+        and shares the operator's TTL policy (data-model §3)."""
+        recorded = []
+
+        class FakeDescriptor:
+            def __init__(self, name, *type_args):
+                self.name = name
+                self.type_args = type_args
+                self.ttl = None
+                recorded.append(self)
+
+            def enable_time_to_live(self, ttl_config):
+                self.ttl = ttl_config
+
+        class FakeRuntimeContext:
+            def get_index_of_this_subtask(self):
+                return 0
+
+            def get_map_state(self, descriptor):
+                return FakeMapState()
+
+            def get_state(self, descriptor):
+                return FakeValueState()
+
+        monkeypatch.setattr(clip_detector_job, "_init_metrics", lambda subtask_index=0: None)
+        monkeypatch.setattr(clip_detector_job, "ValueStateDescriptor", FakeDescriptor)
+        monkeypatch.setattr(clip_detector_job, "MapStateDescriptor", FakeDescriptor)
+
+        detector = clip_detector_job.AnomalyDetector()
+        detector.open(FakeRuntimeContext())
+
+        by_name = {d.name: d for d in recorded}
+        assert "suppression" in by_name
+        assert by_name["suppression"].ttl is not None
+        # One TTL policy for the whole operator: a suppression deadline that
+        # outlived the buckets it gates would be a stale window (§5.3).
+        assert len({id(d.ttl) for d in recorded}) == 1
+        assert detector.suppression_config is not None
+
+    def test_the_ttl_never_returns_expired_state(self, monkeypatch):
+        """§5.3 / FR-011: an expired deadline must read back as absent, so a
+        previous window cannot suppress new activity after a channel returns."""
+        from pyflink.datastream.state import StateTtlConfig
+
+        detector = clip_detector_job.AnomalyDetector()
+        detector.config = spike_detector.DetectorConfig()
+        assert detector._state_ttl().get_state_visibility() == (
+            StateTtlConfig.StateVisibility.NeverReturnExpired
+        )
+
+
+class TestSuppressionRouting:
+    """T037/T045. Contract §4.0 and research D15: the sources deserialize
+    values only, so the operator never sees the Kafka key and everything is
+    derived from the payload broadcaster_id."""
+
+    def test_the_key_comes_from_the_payload(self):
+        assert clip_detector_job.suppression_key(valid_suppression_record()) == BROADCASTER
+
+    @pytest.mark.parametrize("name", sorted(INVALID_SUPPRESSION_RECORDS))
+    def test_an_unroutable_record_still_gets_a_key_instead_of_raising(self, name):
+        """A malformed record must reach process_element2 to be counted
+        (contract §4.1). A keying function that raised, or that dropped the
+        record, would make the rejection metric structurally unreachable."""
+        raw, _ = INVALID_SUPPRESSION_RECORDS[name]
+        key = clip_detector_job.suppression_key(raw)
+        assert isinstance(key, int)
+        if name.startswith(("id-", "not-json", "empty", "json-")):
+            assert key == clip_detector_job.SUPPRESSION_UNROUTABLE_KEY
+
+    def test_the_sentinel_key_is_not_a_broadcaster_id(self):
+        assert clip_detector_job.SUPPRESSION_UNROUTABLE_KEY < 0
+
+    def test_the_key_function_takes_only_the_value(self):
+        import inspect
+
+        params = list(inspect.signature(clip_detector_job.suppression_key).parameters)
+        assert params == ["value"]
+
+
+class TestProcessElement2Decoding:
+    """T037. Contract §4.1: reject defensively, count by reason, and never let
+    an exception escape -- one would fail the operator and stop chat detection
+    for every key on the subtask."""
+
+    def test_a_valid_notice_writes_the_deadline(self, metrics, store):
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS + 200)
+        feed_suppression(detector, store, valid_suppression_record())
+
+        state = spike_detector.SuppressionState.from_json(
+            store.for_key(BROADCASTER)["suppression"].value()
+        )
+        assert state.suppress_until_ms == OCCURRED_AT_MS + 120_000
+        assert state.notice_type == GIFT
+        assert state.notice_at_ms == OCCURRED_AT_MS
+
+    def test_a_raid_uses_the_raid_window(self, metrics, store):
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS)
+        feed_suppression(detector, store, valid_suppression_record(notice_type=RAID))
+        state = spike_detector.SuppressionState.from_json(
+            store.for_key(BROADCASTER)["suppression"].value()
+        )
+        assert state.suppress_until_ms == OCCURRED_AT_MS + 180_000
+
+    def test_a_bare_json_value_is_accepted_as_well_as_the_keyed_tuple(self, metrics, store):
+        """Defensive: the wiring hands the operator a keyed tuple today, and a
+        shape change must not silently stop suppression."""
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS)
+        store.bind(detector, BROADCASTER)
+        ctx = FakeContext(key=BROADCASTER)
+        list(detector.process_element2(valid_suppression_record(), ctx) or [])
+        assert store.for_key(BROADCASTER)["suppression"].value() is not None
+
+    @pytest.mark.parametrize("name", sorted(INVALID_SUPPRESSION_RECORDS))
+    def test_a_malformed_record_is_counted_and_changes_nothing(self, name, metrics, store):
+        raw, reason = INVALID_SUPPRESSION_RECORDS[name]
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS)
+        timers = FakeTimerService()
+
+        emitted, _ = feed_suppression(detector, store, raw, timer_service=timers)
+
+        assert emitted == []
+        assert timers.registered == []
+        assert store.for_key(BROADCASTER)["suppression"].writes == []
+        rejected = metrics["suppression_records_rejected_total"]
+        assert rejected.increments == [{"reason": reason}]
+        # A rejected record is not an accepted one, so it produces no delivery
+        # sample and cannot make a broken path look healthy (contract §4.1 rule 5).
+        assert metrics["suppression_records_consumed_total"].increments == []
+        assert metrics["suppression_delivery_age_seconds"].observations == []
+
+    def test_the_rejection_reasons_stay_inside_the_bounded_label_set(self, metrics, store):
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS)
+        for raw, _ in INVALID_SUPPRESSION_RECORDS.values():
+            feed_suppression(detector, store, raw)
+        reasons = {d["reason"] for d in metrics["suppression_records_rejected_total"].increments}
+        assert reasons <= set(spike_detector.SUPPRESSION_REJECT_REASONS)
+
+    def test_the_optional_fields_are_carried_but_never_read(self, metrics, store):
+        """Contract §2.2: notice_id, received_at_ms and viewer_count are
+        diagnostic only, and a raid's audience size cannot change the window."""
+        deadlines = set()
+        for viewer_count in (None, 1, 90_000):
+            local_store = FakeStateStore()
+            detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS)
+            feed_suppression(
+                detector,
+                local_store,
+                valid_suppression_record(
+                    notice_type=RAID,
+                    notice_id="9c2b1f4e-a1",
+                    received_at_ms=OCCURRED_AT_MS + 175,
+                    viewer_count=viewer_count,
+                ),
+            )
+            deadlines.add(
+                spike_detector.SuppressionState.from_json(
+                    local_store.for_key(BROADCASTER)["suppression"].value()
+                ).suppress_until_ms
+            )
+        assert deadlines == {OCCURRED_AT_MS + 180_000}
+
+    def test_an_unexpected_error_never_escapes(self, monkeypatch, metrics, store, caplog):
+        """The operator's own defence, on top of the decoder's: whatever fails
+        inside, chat detection for every other key on this subtask survives."""
+        def explode(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(clip_detector_job, "apply_notice", explode)
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS)
+        with caplog.at_level(logging.ERROR, logger="clip_detector"):
+            emitted, _ = feed_suppression(detector, store, valid_suppression_record())
+        assert emitted == []
+        assert any("boom" in record.getMessage() for record in caplog.records)
+
+
+class TestProcessElement2State:
+    """T039. data-model §3.1 and contract §4.1 rules 6-8."""
+
+    def test_a_later_notice_extends_and_writes(self, metrics, store):
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS + 60_000)
+        feed_suppression(detector, store, valid_suppression_record())
+        feed_suppression(
+            detector, store, valid_suppression_record(occurred_at_ms=OCCURRED_AT_MS + 60_000)
+        )
+        writes = store.for_key(BROADCASTER)["suppression"].writes
+        assert len(writes) == 2
+        assert spike_detector.SuppressionState.from_json(writes[-1]).suppress_until_ms == (
+            OCCURRED_AT_MS + 60_000 + 120_000
+        )
+
+    def test_an_earlier_or_duplicate_notice_writes_nothing(self, metrics, store):
+        """Write-on-change, the rule `hold` already follows: the deadline is a
+        max-register, so a redelivery or an out-of-order notice costs no write."""
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS + 1)
+        feed_suppression(detector, store, valid_suppression_record(notice_type=RAID))
+        feed_suppression(detector, store, valid_suppression_record(notice_type=RAID))
+        feed_suppression(detector, store, valid_suppression_record(notice_type=GIFT))
+        feed_suppression(
+            detector, store,
+            valid_suppression_record(notice_type=GIFT, occurred_at_ms=OCCURRED_AT_MS - 30_000),
+        )
+        assert len(store.for_key(BROADCASTER)["suppression"].writes) == 1
+
+    def test_it_registers_no_timer_and_emits_nothing(self, metrics, store):
+        """Contract §4.1 rule 7: waiting for suppression before deciding is
+        explicitly rejected -- the spec asks for fail-open, not a delay."""
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS)
+        timers = FakeTimerService()
+        emitted, ctx = feed_suppression(
+            detector, store, valid_suppression_record(), timer_service=timers
+        )
+        assert emitted == []
+        assert timers.registered == []
+
+    def test_a_notice_touches_only_its_own_channel(self, metrics, store):
+        """NFR-002 / I13, through the keyed context rather than a payload
+        lookup: the operator's state is whatever Flink bound for this key."""
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS)
+        feed_suppression(
+            detector, store, valid_suppression_record(broadcaster_id=1), key=1
+        )
+        store.bind(detector, 2)
+        assert store.for_key(2)["suppression"].value() is None
+        assert store.for_key(1)["suppression"].value() is not None
+
+    def test_a_late_notice_is_applied_normally(self, metrics, store):
+        """Contract §4.1 rule 8: lateness is not an error. It affects only the
+        decisions taken after it lands (FR-018)."""
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS + 90_000)
+        feed_suppression(
+            detector, store, valid_suppression_record(occurred_at_ms=OCCURRED_AT_MS)
+        )
+        assert store.for_key(BROADCASTER)["suppression"].value() is not None
+
+
+class TestDeliveryClassification:
+    """T039/T042. I19 / research D13: one clamped value from the consumer
+    clock, captured at receipt, decides everything."""
+
+    def observe_one(self, store, record, receipt_ms, config=None):
+        detector = make_detector(clock_ms=lambda: receipt_ms, suppression_config=config)
+        feed_suppression(detector, store, record)
+        return detector
+
+    def test_a_fresh_record_is_healthy_and_observed_once(self, metrics, store):
+        self.observe_one(store, valid_suppression_record(), OCCURRED_AT_MS + 250)
+        consumed = metrics["suppression_records_consumed_total"]
+        assert consumed.increments == [{"lag_class": "healthy"}]
+        assert metrics["suppression_delivery_age_seconds"].observations == [({}, pytest.approx(0.25))]
+
+    def test_the_threshold_boundary_is_at_or_below(self, metrics, store):
+        self.observe_one(store, valid_suppression_record(), OCCURRED_AT_MS + 30_000)
+        assert metrics["suppression_records_consumed_total"].increments == [
+            {"lag_class": "healthy"}
+        ]
+
+    def test_one_millisecond_past_the_threshold_is_lagging(self, metrics, store, caplog):
+        with caplog.at_level(logging.INFO, logger="clip_detector"):
+            self.observe_one(store, valid_suppression_record(), OCCURRED_AT_MS + 30_001)
+        assert metrics["suppression_records_consumed_total"].increments == [
+            {"lag_class": "lagging"}
+        ]
+        assert any("lag" in record.getMessage().lower() for record in caplog.records)
+
+    def test_the_injected_clock_decides_not_wall_clock(self, metrics, store):
+        """The consumer clock is injected in tests and read at receipt at
+        runtime. A test that depended on time.time() could not pin either
+        class deterministically."""
+        self.observe_one(store, valid_suppression_record(), OCCURRED_AT_MS + 3_600_000)
+        assert metrics["suppression_records_consumed_total"].increments == [
+            {"lag_class": "lagging"}
+        ]
+
+    def test_a_fast_producer_does_not_rescue_a_slow_consumer(self, metrics, store):
+        """The case NFR-005 turns on: Twitch-to-producer latency is 175 ms, so
+        `received_at_ms - occurred_at_ms` looks healthy, while the record only
+        reaches process_element2 45 s after it occurred. Classification reads
+        the consumer receipt, so this is lagging."""
+        record = valid_suppression_record(received_at_ms=OCCURRED_AT_MS + 175)
+        self.observe_one(store, record, OCCURRED_AT_MS + 45_000)
+        assert metrics["suppression_records_consumed_total"].increments == [
+            {"lag_class": "lagging"}
+        ]
+
+    def test_the_optional_producer_clock_changes_no_classification(self, metrics, store):
+        for received_at_ms in (OMIT, None, OCCURRED_AT_MS + 175, OCCURRED_AT_MS + 40_000):
+            local_metrics_store = FakeStateStore()
+            self.observe_one(
+                local_metrics_store,
+                valid_suppression_record(received_at_ms=received_at_ms),
+                OCCURRED_AT_MS + 250,
+            )
+        assert {tuple(sorted(d.items()))
+                for d in metrics["suppression_records_consumed_total"].increments} == {
+            (("lag_class", "healthy"),)
+        }
+
+    def test_a_negative_raw_age_is_clamped_and_logged_as_skew(self, metrics, store, caplog):
+        with caplog.at_level(logging.INFO, logger="clip_detector"):
+            self.observe_one(store, valid_suppression_record(), OCCURRED_AT_MS - 5_000)
+        assert metrics["suppression_records_consumed_total"].increments == [
+            {"lag_class": "healthy"}
+        ]
+        assert metrics["suppression_delivery_age_seconds"].observations == [({}, 0.0)]
+        assert any("skew" in record.getMessage().lower() for record in caplog.records)
+
+    def test_the_configured_threshold_is_what_is_compared(self, metrics, store):
+        tuned = spike_detector.SuppressionConfig(delivery_lag_warn_seconds=5)
+        self.observe_one(store, valid_suppression_record(), OCCURRED_AT_MS + 5_001, config=tuned)
+        assert metrics["suppression_records_consumed_total"].increments == [
+            {"lag_class": "lagging"}
+        ]
+
+    def test_silence_publishes_nothing(self, metrics, store):
+        """I19 / decision 20: a window with no record is idle/unknown, read in
+        Prometheus as `increase(...) == 0`. Nothing may refresh a delivery
+        value from on_timer, because during legitimate silence any value it
+        published would be invented."""
+        detector = make_detector(clock_ms=lambda: OCCURRED_AT_MS)
+        store.bind(detector, BROADCASTER)
+        ctx = FakeContext(key=BROADCASTER, timestamp=OCCURRED_AT_MS)
+        detector.process_element1((BROADCASTER, chat_record()), ctx)
+        fire_timer(detector, store, OCCURRED_AT_MS)
+        assert metrics["suppression_records_consumed_total"].increments == []
+        assert metrics["suppression_delivery_age_seconds"].observations == []
+
+
+class TestFarFutureNoticeTime:
+    """T037/T039 regression. An occurrence time far in the future must be
+    rejected before it reaches the monotone register.
+
+    `apply_notice()` only ever moves the deadline outward (I6), so one record
+    claiming to have occurred centuries from now -- a microsecond value read as
+    milliseconds, a badly set producer clock, or anything that is not this
+    producer -- would pin `suppress_until_ms` past every later notice and
+    silence that channel's clips for as long as the keyed state lives. There is
+    no path in the register that moves a deadline back, so the only defence is
+    to refuse the record: no deadline, no delivery sample, and an
+    operationally visible rejection instead (FR-017, contract §4.1 rule 4).
+
+    Ordinary clock disagreement is not this. The allowance is
+    SUPPRESSION_MAX_FUTURE_SKEW_SECONDS = 30 s, and inside it the existing
+    clamp-and-log behaviour is unchanged (contract §2.2).
+    """
+
+    RECEIPT_MS = OCCURRED_AT_MS
+
+    def feed(self, store, occurred_at_ms, receipt_ms=None, detector=None, **optional):
+        receipt = self.RECEIPT_MS if receipt_ms is None else receipt_ms
+        detector = detector or make_detector(clock_ms=lambda: receipt)
+        emitted, ctx = feed_suppression(
+            detector,
+            store,
+            valid_suppression_record(occurred_at_ms=occurred_at_ms, **optional),
+        )
+        return detector, emitted, ctx
+
+    def test_a_notice_beyond_the_allowance_is_rejected_as_a_field_problem(
+        self, metrics, store
+    ):
+        _, emitted, _ = self.feed(store, self.RECEIPT_MS + 30_001)
+
+        assert emitted == []
+        assert metrics["suppression_records_rejected_total"].increments == [
+            {"reason": "fields"}
+        ]
+        assert "fields" in spike_detector.SUPPRESSION_REJECT_REASONS
+        # No state, and therefore no deadline that a later notice could not move.
+        assert store.for_key(BROADCASTER)["suppression"].writes == []
+        assert store.for_key(BROADCASTER)["suppression"].value() is None
+        # A rejected record is not an accepted one: it must not appear in the
+        # delivery signals, where it would read as a healthy consumed record
+        # (contract §4.1 rule 5).
+        assert metrics["suppression_records_consumed_total"].increments == []
+        assert metrics["suppression_delivery_age_seconds"].observations == []
+
+    def test_exactly_the_allowance_is_still_accepted_and_applied(self, metrics, store):
+        """30 s of future skew is tolerated, clamped to a zero delivery age, and
+        logged as skew -- the behaviour that was already contracted."""
+        self.feed(store, self.RECEIPT_MS + 30_000)
+
+        assert metrics["suppression_records_rejected_total"].increments == []
+        assert metrics["suppression_records_consumed_total"].increments == [
+            {"lag_class": "healthy"}
+        ]
+        assert metrics["suppression_delivery_age_seconds"].observations == [({}, 0.0)]
+        state = spike_detector.SuppressionState.from_json(
+            store.for_key(BROADCASTER)["suppression"].value()
+        )
+        assert state.suppress_until_ms == self.RECEIPT_MS + 30_000 + 120_000
+
+    @pytest.mark.parametrize(
+        "occurred_at_ms",
+        [
+            OCCURRED_AT_MS * 1000,          # microseconds mistaken for milliseconds
+            OCCURRED_AT_MS * 1_000_000,     # nanoseconds, likewise
+            OCCURRED_AT_MS + 86_400_000,    # a day ahead
+            OCCURRED_AT_MS + 30_001,
+        ],
+    )
+    def test_every_untrustworthy_shape_is_refused(self, occurred_at_ms, metrics, store):
+        self.feed(store, occurred_at_ms)
+        assert metrics["suppression_records_rejected_total"].increments == [
+            {"reason": "fields"}
+        ]
+        assert store.for_key(BROADCASTER)["suppression"].writes == []
+
+    def test_the_check_runs_before_the_register_is_touched(
+        self, monkeypatch, metrics, store, caplog
+    ):
+        """Ordering, asserted rather than assumed. With apply_notice() replaced
+        by a bomb, the far-future record must pass through without reaching it,
+        while an acceptable record still does -- which is what makes the first
+        half evidence of ordering and not of a disabled code path."""
+        def explode(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(clip_detector_job, "apply_notice", explode)
+
+        with caplog.at_level(logging.ERROR, logger="clip_detector"):
+            self.feed(store, self.RECEIPT_MS + 3_600_000)
+        assert not any("boom" in r.getMessage() for r in caplog.records)
+        assert store.for_key(BROADCASTER)["suppression"].writes == []
+
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="clip_detector"):
+            self.feed(store, self.RECEIPT_MS)
+        assert any("boom" in r.getMessage() for r in caplog.records)
+
+    def test_the_rejection_is_visible_and_carries_no_payload_content(
+        self, metrics, store, caplog
+    ):
+        """FR-017 / NFR-006: operationally visible, attributable to the channel,
+        and bounded. A rejection log that echoed the record would put producer
+        data -- and, if the payload were ever wrong, user content -- into the
+        operator log for an input that is by definition untrusted."""
+        with caplog.at_level(logging.WARNING, logger="clip_detector"):
+            self.feed(
+                store,
+                self.RECEIPT_MS + 1_000_000_000_000,
+                notice_id="SENTINEL-NOTICE-ID",
+            )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert str(BROADCASTER) in message
+        assert len(message) < 500
+        assert "SENTINEL-NOTICE-ID" not in message
+        assert "schema_version" not in message
+
+    def test_the_refused_record_cannot_poison_a_later_notice(self, metrics, store):
+        """The consequence the whole check exists for: after the bad record, an
+        ordinary notice still sets the deadline it should, because the register
+        was never moved."""
+        detector = make_detector(clock_ms=lambda: self.RECEIPT_MS)
+        self.feed(store, self.RECEIPT_MS + 4_000_000_000_000, detector=detector)
+        self.feed(store, self.RECEIPT_MS, detector=detector)
+
+        state = spike_detector.SuppressionState.from_json(
+            store.for_key(BROADCASTER)["suppression"].value()
+        )
+        assert state.suppress_until_ms == self.RECEIPT_MS + 120_000
+        assert state.notice_at_ms == self.RECEIPT_MS
+
+    def test_a_channel_is_not_silenced_by_a_poisoned_record(
+        self, monkeypatch, metrics, store
+    ):
+        """End to end through the gate: the poisoned notice is refused, so a
+        later spike on the same channel still clips instead of being suppressed
+        until the state's TTL expires."""
+        detector = make_detector(clock_ms=lambda: self.RECEIPT_MS)
+        self.feed(store, self.RECEIPT_MS * 1000, detector=detector)
+
+        peak_second = self.RECEIPT_MS // 1000 + 600
+        stub_evaluate(monkeypatch, emitting_decision(peak_second))
+        emitted, _ = fire_timer(detector, store, (peak_second + 5) * 1000)
+
+        assert len(emitted) == 1
+        assert metrics["clips_suppressed_total"].increments == []
+
+
+class TestOutputGate:
+    """T040/T044. data-model §3.2 and §3.3: an output-only filter at the very
+    end of on_timer, after every state write."""
+
+    PEAK_SECOND = OCCURRED_AT_MS // 1000
+    REPORT_MS = (OCCURRED_AT_MS // 1000 + 10) * 1000
+
+    def suppress_until(self, store, until_ms, notice_type=GIFT, key=BROADCASTER,
+                       from_ms=None):
+        """Write the keyed suppression state directly, as a notice would have.
+
+        The window is the half-open interval `[suppress_from_ms,
+        suppress_until_ms)`, so both ends are written here. `from_ms` defaults
+        to the notice instant, which is what apply_notice() records for a first
+        notice, and it is far enough behind PEAK_SECOND that the tests which
+        only care about the deadline keep asserting the deadline.
+        """
+        notice_at_ms = until_ms - 120_000
+        store.for_key(key)["suppression"].update(
+            spike_detector.SuppressionState(
+                suppress_from_ms=notice_at_ms if from_ms is None else from_ms,
+                suppress_until_ms=until_ms,
+                notice_type=notice_type,
+                notice_at_ms=notice_at_ms,
+            ).to_json()
+        )
+
+    def test_an_unsuppressed_spike_emits_as_before(self, monkeypatch, metrics, store):
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND))
+        detector = make_detector()
+        emitted, _ = fire_timer(detector, store, self.REPORT_MS)
+        assert len(emitted) == 1
+        anomaly = json.loads(emitted[0])
+        assert anomaly["broadcaster_id"] == BROADCASTER
+        assert anomaly["detected_at"] == self.PEAK_SECOND * 1000
+        assert metrics["clips_suppressed_total"].increments == []
+
+    def test_an_active_window_stops_the_output(self, monkeypatch, metrics, store, caplog):
+        """FR-007 / FR-012: no clip, one attributable metric, one structured
+        log, and the anomaly counter still moves so "detected but not clipped"
+        stays computable (research R8)."""
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND))
+        self.suppress_until(store, (self.PEAK_SECOND + 1) * 1000, notice_type=RAID)
+        detector = make_detector()
+
+        with caplog.at_level(logging.INFO, logger="clip_detector"):
+            emitted, _ = fire_timer(detector, store, self.REPORT_MS)
+
+        assert emitted == []
+        assert metrics["clips_suppressed_total"].increments == [
+            {"broadcaster_id": str(BROADCASTER), "notice_type": RAID}
+        ]
+        assert len(metrics["anomalies_detected_total"].increments) == 1
+        suppression_logs = [
+            r for r in caplog.records if "suppress" in r.getMessage().lower()
+        ]
+        assert len(suppression_logs) == 1
+        message = suppression_logs[0].getMessage()
+        assert str(BROADCASTER) in message and RAID in message
+
+    def test_the_deadline_boundary_is_strict(self, monkeypatch, metrics, store):
+        """peak_second * 1000 < suppress_until_ms. A peak exactly at the
+        deadline is outside the window and still clips."""
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND))
+        self.suppress_until(store, self.PEAK_SECOND * 1000)
+        detector = make_detector()
+        emitted, _ = fire_timer(detector, store, self.REPORT_MS)
+        assert len(emitted) == 1
+        assert metrics["clips_suppressed_total"].increments == []
+
+    def test_the_gate_compares_the_peak_not_the_report_second(self, monkeypatch, metrics, store):
+        """Research D5: a burst that peaks inside the window must not escape by
+        being reported hold_cap_seconds later."""
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND))
+        # The deadline sits between the peak and the report second.
+        self.suppress_until(store, (self.PEAK_SECOND + 5) * 1000)
+        detector = make_detector()
+        emitted, _ = fire_timer(detector, store, self.REPORT_MS)
+        assert emitted == []
+
+    def test_a_peak_reported_after_a_later_notice_still_clips(
+        self, monkeypatch, metrics, store
+    ):
+        """T040 regression, and the real shape of the hold delay rather than
+        bare arithmetic.
+
+        A spike peaks, the hold keeps it open, and a gift notice arrives 15
+        seconds AFTER that peak. on_timer then reports the held peak. The gift
+        cannot have caused a burst that peaked before it happened, so the clip
+        must still be emitted: the notice opens
+        `[occurred_at_ms, occurred_at_ms + 120 s)` and the peak is outside it
+        (FR-006, FR-007, FR-018).
+
+        The state here is written by process_element2 from a real record, not
+        by hand, so the near end of the window is whatever the operator and
+        apply_notice() actually agree on.
+        """
+        notice_ms = (self.PEAK_SECOND + 15) * 1000
+        detector = make_detector(clock_ms=lambda: notice_ms + 100)
+        feed_suppression(
+            detector, store, valid_suppression_record(occurred_at_ms=notice_ms)
+        )
+        assert store.for_key(BROADCASTER)["suppression"].value() is not None
+
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND))
+        emitted, _ = fire_timer(detector, store, (self.PEAK_SECOND + 20) * 1000)
+
+        assert len(emitted) == 1
+        assert json.loads(emitted[0])["detected_at"] == self.PEAK_SECOND * 1000
+        assert metrics["clips_suppressed_total"].increments == []
+
+    def test_a_peak_inside_that_same_notices_window_is_still_gated(
+        self, monkeypatch, metrics, store
+    ):
+        """The other half of the pair, so the test above cannot be satisfied by
+        simply not suppressing: the same notice, a peak at its occurrence
+        instant, and the clip is gated (FR-007)."""
+        notice_ms = (self.PEAK_SECOND + 15) * 1000
+        detector = make_detector(clock_ms=lambda: notice_ms + 100)
+        feed_suppression(
+            detector, store, valid_suppression_record(occurred_at_ms=notice_ms)
+        )
+
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND + 15))
+        emitted, _ = fire_timer(detector, store, (self.PEAK_SECOND + 40) * 1000)
+
+        assert emitted == []
+        assert metrics["clips_suppressed_total"].increments == [
+            {"broadcaster_id": str(BROADCASTER), "notice_type": GIFT}
+        ]
+
+    def test_the_kill_switch_restores_pre_007_behaviour(self, monkeypatch, metrics, store):
+        """D11: with SUPPRESSION_GATING_ENABLED false the detector behaves
+        exactly as before, while the topic and the subscriptions stay in place."""
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND))
+        self.suppress_until(store, (self.PEAK_SECOND + 60) * 1000)
+        detector = make_detector(
+            suppression_config=spike_detector.SuppressionConfig(gating_enabled=False)
+        )
+        emitted, _ = fire_timer(detector, store, self.REPORT_MS)
+        assert len(emitted) == 1
+        assert metrics["clips_suppressed_total"].increments == []
+
+    @pytest.mark.parametrize("encoded", [None, "", "{corrupt"])
+    def test_absent_or_unreadable_state_fails_open(self, encoded, monkeypatch, metrics, store):
+        """FR-011 / I10. Absent, never-written, expired under
+        NeverReturnExpired, and unreadable all mean the same thing: not
+        suppressed."""
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND))
+        if encoded is not None:
+            store.for_key(BROADCASTER)["suppression"].update(encoded)
+        detector = make_detector()
+        emitted, _ = fire_timer(detector, store, self.REPORT_MS)
+        assert len(emitted) == 1
+
+    def test_every_state_write_happens_before_the_gate(self, monkeypatch, metrics, store):
+        """I11 / SC-004. The gated run must be byte-identical in state to the
+        ungated one -- including last_fire_second, which starts the cooldown as
+        if a clip had been created (research D6)."""
+        hold = spike_detector.HoldState(
+            started_at=self.PEAK_SECOND, peak_intensity=9.5, peak_at=self.PEAK_SECOND,
+            peak_message_count=420, peak_baseline_mean=10.0, peak_baseline_std=2.0,
+        )
+        expired = [self.PEAK_SECOND - 400, self.PEAK_SECOND - 399]
+
+        def run(gating_enabled):
+            local_store = FakeStateStore()
+            local_store.for_key(BROADCASTER)["counts"] = FakeMapState(
+                {self.PEAK_SECOND: 3, self.PEAK_SECOND - 400: 1, self.PEAK_SECOND - 399: 1}
+            )
+            # Identical suppression state in both runs; only the kill switch
+            # differs, so any difference below is the gate touching state.
+            self.suppress_until(local_store, (self.PEAK_SECOND + 5) * 1000)
+            detector = make_detector(
+                suppression_config=spike_detector.SuppressionConfig(
+                    gating_enabled=gating_enabled
+                )
+            )
+            emitted, ctx = fire_timer(detector, local_store, self.REPORT_MS)
+            state = local_store.for_key(BROADCASTER)
+            return emitted, {
+                "hold": state["hold"].writes,
+                "last_fire": state["last_fire_second"].writes,
+                "removed": sorted(state["counts"].removed),
+                "timers": ctx.timer_service().registered,
+            }
+
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND, expired, hold))
+        gated_out, gated_state = run(True)
+        ungated_out, ungated_state = run(False)
+
+        assert gated_state == ungated_state
+        assert gated_state["last_fire"] == [self.REPORT_MS // 1000]
+        assert gated_state["removed"] == expired
+        assert gated_state["timers"]
+        assert gated_out == [] and len(ungated_out) == 1
+
+    def test_a_late_notice_never_retracts_an_emitted_clip(self, monkeypatch, metrics, store):
+        """FR-018 / I12 / US1-6: the state is read at decision time only, and
+        there is no retraction path. A notice that lands after the emission
+        affects only later decisions."""
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND))
+        detector = make_detector(clock_ms=lambda: self.REPORT_MS)
+        first, _ = fire_timer(detector, store, self.REPORT_MS)
+        assert len(first) == 1
+
+        feed_suppression(
+            detector,
+            store,
+            valid_suppression_record(occurred_at_ms=(self.PEAK_SECOND - 30) * 1000),
+        )
+
+        assert len(first) == 1
+        assert metrics["clips_suppressed_total"].increments == []
+        # The same notice does gate the next decision, whose peak is inside it.
+        stub_evaluate(monkeypatch, emitting_decision(self.PEAK_SECOND + 20))
+        second, _ = fire_timer(detector, store, self.REPORT_MS + 20_000)
+        assert second == []
+        assert len(metrics["clips_suppressed_total"].increments) == 1
+
+
+class TestSuppressionSourceWiring:
+    """T038's PyFlink half. Every value comes from the pure
+    SuppressionSourceSettings of T031, which test_spike_detector.py asserts
+    without PyFlink; this proves the job actually builds its source from them.
+    Fakes only: no gateway, no cluster, and main() is never called."""
+
+    @pytest.fixture
+    def kafka_fakes(self, monkeypatch):
+        calls = []
+
+        class FakeBuilder:
+            def set_bootstrap_servers(self, value):
+                calls.append(("bootstrap_servers", value))
+                return self
+
+            def set_topics(self, *topics):
+                calls.append(("topics", topics))
+                return self
+
+            def set_group_id(self, value):
+                calls.append(("group_id", value))
+                return self
+
+            def set_starting_offsets(self, value):
+                calls.append(("starting_offsets", value))
+                return self
+
+            def set_value_only_deserializer(self, value):
+                calls.append(("value_only_deserializer", value))
+                return self
+
+            def build(self):
+                calls.append(("build", None))
+                return "SOURCE"
+
+        monkeypatch.setattr(
+            clip_detector_job, "KafkaSource",
+            type("FakeKafkaSource", (), {"builder": staticmethod(lambda: FakeBuilder())}),
+        )
+        monkeypatch.setattr(
+            clip_detector_job, "KafkaOffsetsInitializer",
+            type("FakeOffsets", (), {
+                "latest": staticmethod(lambda: "LATEST"),
+                "earliest": staticmethod(lambda: "EARLIEST"),
+            }),
+        )
+        monkeypatch.setattr(clip_detector_job, "SimpleStringSchema", lambda: "VALUE_ONLY")
+        return calls
+
+    @pytest.fixture
+    def watermark_fakes(self, monkeypatch):
+        class WatermarkCalls(list):
+            pass
+
+        calls = WatermarkCalls()
+        calls.strategies = []
+
+        class FakeStrategy:
+            def __init__(self, kind, out_of_orderness=None, idleness=None):
+                self.kind = kind
+                self.out_of_orderness = out_of_orderness
+                self.idleness = idleness
+                self.assigner = None
+                calls.strategies.append(self)
+
+            def with_idleness(self, duration):
+                calls.append(("idleness", duration))
+                # PyFlink 1.18 returns a fresh Python wrapper here and does not
+                # carry a Python timestamp assigner onto that wrapper.
+                return FakeStrategy(
+                    self.kind,
+                    out_of_orderness=self.out_of_orderness,
+                    idleness=duration,
+                )
+
+            def with_timestamp_assigner(self, assigner):
+                calls.append(("assigner", assigner))
+                self.assigner = assigner
+                return self
+
+        monkeypatch.setattr(
+            clip_detector_job, "Duration",
+            type("FakeDuration", (), {"of_seconds": staticmethod(lambda n: ("seconds", n))}),
+        )
+
+        def for_bounded(duration):
+            calls.append(("out_of_orderness", duration))
+            return FakeStrategy("bounded", out_of_orderness=duration)
+
+        def no_watermarks():
+            strategy = FakeStrategy("no_watermarks")
+            calls.append(("no_watermarks", strategy))
+            return strategy
+
+        monkeypatch.setattr(
+            clip_detector_job, "WatermarkStrategy",
+            type("FakeWatermarkStrategy", (), {
+                "for_bounded_out_of_orderness": staticmethod(for_bounded),
+                "no_watermarks": staticmethod(no_watermarks),
+            }),
+        )
+        return calls
+
+    def test_the_source_is_built_from_the_pure_settings(self, kafka_fakes):
+        settings = spike_detector.SuppressionSourceSettings()
+        assert clip_detector_job.build_suppression_source(settings) == "SOURCE"
+        recorded = dict(kafka_fakes)
+        assert recorded["topics"] == (settings.topic,)
+        # latest(), never earliest(): old notices must not be replayed into
+        # event time and pin the operator watermark in the past (research D4).
+        assert recorded["starting_offsets"] == "LATEST"
+        assert settings.starting_offsets == "latest"
+        # Value-only, which is why the operator never sees the Kafka key
+        # (contract §4.0, research D15).
+        assert recorded["value_only_deserializer"] == "VALUE_ONLY"
+        assert recorded["bootstrap_servers"] == clip_detector_job.KAFKA_BOOTSTRAP_SERVERS
+
+    def test_the_watermark_strategy_is_built_from_the_pure_settings(self, watermark_fakes):
+        settings = spike_detector.SuppressionSourceSettings()
+        strategy = clip_detector_job.build_suppression_watermark_strategy(settings)
+        assert strategy.kind == "bounded"
+        assert strategy.out_of_orderness == (
+            "seconds", settings.out_of_orderness_seconds
+        )
+        assert strategy.idleness == ("seconds", settings.idleness_seconds)
+        # I15: strictly below the chat stream's, so suppression is never the
+        # binding watermark minimum in steady state.
+        assert settings.idleness_seconds < spike_detector.WATERMARK_IDLENESS_SECONDS
+        assert isinstance(
+            strategy.assigner, clip_detector_job.SuppressionTimestampAssigner
+        )
+
+    def test_the_chat_watermark_strategy_keeps_twitch_event_time(self, watermark_fakes):
+        """Decision 25 changes where this strategy is attached, not what it
+        means: chat remains bounded/idled and derives event time from sent_at."""
+        strategy = clip_detector_job.build_chat_watermark_strategy()
+
+        assert strategy.kind == "bounded"
+        assert strategy.out_of_orderness == (
+            "seconds", spike_detector.WATERMARK_OUT_OF_ORDERNESS_SECONDS
+        )
+        assert strategy.idleness == (
+            "seconds", spike_detector.WATERMARK_IDLENESS_SECONDS
+        )
+        assert isinstance(strategy.assigner, clip_detector_job.SentAtTimestampAssigner)
+        assert strategy.assigner.extract_timestamp(chat_record(), 999) == OCCURRED_AT_MS
+        assert strategy.assigner.extract_timestamp(
+            json.dumps({"sent_at": None}), 999
+        ) == 999
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"sent_at": None},
+            {"sent_at": "1772668800123"},
+            {"sent_at": 1_772_668_800_123.0},
+            {"sent_at": True},
+        ],
+    )
+    def test_chat_event_time_requires_a_plain_integer_sent_at(self, payload):
+        assigner = clip_detector_job.SentAtTimestampAssigner(
+            clock_ms=lambda: OCCURRED_AT_MS
+        )
+        assert assigner.extract_timestamp(json.dumps(payload), 999) == 999
+
+    def test_chat_event_time_accepts_the_future_bound_but_not_one_ms_beyond_it(self):
+        source_clock = OCCURRED_AT_MS
+        max_skew_ms = spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        assert max_skew_ms == 30_000
+        assigner = clip_detector_job.SentAtTimestampAssigner(
+            clock_ms=lambda: source_clock
+        )
+        at_bound = chat_record(sent_at=source_clock + max_skew_ms)
+        over_bound = chat_record(sent_at=source_clock + max_skew_ms + 1)
+        original_at_bound = at_bound
+        original_over_bound = over_bound
+        record_timestamp = source_clock + 250
+
+        assert assigner.extract_timestamp(at_bound, record_timestamp) == (
+            source_clock + 30_000
+        )
+        assert assigner.extract_timestamp(over_bound, record_timestamp) == record_timestamp
+        assert at_bound == original_at_bound
+        assert over_bound == original_over_bound
+
+    @pytest.fixture
+    def topology_fakes(self):
+        """A source-to-assignment topology with every intervening operation
+        made fatal. It models API calls only; it creates no gateway or JVM."""
+        events = []
+
+        class FakeStream:
+            def __init__(self, source, parallelism):
+                self.source = source
+                self.parallelism = parallelism
+
+            def assign_timestamps_and_watermarks(self, strategy):
+                events.append(("assign_timestamps_and_watermarks", self.source, strategy))
+                return FakeStream(self.source, self.parallelism)
+
+            def _unexpected(self, operation):
+                events.append((operation, self.source))
+                raise AssertionError(
+                    f"{operation} ran between from_source and timestamp assignment"
+                )
+
+            def process(self, *args, **kwargs):
+                return self._unexpected("process")
+
+            def map(self, *args, **kwargs):
+                return self._unexpected("map")
+
+            def key_by(self, *args, **kwargs):
+                return self._unexpected("key_by")
+
+            def connect(self, *args, **kwargs):
+                return self._unexpected("connect")
+
+            def set_parallelism(self, *args, **kwargs):
+                return self._unexpected("set_parallelism")
+
+        class FakeEnvironment:
+            def __init__(self):
+                self.parallelism = clip_detector_job.FLINK_PARALLELISM
+
+            def from_source(self, source, watermark_strategy, name):
+                events.append(("from_source", source, watermark_strategy, name))
+                return FakeStream(source, self.parallelism)
+
+        return FakeEnvironment(), events
+
+    def test_both_python_assigners_are_attached_immediately_after_the_sources(
+        self, watermark_fakes, topology_fakes
+    ):
+        """PyFlink 1.18 ignores a Python TimestampAssigner passed directly to
+        from_source. The no-watermark source placeholder and executable
+        post-source assignment are therefore one indivisible wiring step on
+        both sides of the connected operator (decision 25 / contract §1.1.1)."""
+        env, events = topology_fakes
+        settings = spike_detector.SuppressionSourceSettings()
+
+        chat, suppression = clip_detector_job.build_event_time_streams(
+            env, "CHAT_SOURCE", "SUPPRESSION_SOURCE", settings
+        )
+
+        assert [event[0] for event in events] == [
+            "from_source",
+            "assign_timestamps_and_watermarks",
+            "from_source",
+            "assign_timestamps_and_watermarks",
+        ]
+        for source in ("CHAT_SOURCE", "SUPPRESSION_SOURCE"):
+            source_index = next(
+                i for i, event in enumerate(events)
+                if event[0] == "from_source" and event[1] == source
+            )
+            assignment = events[source_index + 1]
+            assert assignment[0] == "assign_timestamps_and_watermarks"
+            assert assignment[1] == source
+            assert events[source_index][2].kind == "no_watermarks"
+            assert assignment[2].kind == "bounded"
+
+        assigned = {
+            event[1]: event[2]
+            for event in events
+            if event[0] == "assign_timestamps_and_watermarks"
+        }
+        assert isinstance(
+            assigned["CHAT_SOURCE"].assigner,
+            clip_detector_job.SentAtTimestampAssigner,
+        )
+        assert isinstance(
+            assigned["SUPPRESSION_SOURCE"].assigner,
+            clip_detector_job.SuppressionTimestampAssigner,
+        )
+        assert chat.parallelism == suppression.parallelism == 4
+        assert settings.expected_partitions == settings.expected_parallelism == 4
+
+    def test_main_delegates_both_sources_to_the_tested_wiring_helper(self):
+        """The fake-tested helper must be the production path, not dead test
+        scaffolding. This inspects Python syntax only and never invokes main."""
+        tree = ast.parse(textwrap.dedent(inspect.getsource(clip_detector_job.main)))
+        helper_calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "build_event_time_streams"
+        ]
+        assert len(helper_calls) == 1
+
+    def test_the_effective_suppression_assignment_keeps_the_future_time_fallback(
+        self, watermark_fakes, topology_fakes
+    ):
+        """The +30s guard is exercised through the strategy actually attached
+        after from_source, not merely through an otherwise-dead assigner."""
+        env, events = topology_fakes
+        settings = spike_detector.SuppressionSourceSettings()
+        clip_detector_job.build_event_time_streams(
+            env, "CHAT_SOURCE", "SUPPRESSION_SOURCE", settings
+        )
+        assigned = next(
+            event[2] for event in events
+            if event[0] == "assign_timestamps_and_watermarks"
+            and event[1] == "SUPPRESSION_SOURCE"
+        )
+        assigner = assigned.assigner
+        assigner._clock_ms = lambda: OCCURRED_AT_MS
+        record_timestamp = OCCURRED_AT_MS + 250
+        at_bound = valid_suppression_record(
+            occurred_at_ms=(
+                OCCURRED_AT_MS
+                + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+            )
+        )
+        over_bound = valid_suppression_record(
+            occurred_at_ms=(
+                OCCURRED_AT_MS
+                + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+                + 1
+            )
+        )
+
+        assert assigner.extract_timestamp(at_bound, record_timestamp) == (
+            OCCURRED_AT_MS
+            + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        )
+        assert assigner.extract_timestamp(over_bound, record_timestamp) == record_timestamp
+        assert json.loads(over_bound)["occurred_at_ms"] == (
+            OCCURRED_AT_MS
+            + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+            + 1
+        )
+
+    def test_the_effective_chat_assignment_keeps_the_future_time_fallback(
+        self, watermark_fakes, topology_fakes
+    ):
+        """The strategy returned by the wiring helper carries the hardened
+        sent_at assigner, rather than an assigner lost on an earlier wrapper."""
+        env, events = topology_fakes
+        settings = spike_detector.SuppressionSourceSettings()
+        clip_detector_job.build_event_time_streams(
+            env, "CHAT_SOURCE", "SUPPRESSION_SOURCE", settings
+        )
+        assigned = next(
+            event[2] for event in events
+            if event[0] == "assign_timestamps_and_watermarks"
+            and event[1] == "CHAT_SOURCE"
+        )
+        assigner = assigned.assigner
+        assert isinstance(assigner, clip_detector_job.SentAtTimestampAssigner)
+        assigner._clock_ms = lambda: OCCURRED_AT_MS
+        max_skew_ms = spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        at_bound = chat_record(sent_at=OCCURRED_AT_MS + max_skew_ms)
+        over_bound = chat_record(sent_at=OCCURRED_AT_MS + max_skew_ms + 1)
+        original_over_bound = over_bound
+        record_timestamp = OCCURRED_AT_MS + 250
+
+        assert assigner.extract_timestamp(at_bound, record_timestamp) == (
+            OCCURRED_AT_MS + max_skew_ms
+        )
+        assert assigner.extract_timestamp(over_bound, record_timestamp) == record_timestamp
+        assert over_bound == original_over_bound
+
+    def test_event_time_comes_from_occurred_at_ms(self):
+        """Twitch's clock, the same one and the same converter chat-messages
+        uses, which is what makes peak_second * 1000 < suppress_until_ms
+        meaningful (contract invariant 2)."""
+        assigner = clip_detector_job.SuppressionTimestampAssigner(
+            clock_ms=lambda: OCCURRED_AT_MS
+        )
+        assert assigner.extract_timestamp(valid_suppression_record(), 999) == OCCURRED_AT_MS
+
+    def test_future_trust_is_enforced_before_the_source_watermark(self):
+        """A rejected far-future value must not poison event time upstream of
+        process_element2, where the normal rejection metric and log occur."""
+        record_timestamp = OCCURRED_AT_MS + 250
+        assigner = clip_detector_job.SuppressionTimestampAssigner(
+            clock_ms=lambda: OCCURRED_AT_MS
+        )
+
+        assert assigner.extract_timestamp(
+            valid_suppression_record(
+                occurred_at_ms=(
+                    OCCURRED_AT_MS
+                    + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+                )
+            ),
+            record_timestamp,
+        ) == (
+            OCCURRED_AT_MS
+            + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        )
+        assert assigner.extract_timestamp(
+            valid_suppression_record(
+                occurred_at_ms=(
+                    OCCURRED_AT_MS
+                    + spike_detector.SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+                    + 1
+                )
+            ),
+            record_timestamp,
+        ) == record_timestamp
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "{not json",
+            valid_suppression_record(occurred_at_ms=OMIT),
+            valid_suppression_record(occurred_at_ms=None),
+        ],
+    )
+    def test_a_record_without_a_usable_time_falls_back_to_the_record_timestamp(self, raw):
+        """Handing None to Flink's timestamp assignment is what the chat
+        assigner already guards against; this one must not be different."""
+        assigner = clip_detector_job.SuppressionTimestampAssigner(
+            clock_ms=lambda: OCCURRED_AT_MS
+        )
+        assert assigner.extract_timestamp(raw, 999) == 999
+
+    def test_both_streams_are_keyed_then_connected_then_processed(self):
+        """D3: a second KafkaSource connected to the keyed chat stream through
+        a KeyedCoProcessFunction, both keyed on the payload broadcaster_id."""
+        log = []
+
+        class FakeStream:
+            def __init__(self, name):
+                self.name = name
+
+            def map(self, fn):
+                log.append(("map", self.name, fn))
+                return FakeStream(self.name + ":mapped")
+
+            def key_by(self, fn):
+                log.append(("key_by", self.name, fn))
+                return FakeStream(self.name + ":keyed")
+
+            def connect(self, other):
+                log.append(("connect", self.name, other.name))
+                return FakeConnected()
+
+        class FakeConnected:
+            def process(self, function):
+                log.append(("process", function))
+                return FakeStream("processed")
+
+        detector = clip_detector_job.AnomalyDetector()
+        clip_detector_job.connect_detector(
+            FakeStream("chat"), FakeStream("suppression"), detector
+        )
+
+        steps = [entry[0] for entry in log]
+        assert steps.count("key_by") == 2
+        assert steps.index("connect") > max(
+            i for i, step in enumerate(steps) if step == "key_by"
+        )
+        assert steps.index("process") > steps.index("connect")
+        assert log[-1][0] == "process" and log[-1][1] is detector
+
+        keys = [entry[2] for entry in log if entry[0] == "map"]
+        assert [fn(chat_record()) for fn in keys[:1]] == [(BROADCASTER, chat_record())]
+        assert keys[1](valid_suppression_record())[0] == BROADCASTER
+
+    def test_the_partition_count_matches_the_jobs_parallelism(self):
+        settings = spike_detector.SuppressionSourceSettings()
+        assert clip_detector_job.FLINK_PARALLELISM == settings.expected_parallelism
+        assert settings.expected_partitions == settings.expected_parallelism
+
+
+class TestSuppressionMetricRegistration:
+    """T042. The label sets are the contract with the dashboards and alerts:
+    only reason/category labels are bounded, and broadcaster attribution is
+    kept because NFR-006 requires it."""
+
+    @pytest.fixture
+    def registered(self, monkeypatch):
+        created = {}
+
+        def fake_counter(name, description, labels):
+            created[name] = ("counter", tuple(labels))
+            return RecordingMetric(name, labels)
+
+        def fake_gauge(name, description, labels):
+            created[name] = ("gauge", tuple(labels))
+            return RecordingMetric(name, labels)
+
+        def fake_histogram(name, description, labels=(), **kwargs):
+            created[name] = ("histogram", tuple(labels))
+            return RecordingMetric(name, labels)
+
+        monkeypatch.setattr(clip_detector_job, "Counter", fake_counter)
+        monkeypatch.setattr(clip_detector_job, "Gauge", fake_gauge)
+        monkeypatch.setattr(clip_detector_job, "Histogram", fake_histogram, raising=False)
+        monkeypatch.setattr(clip_detector_job, "start_http_server", lambda port: None)
+        monkeypatch.setattr(clip_detector_job, "_metrics_initialized", False)
+        clip_detector_job._init_metrics(0)
+        yield created
+        monkeypatch.setattr(clip_detector_job, "_metrics_initialized", False)
+
+    def test_the_suppressed_clip_signal_is_attributable(self, registered):
+        kind, labels = registered["clips_suppressed_total"]
+        assert kind == "counter"
+        assert set(labels) == {"broadcaster_id", "notice_type"}
+
+    def test_the_rejection_reason_label_is_bounded(self, registered):
+        assert registered["suppression_records_rejected_total"][1] == ("reason",)
+        assert spike_detector.SUPPRESSION_REJECT_REASONS == (
+            "decode", "schema_version", "fields"
+        )
+
+    def test_the_delivery_signals(self, registered):
+        assert registered["suppression_records_consumed_total"][1] == ("lag_class",)
+        assert spike_detector.SUPPRESSION_LAG_CLASSES == ("healthy", "lagging")
+        kind, labels = registered["suppression_delivery_age_seconds"]
+        assert kind == "histogram"
+        # No per-channel delivery gauge: during legitimate silence it would
+        # have to invent a value (decision 20, NFR-005).
+        assert labels == ()
+
+    def test_the_existing_anomaly_counter_is_untouched(self, registered):
+        """R8: `anomalies_detected_total` keeps incrementing for a suppressed
+        decision, so AnomalyDetectionStalled keeps its meaning."""
+        assert registered["anomalies_detected_total"] == ("counter", ("broadcaster_id",))

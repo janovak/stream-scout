@@ -102,11 +102,21 @@ services:
     # it. Deploying this requires deleting the live `chat-messages` topic
     # before the next restart so this command creates it fresh at 4;
     # otherwise the config here silently stops matching reality.
+    #
+    # `suppression-events` (Feature 007) carries the gift/raid notices the
+    # clip detector uses to ignore the bursts they cause. 4 partitions for the
+    # same reason as above: it must equal FLINK_PARALLELISM so every source
+    # subtask owns exactly one split and split idleness stays well defined.
+    # 1 h retention because a notice is actionable for at most 180 s -- long
+    # enough to replay for debugging, short enough that the topic is not an
+    # operational log. It carries a notice and never a decision, so retuning a
+    # suppression window never invalidates a retained record.
     command: |
       "
       echo 'Creating Kafka topics...'
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic stream-lifecycle --partitions 10 --replication-factor 1 --config retention.ms=604800000
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic chat-messages --partitions 4 --replication-factor 1 --config retention.ms=3600000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic suppression-events --partitions 4 --replication-factor 1 --config retention.ms=3600000
       echo 'Kafka topics created successfully!'
       kafka-topics --bootstrap-server kafka:29092 --list
       "
@@ -208,6 +218,19 @@ services:
       # removes few real events. The value stays at 30 on purpose. Plan 06
       # keeps it at 30 for now, so that this phase changes one thing only.
       - DETECTION_COOLDOWN_SECONDS=30
+      # Feature 007. The gift and raid suppression windows, in seconds. These
+      # are the SuppressionConfig code defaults, written here as well so the
+      # jobmanager and the taskmanager run the same policy.
+      - SUPPRESSION_GIFT_WINDOW_SECONDS=120
+      - SUPPRESSION_RAID_WINDOW_SECONDS=180
+      # The kill switch, checked in as false even though the SuppressionConfig
+      # code default is true: deploying this feature must change no clip
+      # behaviour. Flip it to true operationally only after E1, E2a, E2b,
+      # and E3 pass.
+      - SUPPRESSION_GATING_ENABLED=false
+      # Reporting threshold only. A record older than this is still applied;
+      # it is counted as lagging and logged.
+      - SUPPRESSION_DELIVERY_LAG_WARN_SECONDS=30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
@@ -363,6 +386,19 @@ services:
       - CLIP_INITIAL_DELAY_SECONDS=0
       - CLIP_CREATE_RETRY_DELAYS=0,2,4
       - CLIP_METADATA_RETRY_DELAYS=5,10,15,30
+      # Feature 007. The gift and raid suppression windows, in seconds. These
+      # are the SuppressionConfig code defaults, written here as well so the
+      # jobmanager and the taskmanager run the same policy.
+      - SUPPRESSION_GIFT_WINDOW_SECONDS=120
+      - SUPPRESSION_RAID_WINDOW_SECONDS=180
+      # The kill switch, checked in as false even though the SuppressionConfig
+      # code default is true: deploying this feature must change no clip
+      # behaviour. Flip it to true operationally only after E1, E2a, E2b,
+      # and E3 pass.
+      - SUPPRESSION_GATING_ENABLED=false
+      # Reporting threshold only. A record older than this is still applied;
+      # it is counted as lagging and logged.
+      - SUPPRESSION_DELIVERY_LAG_WARN_SECONDS=30
     volumes:
       - ./secrets:/opt/flink/secrets:rw
       - ./services/flink-job/clip_detector_job.py:/opt/flink/usrlib/clip_detector_job.py:ro
@@ -397,6 +433,10 @@ services:
       # Scopes this service needs on the token, seeded by
       # seed_twitch_tokens.py REQUIRED_SCOPES:
       #   user:read:chat -- EventSub channel.chat.message (the chat transport)
+      #                     AND channel.chat.notification (the gift/raid
+      #                     notices feature 007 suppresses on). One scope
+      #                     covers both subscription types; feature 007 adds
+      #                     no new scope and nothing reseeds the token.
       #   clips:edit     -- clip creation, shared with the Flink job
       # A token without user:read:chat makes every chat subscription refuse;
       # the service logs that at ERROR on start-up rather than going quiet.
@@ -405,18 +445,37 @@ services:
       - PROMETHEUS_PORT=9100
       - HEALTH_CHECK_PORT=8080
       - LOG_LEVEL=INFO
-      # Monitored channel band. Raised to 800/900 on 2026-08-31 after the
-      # 150/300 point soaked clean for ~1 h post feature-006 merge (all polls
-      # outcome=success, metadata failure streak 0, EventSub converged, no
-      # scheduler skips). Earlier the 2026-08-30 ramp proved ~485 channels safe
-      # (TaskManager RSS flat ~2.6 GB, no ClipCreator pileup, no clip rate
-      # limit). See OPERATIONS.md "Ramping the monitored channel count".
-      - JOIN_THRESHOLD=800
-      - LEAVE_THRESHOLD=900
+      # Feature 007 entry/retention band. New channels enter in the top 400;
+      # incumbents remain through rank 450. Two EventSub subscriptions per
+      # channel make 450 x 2 = 900, the exact 3-session x 300 ceiling, with no
+      # guaranteed free reserve.
+      #
+      # What is checked in below -- and the default when the environment sets
+      # nothing -- is a retention threshold of 400. That is what the FIRST
+      # deploy runs at: 400 x 2 = 800 leaves 100 subscription slots of slack
+      # while dual coverage is still unproven in production.
+      #
+      # The operator ramps retention to the final target only after E1 and E2a
+      # have passed AND an account-wide sweep has removed every foreign
+      # EventSub subscription on this client-id/user-id pair (they are counted
+      # against the same 900, so one left behind makes the ceiling unreachable
+      # arithmetic rather than a bug). The ramp is one explicit environment
+      # variable on this service, LEAVE_THRESHOLD=450, and E2b then runs
+      # against it.
+      #
+      # Entry stays a literal 400 throughout, so a missing override can never
+      # admit more channels than the band allows. The final target for the
+      # band is unchanged: 400 entry, 450 retention.
+      - JOIN_THRESHOLD=400
+      - LEAVE_THRESHOLD=${LEAVE_THRESHOLD:-400}
+      # How long a channel stays degraded_chat_only after Twitch refuses its
+      # notification subscription while chat is live. Bounded rather than
+      # permanent, so one auxiliary 403 cannot cost that channel its chat.
+      - AUXILIARY_REFUSAL_RETRY_SECONDS=3600
       # Pad, as a fraction of LEAVE_THRESHOLD, so channels with clipping
       # disabled don't shrink the candidate pool below LEAVE_THRESHOLD. Measured
       # disabled rate near the top is ~22% and thins with depth; 0.30 keeps
-      # margin at any threshold (270 extra at 900). Raise if the "Fewer than
+      # margin at any threshold (135 extra at 450). Raise if the "Fewer than
       # LEAVE_THRESHOLD" warning fires.
       - CLIPPING_DISABLED_FETCH_PAD_FRACTION=0.30
     volumes:

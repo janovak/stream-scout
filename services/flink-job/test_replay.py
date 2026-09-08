@@ -11,7 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from spike_detector import DetectorConfig
+from spike_detector import (
+    SUPPRESSION_IDLENESS_SECONDS,
+    SUPPRESSION_LAG_HEALTHY,
+    SUPPRESSION_MAX_FUTURE_SKEW_SECONDS,
+    SUPPRESSION_REJECT_FIELDS,
+    DetectorConfig,
+    SuppressionConfig,
+)
 from tools.replay import EventTimeReplayer, WATERMARK_OUT_OF_ORDERNESS_MS, format_evaluation, replay
 
 # A short baseline so fixtures stay a readable length -- the shipped default is
@@ -194,6 +201,145 @@ def steady_then_burst_lines(burst_seconds=(1025, 1026, 1027), quiet=3, loud=80):
     return lines
 
 
+# Feature 007 merged-replay fixtures. Tagged deliveries preserve list order:
+# occurred_at_ms is event time, while delivered_at_ms is the deterministic
+# consumer receipt/processing clock supplied to EventTimeReplayer.run().
+GATING_ON = SuppressionConfig(gating_enabled=True)
+GATING_OFF = SuppressionConfig(gating_enabled=False)
+
+
+def chat_delivery(broadcaster_id, sent_at_ms, text="hi", delivered_at_ms=None):
+    return {
+        "input": "chat",
+        "value": msg(broadcaster_id, sent_at_ms, text=text),
+        "delivered_at_ms": sent_at_ms if delivered_at_ms is None else delivered_at_ms,
+    }
+
+
+def suppression_record(broadcaster_id, notice_type, occurred_at_ms, **optional_fields):
+    payload = {
+        "schema_version": 1,
+        "broadcaster_id": broadcaster_id,
+        "notice_type": notice_type,
+        "occurred_at_ms": occurred_at_ms,
+    }
+    payload.update(optional_fields)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def suppression_delivery(
+    broadcaster_id,
+    notice_type,
+    occurred_at_ms,
+    delivered_at_ms=None,
+    **optional_fields,
+):
+    return {
+        "input": "suppression",
+        "value": suppression_record(
+            broadcaster_id,
+            notice_type,
+            occurred_at_ms,
+            **optional_fields,
+        ),
+        "delivered_at_ms": (
+            occurred_at_ms if delivered_at_ms is None else delivered_at_ms
+        ),
+    }
+
+
+def deterministic_chat_deliveries(
+    broadcaster_id=1,
+    burst_seconds=(1025, 1026, 1027),
+    start_second=1000,
+    end_second=1045,
+    quiet=3,
+    loud=80,
+):
+    """Small synthetic fixture that exercises the detector, not a copy of it."""
+    deliveries = []
+    for second in range(start_second, end_second):
+        count = loud if second in burst_seconds else quiet + second % 2
+        deliveries.extend(
+            chat_delivery(broadcaster_id, second * 1000 + offset)
+            for offset in range(count)
+        )
+    return deliveries
+
+
+def run_merged(deliveries, suppression_config=GATING_ON):
+    replayer = EventTimeReplayer(
+        CONFIG,
+        suppression_config=suppression_config,
+    )
+    return replayer.run(
+        deliveries,
+        consumer_receipt_ms=lambda delivery: delivery["delivered_at_ms"],
+    )
+
+
+def serialized_result(result):
+    return json.dumps(
+        result,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+
+def clip_peak_second(clip):
+    return clip["spike"]["detected_at_seconds"]
+
+
+def trace_for(result, broadcaster_id):
+    return [
+        row
+        for row in result["detector_trace"]
+        if row["broadcaster_id"] == broadcaster_id
+    ]
+
+
+DETECTOR_STATE_TRACE_FIELDS = (
+    "broadcaster_id",
+    "second",
+    "message_counts",
+    "measurement",
+    "hold_before",
+    "hold_after",
+    "expired_buckets",
+    "timer_fired",
+    "timer_registered",
+    "last_fire_second_before",
+    "last_fire_second_after",
+)
+
+
+def assert_detector_state_trace_equal(left, right):
+    """SC-004 comparison: every detector-state surface, output excluded."""
+    left_rows = left["detector_trace"]
+    right_rows = right["detector_trace"]
+    assert len(left_rows) == len(right_rows)
+    for left_row, right_row in zip(left_rows, right_rows):
+        assert left_row["message_counts"] == sorted(left_row["message_counts"])
+        assert right_row["message_counts"] == sorted(right_row["message_counts"])
+        assert left_row["expired_buckets"] == sorted(left_row["expired_buckets"])
+        assert right_row["expired_buckets"] == sorted(right_row["expired_buckets"])
+        assert {
+            field: left_row[field] for field in DETECTOR_STATE_TRACE_FIELDS
+        } == {
+            field: right_row[field] for field in DETECTOR_STATE_TRACE_FIELDS
+        }
+
+
+def insert_before_chat_second(deliveries, second, delivery):
+    insertion = next(
+        index
+        for index, item in enumerate(deliveries)
+        if json.loads(item["value"])["sent_at"] // 1000 >= second
+    )
+    return deliveries[:insertion] + [delivery] + deliveries[insertion:], insertion
+
+
 def test_hold_persists_across_seconds_and_emits_the_peak():
     """The harness must carry the hold between evaluations, as
     AnomalyDetector carries it in ValueState -- otherwise every elevated
@@ -260,6 +406,549 @@ def test_replay_is_deterministic_on_repeat():
     run1 = [(e.broadcaster_id, e.second, e.emit) for e in replay(lines, CONFIG)]
     run2 = [(e.broadcaster_id, e.second, e.emit) for e in replay(lines, CONFIG)]
     assert run1 == run2
+
+
+class TestMergedSuppressionReplay:
+    def test_late_notice_does_not_retract_but_gates_a_later_active_peak(self):
+        chat = deterministic_chat_deliveries(
+            burst_seconds=(1025, 1026, 1027, 1075, 1076, 1077),
+            end_second=1095,
+        )
+        chat_only = run_merged(chat)
+        assert len(chat_only["clips"]) == 2
+        first_clip, later_clip = chat_only["clips"]
+        first_peak = clip_peak_second(first_clip)
+        later_peak = clip_peak_second(later_clip)
+
+        # Insert after the delivery that emitted the first clip. Although the
+        # notice's occurred_at predates that clip, delivery order is decisive:
+        # output already emitted is immutable. Its still-live deadline can
+        # gate the later episode.
+        insertion = first_clip["delivery_index"] + 1
+        assert insertion < later_clip["delivery_index"]
+        receipt_ms = chat[insertion - 1]["delivered_at_ms"]
+        late_notice = suppression_delivery(
+            1,
+            "community_sub_gift",
+            first_peak * 1000,
+            delivered_at_ms=receipt_ms,
+        )
+        merged = chat[:insertion] + [late_notice] + chat[insertion:]
+
+        gated = run_merged(merged)
+
+        assert [clip_peak_second(clip) for clip in gated["clips"]] == [first_peak]
+        assert first_peak < later_peak < first_peak + GATING_ON.gift_window_seconds
+        assert len(gated["suppression_metrics"]) == 1
+        assert gated["suppression_metrics"][0]["peak_second"] == later_peak
+        assert len(gated["suppression_logs"]) == 1
+        assert gated["suppression_logs"][0]["peak_second"] == later_peak
+        assert gated["suppression_transitions"][0]["delivery_index"] == insertion
+
+    def test_notice_state_and_output_are_isolated_by_broadcaster(self):
+        one_channel = deterministic_chat_deliveries()
+        probe = run_merged(one_channel)
+        assert len(probe["clips"]) == 1
+        peak = clip_peak_second(probe["clips"][0])
+
+        channel_a = deterministic_chat_deliveries(broadcaster_id=101)
+        channel_b = deterministic_chat_deliveries(broadcaster_id=202)
+        chat = sorted(
+            channel_a + channel_b,
+            key=lambda delivery: (
+                delivery["delivered_at_ms"],
+                json.loads(delivery["value"])["broadcaster_id"],
+            ),
+        )
+        notice = suppression_delivery(
+            101,
+            "raid",
+            peak * 1000,
+            delivered_at_ms=peak * 1000,
+        )
+        merged, _ = insert_before_chat_second(chat, peak, notice)
+
+        gated = run_merged(merged)
+
+        assert [clip["broadcaster_id"] for clip in gated["clips"]] == [202]
+        assert gated["suppression_metrics"] == [
+            {
+                "broadcaster_id": 101,
+                "notice_type": "raid",
+                "peak_second": peak,
+            }
+        ]
+        assert {row["broadcaster_id"] for row in gated["suppression_transitions"]} == {
+            101
+        }
+        assert trace_for(gated, 101)
+        assert trace_for(gated, 202)
+
+    def test_version_one_future_trust_boundary_uses_injected_receipt_clock(self):
+        receipt_ms = 2_000_000
+        exact = receipt_ms + SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        over = exact + 1
+        deliveries = [
+            suppression_delivery(
+                11,
+                "sub_gift",
+                exact,
+                delivered_at_ms=receipt_ms,
+                notice_id="accepted-at-boundary",
+            ),
+            suppression_delivery(
+                22,
+                "raid",
+                over,
+                delivered_at_ms=receipt_ms,
+                viewer_count=500,
+            ),
+        ]
+
+        result = run_merged(deliveries)
+
+        assert len(result["suppression_transitions"]) == 1
+        accepted = result["suppression_transitions"][0]
+        assert accepted["broadcaster_id"] == 11
+        assert accepted["state_after"] == {
+            "suppress_from_ms": exact,
+            "suppress_until_ms": exact + GATING_ON.gift_window_seconds * 1000,
+            "notice_type": "sub_gift",
+            "notice_at_ms": exact,
+        }
+        assert result["delivery_observations"] == [
+            {
+                "delivery_index": 0,
+                "delivery_age_ms": 0,
+                "lag_class": SUPPRESSION_LAG_HEALTHY,
+                "clock_skew": True,
+            }
+        ]
+        assert result["suppression_rejections"] == [
+            {
+                "delivery_index": 1,
+                "reason": SUPPRESSION_REJECT_FIELDS,
+            }
+        ]
+        assert all(
+            transition["broadcaster_id"] != 22
+            for transition in result["suppression_transitions"]
+        )
+        assert all(
+            observation["delivery_index"] != 1
+            for observation in result["delivery_observations"]
+        )
+
+    def test_rejected_future_time_cannot_advance_the_source_watermark(self):
+        receipt_ms = 2_000_000
+        poisoned = receipt_ms + (
+            SUPPRESSION_MAX_FUTURE_SKEW_SECONDS * 1000
+        ) + 1
+        result = run_merged(
+            [
+                suppression_delivery(
+                    22,
+                    "raid",
+                    poisoned,
+                    delivered_at_ms=receipt_ms,
+                )
+            ]
+        )
+
+        assert result["suppression_rejections"] == [
+            {"delivery_index": 0, "reason": SUPPRESSION_REJECT_FIELDS}
+        ]
+        assert result["watermark_trace"][0]["suppression_watermark_ms"] == (
+            receipt_ms - WATERMARK_OUT_OF_ORDERNESS_MS - 1
+        )
+
+
+class TestOutputOnlySuppressionReplay:
+    def test_gated_and_ungated_runs_have_identical_detector_state(self):
+        chat = deterministic_chat_deliveries(
+            burst_seconds=(1025, 1026, 1027, 1075, 1076, 1077),
+            end_second=1095,
+        )
+        probe = run_merged(chat)
+        assert len(probe["clips"]) == 2
+        first_clip, covered_clip = probe["clips"]
+        pre_notice_peak = clip_peak_second(first_clip)
+        covered_peak = clip_peak_second(covered_clip)
+
+        # The first episode peaks before this notice but reports after it.
+        # The same interval remains live for the second episode.
+        notice_second = pre_notice_peak + 1
+        assert notice_second < first_clip["report_second"]
+        notice = suppression_delivery(
+            1,
+            "community_sub_gift",
+            notice_second * 1000,
+            delivered_at_ms=notice_second * 1000,
+        )
+        merged, insertion = insert_before_chat_second(chat, notice_second, notice)
+        assert insertion < first_clip["delivery_index"]
+
+        ungated = run_merged(merged, GATING_OFF)
+        gated = run_merged(merged, GATING_ON)
+
+        assert_detector_state_trace_equal(ungated, gated)
+        assert ungated["suppression_transitions"] == gated["suppression_transitions"]
+        assert ungated["delivery_observations"] == gated["delivery_observations"]
+        assert ungated["suppression_rejections"] == gated["suppression_rejections"]
+        assert ungated["watermark_trace"] == gated["watermark_trace"]
+
+        assert [clip_peak_second(clip) for clip in ungated["clips"]] == [
+            pre_notice_peak,
+            covered_peak,
+        ]
+        assert [clip_peak_second(clip) for clip in gated["clips"]] == [
+            pre_notice_peak
+        ]
+        assert ungated["suppression_metrics"] == []
+        assert ungated["suppression_logs"] == []
+        assert gated["suppression_metrics"] == [
+            {
+                "broadcaster_id": 1,
+                "notice_type": "community_sub_gift",
+                "peak_second": covered_peak,
+            }
+        ]
+        assert len(gated["suppression_logs"]) == 1
+        assert gated["suppression_logs"][0] == {
+            "event": "clip_suppressed",
+            "broadcaster_id": 1,
+            "notice_type": "community_sub_gift",
+            "peak_second": covered_peak,
+        }
+
+        # These explicit projections make SC-004's state claim visible even
+        # if the result later gains unrelated diagnostic fields.
+        assert [
+            row["measurement"] for row in trace_for(ungated, 1)
+        ] == [row["measurement"] for row in trace_for(gated, 1)]
+        assert [
+            (row["hold_before"], row["hold_after"])
+            for row in trace_for(ungated, 1)
+        ] == [
+            (row["hold_before"], row["hold_after"])
+            for row in trace_for(gated, 1)
+        ]
+        assert [
+            (row["timer_fired"], row["timer_registered"])
+            for row in trace_for(ungated, 1)
+        ] == [
+            (row["timer_fired"], row["timer_registered"])
+            for row in trace_for(gated, 1)
+        ]
+        assert [
+            (
+                row["last_fire_second_before"],
+                row["last_fire_second_after"],
+            )
+            for row in trace_for(ungated, 1)
+        ] == [
+            (
+                row["last_fire_second_before"],
+                row["last_fire_second_after"],
+            )
+            for row in trace_for(gated, 1)
+        ]
+
+    def test_legacy_unsuppressed_human_readable_output_is_unchanged(self):
+        evaluations = list(replay(steady_then_burst_lines(), CONFIG))
+        fired = [evaluation for evaluation in evaluations if evaluation.emit is not None]
+        assert len(fired) == 1
+        evaluation = fired[0]
+        spike = evaluation.emit
+        assert format_evaluation(evaluation) == (
+            f"{evaluation.second} {evaluation.broadcaster_id} SPIKE "
+            f"peak_at={spike.detected_at_seconds} "
+            f"count={spike.message_count} mean={spike.baseline_mean:.4f} "
+            f"std={spike.baseline_std:.4f} intensity={spike.intensity:.4f}"
+        )
+
+
+class TestSuppressionIntervalReplay:
+    def test_peak_boundaries_and_fail_open_paths_use_peak_time(self):
+        chat = deterministic_chat_deliveries()
+        probe = run_merged(chat)
+        assert len(probe["clips"]) == 1
+        control_clip = probe["clips"][0]
+        peak = clip_peak_second(control_clip)
+
+        at_start, _ = insert_before_chat_second(
+            chat,
+            peak,
+            suppression_delivery(
+                1,
+                "community_sub_gift",
+                peak * 1000,
+                delivered_at_ms=peak * 1000,
+            ),
+        )
+        at_deadline, _ = insert_before_chat_second(
+            chat,
+            peak,
+            suppression_delivery(
+                1,
+                "community_sub_gift",
+                (peak - GATING_ON.gift_window_seconds) * 1000,
+                delivered_at_ms=peak * 1000,
+            ),
+        )
+        after_peak_second = peak + 1
+        pre_notice, _ = insert_before_chat_second(
+            chat,
+            after_peak_second,
+            suppression_delivery(
+                1,
+                "raid",
+                after_peak_second * 1000,
+                delivered_at_ms=after_peak_second * 1000,
+            ),
+        )
+
+        absent = run_merged(chat)
+        inactive = run_merged(at_start, GATING_OFF)
+        exact_start = run_merged(at_start)
+        exact_deadline = run_merged(at_deadline)
+        pre_notice_result = run_merged(pre_notice)
+
+        assert [clip_peak_second(clip) for clip in absent["clips"]] == [peak]
+        assert [clip_peak_second(clip) for clip in inactive["clips"]] == [peak]
+        assert exact_start["clips"] == []
+        assert [clip_peak_second(clip) for clip in exact_deadline["clips"]] == [
+            peak
+        ]
+        assert [
+            clip_peak_second(clip) for clip in pre_notice_result["clips"]
+        ] == [peak]
+        assert pre_notice_result["clips"][0]["report_second"] > after_peak_second
+        assert len(exact_start["suppression_metrics"]) == 1
+        assert exact_deadline["suppression_metrics"] == []
+        assert pre_notice_result["suppression_metrics"] == []
+
+    def test_overlap_extension_new_intervals_and_noops_are_exact(self):
+        config = SuppressionConfig(
+            gift_window_seconds=10,
+            raid_window_seconds=20,
+            gating_enabled=True,
+        )
+        deliveries = [
+            suppression_delivery(7, "sub_gift", 100_000, delivered_at_ms=200_000),
+            suppression_delivery(7, "sub_gift", 100_000, delivered_at_ms=200_001),
+            suppression_delivery(7, "sub_gift", 99_000, delivered_at_ms=200_002),
+            suppression_delivery(7, "sub_gift", 105_000, delivered_at_ms=200_003),
+            suppression_delivery(7, "raid", 106_000, delivered_at_ms=200_004),
+            suppression_delivery(7, "sub_gift", 126_000, delivered_at_ms=200_005),
+            suppression_delivery(8, "sub_gift", 100_000, delivered_at_ms=200_006),
+            suppression_delivery(8, "sub_gift", 111_000, delivered_at_ms=200_007),
+        ]
+
+        result = run_merged(deliveries, config)
+        channel_7 = [
+            transition
+            for transition in result["suppression_transitions"]
+            if transition["broadcaster_id"] == 7
+        ]
+        channel_8 = [
+            transition
+            for transition in result["suppression_transitions"]
+            if transition["broadcaster_id"] == 8
+        ]
+
+        assert channel_7[0]["state_after"] == {
+            "suppress_from_ms": 100_000,
+            "suppress_until_ms": 110_000,
+            "notice_type": "sub_gift",
+            "notice_at_ms": 100_000,
+        }
+        for transition in channel_7[1:3]:
+            assert transition["state_changed"] is False
+            assert transition["state_after"] == channel_7[0]["state_after"]
+        assert channel_7[3]["state_after"] == {
+            "suppress_from_ms": 100_000,
+            "suppress_until_ms": 115_000,
+            "notice_type": "sub_gift",
+            "notice_at_ms": 105_000,
+        }
+        assert channel_7[4]["state_after"] == {
+            "suppress_from_ms": 100_000,
+            "suppress_until_ms": 126_000,
+            "notice_type": "raid",
+            "notice_at_ms": 106_000,
+        }
+        assert channel_7[5]["state_after"] == {
+            "suppress_from_ms": 126_000,
+            "suppress_until_ms": 136_000,
+            "notice_type": "sub_gift",
+            "notice_at_ms": 126_000,
+        }
+        assert channel_8[-1]["state_before"]["suppress_until_ms"] == 110_000
+        assert channel_8[-1]["state_after"] == {
+            "suppress_from_ms": 111_000,
+            "suppress_until_ms": 121_000,
+            "notice_type": "sub_gift",
+            "notice_at_ms": 111_000,
+        }
+
+
+class TestSimplifiedSparseSuppressionWatermark:
+    """Offline scalar model only; these tests are not PyFlink runtime evidence."""
+
+    def test_silent_suppression_input_preserves_chat_timer_seconds(self):
+        chat = deterministic_chat_deliveries()
+        legacy = list(replay([delivery["value"] for delivery in chat], CONFIG))
+        merged = run_merged(chat)
+
+        assert [
+            (row["broadcaster_id"], row["timer_fired"])
+            for row in merged["detector_trace"]
+        ] == [
+            (evaluation.broadcaster_id, evaluation.second)
+            for evaluation in legacy
+        ]
+        assert all(
+            row["suppression_idle"] is True
+            and row["combined_watermark_ms"] == row["chat_watermark_ms"]
+            for row in merged["watermark_trace"]
+        )
+        assert merged["suppression_transitions"] == []
+        assert merged["delivery_observations"] == []
+
+    def test_isolated_notice_hold_is_bounded_then_chat_progresses(self):
+        deliveries = [
+            chat_delivery(1, second * 1000)
+            for second in range(1000, 1036)
+        ]
+        notice_second = 1020
+        notice = suppression_delivery(
+            1,
+            "raid",
+            notice_second * 1000,
+            delivered_at_ms=notice_second * 1000,
+        )
+        merged, notice_index = insert_before_chat_second(
+            deliveries,
+            notice_second,
+            notice,
+        )
+
+        result = run_merged(merged)
+        notice_row = next(
+            row
+            for row in result["watermark_trace"]
+            if row["delivery_index"] == notice_index
+        )
+        released_row = next(
+            row
+            for row in result["watermark_trace"]
+            if row["delivery_index"] > notice_index
+            and row["suppression_idle"] is True
+        )
+        active_hold_rows = [
+            row
+            for row in result["watermark_trace"]
+            if notice_index <= row["delivery_index"] < released_row["delivery_index"]
+            and row["suppression_idle"] is False
+            and row["chat_watermark_ms"] > row["suppression_watermark_ms"]
+        ]
+
+        assert notice_row["input"] == "suppression"
+        assert notice_row["suppression_idle"] is False
+        assert active_hold_rows
+        assert all(
+            row["combined_watermark_ms"] == row["suppression_watermark_ms"]
+            for row in active_hold_rows
+        )
+        assert all(
+            row["processing_time_ms"] - notice_row["processing_time_ms"]
+            < SUPPRESSION_IDLENESS_SECONDS * 1000
+            for row in result["watermark_trace"]
+            if row["delivery_index"] > notice_index
+            and row["delivery_index"] < released_row["delivery_index"]
+            and row["suppression_idle"] is False
+        )
+        assert (
+            released_row["processing_time_ms"] - notice_row["processing_time_ms"]
+            >= SUPPRESSION_IDLENESS_SECONDS * 1000
+        )
+        assert released_row["combined_watermark_ms"] == released_row[
+            "chat_watermark_ms"
+        ]
+        assert max(
+            row["timer_fired"] for row in result["detector_trace"]
+        ) > notice_second
+
+    def test_sustained_notice_traffic_advances_suppression_watermark(self):
+        deliveries = []
+        for second in range(1000, 1021):
+            deliveries.append(chat_delivery(1, second * 1000))
+            if second % 2 == 0:
+                deliveries.append(
+                    suppression_delivery(
+                        1,
+                        "sub_gift",
+                        second * 1000,
+                        delivered_at_ms=second * 1000,
+                    )
+                )
+
+        result = run_merged(deliveries)
+        notice_rows = [
+            row
+            for row in result["watermark_trace"]
+            if row["input"] == "suppression"
+        ]
+        first_notice_index = notice_rows[0]["delivery_index"]
+        chat_rows_after_first_notice = [
+            row
+            for row in result["watermark_trace"]
+            if row["input"] == "chat"
+            and row["delivery_index"] > first_notice_index
+        ]
+        suppression_watermarks = [
+            row["suppression_watermark_ms"] for row in notice_rows
+        ]
+        combined_watermarks = [
+            row["combined_watermark_ms"] for row in result["watermark_trace"]
+            if row["combined_watermark_ms"] is not None
+        ]
+
+        assert len(notice_rows) > 2
+        assert chat_rows_after_first_notice
+        assert all(
+            row["suppression_idle"] is False
+            for row in chat_rows_after_first_notice
+        )
+        assert suppression_watermarks == sorted(suppression_watermarks)
+        assert len(set(suppression_watermarks)) == len(suppression_watermarks)
+        assert combined_watermarks == sorted(combined_watermarks)
+        assert notice_rows[-1]["combined_watermark_ms"] > notice_rows[0][
+            "combined_watermark_ms"
+        ]
+
+
+class TestMergedReplayDeterminism:
+    def test_identical_merged_input_has_byte_identical_structured_result(self):
+        chat = deterministic_chat_deliveries(
+            burst_seconds=(1025, 1026, 1027),
+            end_second=1050,
+        )
+        notice = suppression_delivery(
+            1,
+            "raid",
+            1025 * 1000,
+            delivered_at_ms=1025 * 1000,
+            notice_id="deterministic-notice",
+            viewer_count=123,
+        )
+        merged, _ = insert_before_chat_second(chat, 1025, notice)
+
+        first = serialized_result(run_merged(merged))
+        second = serialized_result(run_merged(merged))
+
+        assert first == second
 
 
 @pytest.mark.skipif(not DEV_SLICE.exists(), reason="corpus/dev-slice.jsonl not cut locally (gitignored)")
