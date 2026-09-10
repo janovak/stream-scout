@@ -686,6 +686,7 @@ SUPPRESSION_METRIC_GLOBALS = {
     "_suppression_records_consumed_total": "suppression_records_consumed_total",
     "_suppression_delivery_age_seconds": "suppression_delivery_age_seconds",
     "_hold_regressed_total": "hold_regressed_total",
+    "_anomaly_min_lift_candidates_total": "anomaly_min_lift_candidates_total",
 }
 
 
@@ -854,6 +855,54 @@ class TestOperatorShape:
         ctx = FakeContext(key=BROADCASTER, timestamp=OCCURRED_AT_MS)
         detector.process_element1((BROADCASTER, chat_record()), ctx)
         assert store.for_key(BROADCASTER)["suppression"].writes == []
+
+    @pytest.mark.parametrize(
+        ("enabled", "mode"),
+        [(False, "shadow"), (True, "enforced")],
+    )
+    def test_a_minimum_lift_candidate_is_logged_and_counted(
+        self, enabled, mode, monkeypatch, metrics, store, caplog
+    ):
+        measurement = spike_detector.Spike(
+            message_count=1,
+            baseline_mean=0.01,
+            baseline_std=0.01,
+            intensity=19.0,
+            detected_at_seconds=OCCURRED_AT_MS // 1000,
+        )
+        decision = spike_detector.Decision(
+            emit=None,
+            hold=None,
+            expired_buckets=[],
+            measurement=measurement,
+            observed_seconds=300,
+            min_lift_candidate=True,
+            min_lift_would_open=True,
+        )
+        stub_evaluate(monkeypatch, decision)
+        detector = make_detector(
+            config=spike_detector.DetectorConfig(
+                min_excess_gating_enabled=enabled
+            )
+        )
+
+        with caplog.at_level(logging.INFO, logger="clip_detector"):
+            emitted, _ = fire_timer(detector, store, OCCURRED_AT_MS)
+
+        assert emitted == []
+        assert metrics["anomaly_min_lift_candidates_total"].increments == [{
+            "broadcaster_id": str(BROADCASTER),
+            "mode": mode,
+        }]
+        message = next(
+            record.getMessage()
+            for record in caplog.records
+            if "MINIMUM LIFT CANDIDATE" in record.getMessage()
+        )
+        assert f"mode={mode}" in message
+        assert "would_open=true" in message
+        assert "count=1" in message
+        assert "required=2.000" in message
 
     def test_open_registers_the_suppression_state_under_the_same_ttl(self, monkeypatch):
         """T043. The suppression state is JSON in a Types.STRING() ValueState
@@ -2063,6 +2112,13 @@ class TestSuppressionMetricRegistration:
         kind, labels = registered["clips_suppressed_total"]
         assert kind == "counter"
         assert set(labels) == {"broadcaster_id", "notice_type"}
+
+    def test_the_minimum_lift_signal_has_bounded_mode_and_channel_attribution(
+        self, registered
+    ):
+        kind, labels = registered["anomaly_min_lift_candidates_total"]
+        assert kind == "counter"
+        assert labels == ("broadcaster_id", "mode")
 
     def test_the_rejection_reason_label_is_bounded(self, registered):
         assert registered["suppression_records_rejected_total"][1] == ("reason",)

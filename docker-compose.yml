@@ -191,6 +191,13 @@ services:
       # 9.0 is the 99.99th percentile. That default filter thus hides almost
       # every clip. Phase 6 must correct it.
       - DETECTION_STD_DEV_THRESHOLD=4.0
+      # Feature 008. A reading must exceed the five-second baseline expectation
+      # by at least two messages as well as clearing the z-score trigger. The
+      # first production deployment is shadow-only: it publishes
+      # anomaly_min_lift_candidates_total and logs candidates without changing
+      # clip decisions. Set gating to true after the P1 checks in OPERATIONS.md.
+      - DETECTION_MIN_EXCESS_MESSAGES=2.0
+      - DETECTION_MIN_EXCESS_GATING_ENABLED=false
       # The maximum length of one elevated period, before the detector reports
       # a result. Plan 06 Phase 4 step 19 measured real periods with no cap.
       # The median is 2 seconds, the 99th percentile is 14, and the longest in
@@ -345,6 +352,10 @@ services:
       # 9.0 is the 99.99th percentile. That default filter thus hides almost
       # every clip. Phase 6 must correct it.
       - DETECTION_STD_DEV_THRESHOLD=4.0
+      # Feature 008. Keep these values identical to the JobManager block. The
+      # checked-in false value makes the initial deployment shadow-only.
+      - DETECTION_MIN_EXCESS_MESSAGES=2.0
+      - DETECTION_MIN_EXCESS_GATING_ENABLED=false
       # The maximum length of one elevated period, before the detector reports
       # a result. Plan 06 Phase 4 step 19 measured real periods with no cap.
       # The median is 2 seconds, the 99th percentile is 14, and the longest in

@@ -150,6 +150,7 @@ def main():
             # parser accepts. Nothing downstream reads this field; it is here
             # so a reader can see that the trigger was off.
             "k": "disabled" if math.isinf(config.k) else config.k,
+            "min_excess_messages": config.min_excess_messages,
             "min_baseline_fraction": config.min_baseline_fraction,
             "min_observed_seconds": min_observed_seconds,
         }) + "\n")
