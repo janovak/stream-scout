@@ -3,11 +3,11 @@
 Change a tools/measure_corpus.py dump into the Plan 06 Phase 4 tables.
 
 Steps 18 to 22 read the same per-second dump. `intensity` does not depend on
-`k`, `hold_cap_seconds` or `cooldown_seconds`. Those three fields control
-what the state machine does with a reading. They do not control the reading.
-This tool thus measures the cost of each candidate value. It runs the state
-machine again over the recorded readings. It does not replay 635 MB of chat
-one more time.
+`k`, `min_excess_messages`, `hold_cap_seconds` or `cooldown_seconds`. Those
+four fields control what the state machine does with a reading. They do not
+control the reading. This tool thus measures the cost of each candidate value.
+It runs the state machine again over the recorded readings. It does not replay
+635 MB of chat one more time.
 
 The state machine here is `reconstruct`. It agrees with the hold, cooldown
 and cap branches of spike_detector.evaluate(). But it is a second copy of
@@ -30,6 +30,10 @@ import sys
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from spike_detector import DetectorConfig  # noqa: E402
 
 OK, WARMUP, FLAT = 0, 1, 2
 STATUS_CODES = {"ok": OK, "warmup": WARMUP, "flat": FLAT}
@@ -156,6 +160,17 @@ def heading(text):
     print(f"\n## {text}\n")
 
 
+def is_elevated(readings, series, index, k):
+    """The two production gates for one measured reading."""
+    excess_messages = (
+        series.count[index] - series.mean[index] * readings.window_seconds
+    )
+    return (
+        series.intensity[index] >= k
+        and excess_messages >= readings.config["min_excess_messages"]
+    )
+
+
 # --------------------------------------------------------------------------
 # the detector's state machine, replayed over recorded readings
 
@@ -228,7 +243,7 @@ def reconstruct(readings, k, cap, cooldown, gate):
                 continue  # unmeasurable: the hold is kept, untouched
 
             intensity = series.intensity[i]
-            elevated = intensity >= k
+            elevated = is_elevated(readings, series, i, k)
 
             if hold is None:
                 if not elevated:
@@ -268,7 +283,7 @@ def elevated_runs(readings, k, gate):
         for i in range(len(series)):
             second = series.second[i]
             measurable = series.status[i] == OK and series.observed[i] >= gate
-            elevated = measurable and series.intensity[i] >= k
+            elevated = measurable and is_elevated(readings, series, i, k)
             contiguous = previous_second is not None and second == previous_second + 1
             if elevated and start is not None and contiguous:
                 if series.intensity[i] > peak:
@@ -439,7 +454,7 @@ def step_19(readings, k, cooldown, gate, caps):
             while i is not None and i < len(series) and series.second[i] == second:
                 if series.status[i] != OK or series.observed[i] < gate:
                     break
-                if series.intensity[i] < k:
+                if not is_elevated(readings, series, i, k):
                     break
                 best = max(best, series.intensity[i])
                 i += 1
@@ -638,15 +653,28 @@ def step_21(readings, k, cap, cooldown, gate, offsets):
                 in_run = dict.fromkeys(names, False)
                 continue
             window_mean = series.count[i] / readings.window_seconds
-            missed = series.intensity[i] < k
+            current_minimum_lift_met = (
+                series.count[i] - series.mean[i] * readings.window_seconds
+                >= readings.config["min_excess_messages"]
+            )
+            missed = not is_elevated(readings, series, i, k)
             scaled_std = episode.start_std * (series.mean[i] / episode.start_mean)
             candidates = {
                 "frozen": (window_mean - episode.start_mean) / episode.start_std,
                 "spread": (window_mean - series.mean[i]) / episode.start_std,
                 "excess": (window_mean - series.mean[i]) / scaled_std,
             }
+            minimum_lifts = {
+                "frozen": (
+                    series.count[i]
+                    - episode.start_mean * readings.window_seconds
+                    >= readings.config["min_excess_messages"]
+                ),
+                "spread": current_minimum_lift_met,
+                "excess": current_minimum_lift_met,
+            }
             for name, value in candidates.items():
-                swallowed = missed and value >= k
+                swallowed = missed and minimum_lifts[name] and value >= k
                 if swallowed:
                     counts[name][1] += 1
                     if not in_run[name]:
@@ -752,7 +780,7 @@ def step_22(readings, k, cap, cooldown, reference_fraction, fractions):
 # --verify: the reconstruction against the real detector
 
 
-def verify(readings_path, corpus, k, cap, cooldown, fraction):
+def verify(readings_path, corpus, k, min_excess_messages, cap, cooldown, fraction):
     """Replay `corpus` through the real detector and diff against reconstruct().
 
     reconstruct() is a second implementation of evaluate()'s state machine.
@@ -779,6 +807,7 @@ def verify(readings_path, corpus, k, cap, cooldown, fraction):
             cwd=flink_job, check=True, capture_output=True, text=True,
         )
         readings = load(dump)
+        readings.config["min_excess_messages"] = min_excess_messages
     finally:
         dump.unlink(missing_ok=True)
     expected = reconstruct(readings, k, cap, cooldown,
@@ -788,6 +817,8 @@ def verify(readings_path, corpus, k, cap, cooldown, fraction):
         "DETECTION_WINDOW_SECONDS": str(window_seconds),
         "DETECTION_BASELINE_SECONDS": str(baseline_seconds),
         "DETECTION_STD_DEV_THRESHOLD": str(k),
+        "DETECTION_MIN_EXCESS_MESSAGES": str(min_excess_messages),
+        "DETECTION_MIN_EXCESS_GATING_ENABLED": "true",
         "DETECTION_HOLD_CAP_SECONDS": str(cap),
         "DETECTION_COOLDOWN_SECONDS": str(cooldown),
         "DETECTION_MIN_BASELINE_FRACTION": str(fraction),
@@ -853,6 +884,13 @@ def parse_args():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("readings", help="TSV from tools/measure_corpus.py")
     parser.add_argument("--k", type=float, default=4.0)
+    parser.add_argument(
+        "--min-excess-messages",
+        type=float,
+        default=DetectorConfig.min_excess_messages,
+        help="Minimum window messages above the baseline expectation. Use 0 "
+             "to reproduce the pre-Feature-008 Plan 06 tables.",
+    )
     parser.add_argument("--cap", type=int, default=25)
     parser.add_argument("--cooldown", type=int, default=30)
     parser.add_argument("--min-baseline-fraction", type=float, default=0.8)
@@ -866,10 +904,18 @@ def parse_args():
 def main():
     args = parse_args()
     if args.verify:
-        sys.exit(verify(args.readings, args.verify, args.k, args.cap,
-                        args.cooldown, args.min_baseline_fraction))
+        sys.exit(verify(
+            args.readings,
+            args.verify,
+            args.k,
+            args.min_excess_messages,
+            args.cap,
+            args.cooldown,
+            args.min_baseline_fraction,
+        ))
 
     readings = load(args.readings)
+    readings.config["min_excess_messages"] = args.min_excess_messages
     gate = int(readings.baseline_seconds * args.min_baseline_fraction)
 
     # A dump only holds readings for the seconds its own gate admitted. Asking

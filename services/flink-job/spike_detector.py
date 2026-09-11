@@ -17,6 +17,10 @@ Plan 06 Phase 3 changed the arithmetic. These are the changes:
     offset of approximately 5 x (mean / std) under every result. Flat chat
     scored 7 to 17 on a scale whose trigger was 5. Steady chat also scored
     higher than bursty chat.
+  - A second minimum-lift gate prevents a tiny baseline standard deviation
+    from turning trivial absolute activity into a clip. A reading must clear
+    both the z-score trigger and the configured excess-message threshold.
+    Shadow mode measures that gate without changing detector output.
   - The detector holds through an elevated period. It reports the highest
     value in that period. Before, it reported the first value that crossed
     the trigger. That value was always `k + a small amount`.
@@ -172,6 +176,27 @@ MAX_WATERMARK = 9223372036854775807
 # and tools/replay.py share it, so the harness sees what the operator sees.
 COMMAND_PATTERN = re.compile(r"^![a-zA-Z0-9]+")
 
+# Boolean environment values are strict. An invalid kill switch must stop
+# startup rather than silently invert the operator's belief about whether
+# output is being gated.
+_TRUE_SPELLINGS = ("true", "1", "yes", "on")
+_FALSE_SPELLINGS = ("false", "0", "no", "off")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _TRUE_SPELLINGS:
+        return True
+    if normalized in _FALSE_SPELLINGS:
+        return False
+    raise ValueError(
+        f"{name} must be one of {_TRUE_SPELLINGS + _FALSE_SPELLINGS}, "
+        f"got {raw!r}"
+    )
+
 
 def is_command(text: str) -> bool:
     return bool(COMMAND_PATTERN.match(text))
@@ -267,6 +292,18 @@ class DetectorConfig:
     # the formula that Phase 3 deleted. It had no meaning on this scale.
     k: float = 4.0
 
+    # A z-score alone is unstable as a product signal when baseline_std is
+    # tiny: trivial absolute activity can still look statistically extreme.
+    # Require the five-second window to exceed its baseline expectation by at
+    # least two messages as well. This is an eligibility gate, not a change to
+    # intensity; stored and displayed intensity keeps its existing meaning.
+    min_excess_messages: float = 2.0
+
+    # True in code and docker-compose.yml: the minimum-lift policy ships
+    # enforced. Operators can set it false temporarily for shadow validation
+    # or rollback without changing the threshold.
+    min_excess_gating_enabled: bool = True
+
     # The maximum length of one elevated period, before the detector reports a
     # result. Plan 06 Phase 4 step 19 measured real periods on the corpus with
     # no cap. The median period lasts 2 seconds. The 99th percentile is 14
@@ -340,6 +377,21 @@ class DetectorConfig:
             raise ValueError(f"hold_cap_seconds must be >= 0, got {self.hold_cap_seconds}")
         if self.cooldown_seconds < 0:
             raise ValueError(f"cooldown_seconds must be >= 0, got {self.cooldown_seconds}")
+        if (
+            isinstance(self.min_excess_messages, bool)
+            or not isinstance(self.min_excess_messages, (int, float))
+            or not math.isfinite(self.min_excess_messages)
+            or self.min_excess_messages < 0
+        ):
+            raise ValueError(
+                f"min_excess_messages must be a finite number >= 0, got "
+                f"{self.min_excess_messages!r}"
+            )
+        if not isinstance(self.min_excess_gating_enabled, bool):
+            raise ValueError(
+                f"min_excess_gating_enabled must be a bool, got "
+                f"{self.min_excess_gating_enabled!r}"
+            )
         # The range excludes 1.0, and not only the values above it.
         # observed_seconds reaches the full baseline only when a message is in
         # the single oldest baseline second. 1.0 thus stops the measurement of
@@ -376,6 +428,13 @@ class DetectorConfig:
             window_seconds=int(os.getenv("DETECTION_WINDOW_SECONDS", cls.window_seconds)),
             baseline_seconds=int(os.getenv("DETECTION_BASELINE_SECONDS", cls.baseline_seconds)),
             k=float(os.getenv("DETECTION_STD_DEV_THRESHOLD", cls.k)),
+            min_excess_messages=float(
+                os.getenv("DETECTION_MIN_EXCESS_MESSAGES", cls.min_excess_messages)
+            ),
+            min_excess_gating_enabled=_env_bool(
+                "DETECTION_MIN_EXCESS_GATING_ENABLED",
+                cls.min_excess_gating_enabled,
+            ),
             hold_cap_seconds=int(os.getenv("DETECTION_HOLD_CAP_SECONDS", cls.hold_cap_seconds)),
             cooldown_seconds=int(os.getenv("DETECTION_COOLDOWN_SECONDS", cls.cooldown_seconds)),
             min_baseline_fraction=float(
@@ -468,8 +527,9 @@ class Decision:
     hold: Optional[HoldState]       # the updated hold to keep in ValueState
     expired_buckets: List[int]      # the operator removes these from MapState
 
-    # The two fields below are diagnostic. The operator does not read them.
-    # AnomalyDetector uses `emit`, `hold` and `expired_buckets` only.
+    # The fields below are diagnostic. The operator reads only
+    # min_lift_candidate for rollout telemetry; it does not use any of them to
+    # change detector state.
     #
     # Plan 06 Phase 4 step 17 needs the reading of every second. `emit` gives
     # the seconds that reported a spike only. It also carries the peak of a
@@ -482,9 +542,9 @@ class Decision:
     # The reading of this second, at the trigger or not. It is None for a
     # second that the detector cannot measure. That occurs when the warm-up
     # gate rejects the second, or when the baseline has no spread.
-    # `intensity` does not depend on `k`, `hold_cap_seconds` or
-    # `cooldown_seconds`. Thus one replay gives the full distribution for each
-    # value of those three fields.
+    # `intensity` does not depend on `k`, `min_excess_messages`,
+    # `hold_cap_seconds` or `cooldown_seconds`. Thus one replay gives the full
+    # distribution for each value of those four fields.
     measurement: Optional[Spike] = None
 
     # The time that the detector has watched this key, in seconds. The warm-up
@@ -506,6 +566,18 @@ class Decision:
     # The old bug made duplicate clips. That symptom is now gone. The log
     # line that showed the bug is also gone. This field replaces it.
     hold_regressed: bool = False
+
+    # True when this second clears the z-score trigger but its absolute
+    # increase is below min_excess_messages. It remains true in shadow mode,
+    # when the reading is still allowed to open or extend a hold. The operator
+    # uses this diagnostic for rollout telemetry.
+    min_lift_candidate: bool = False
+
+    # True only when this candidate would open a new hold under the pre-gate
+    # policy. This is calculated after an over-age hold is discarded and with
+    # the same cooldown predicate the state machine uses below, so production
+    # rollout logs do not have to approximate either condition.
+    min_lift_would_open: bool = False
 
 
 def evaluate(
@@ -627,6 +699,8 @@ def evaluate(
 
     window_mean = window_total / config.window_seconds
     intensity = (window_mean - baseline_mean) / baseline_std
+    expected_window_messages = baseline_mean * config.window_seconds
+    excess_messages = window_total - expected_window_messages
 
     measurement = Spike(
         message_count=window_total,
@@ -635,7 +709,16 @@ def evaluate(
         intensity=intensity,
         detected_at_seconds=second,
     )
-    elevated = intensity >= config.k
+    zscore_elevated = intensity >= config.k
+    minimum_lift_met = excess_messages >= config.min_excess_messages
+    min_lift_candidate = zscore_elevated and not minimum_lift_met
+    cooldown_active = _in_cooldown(second, last_fire_second, config)
+    min_lift_would_open = (
+        min_lift_candidate and hold is None and not cooldown_active
+    )
+    elevated = zscore_elevated and (
+        not config.min_excess_gating_enabled or minimum_lift_met
+    )
 
     # Each branch below gives the same three values. Only `emit` and `hold`
     # change. This local function keeps the three values in one place. A new
@@ -649,12 +732,14 @@ def evaluate(
             expired_buckets=expired_buckets,
             measurement=measurement,
             observed_seconds=observed_seconds,
+            min_lift_candidate=min_lift_candidate,
+            min_lift_would_open=min_lift_would_open,
         )
 
     if hold is None:
         if not elevated:
             return decide(emit=None, hold=None)
-        if _in_cooldown(second, last_fire_second, config):
+        if cooldown_active:
             # The cooldown stops a new period from opening. It does not stop
             # each report. An open period always runs to its own end. The hold
             # already gives one report per period. A cooldown that could stop
@@ -832,13 +917,6 @@ SUPPRESSION_LAG_HEALTHY = "healthy"
 SUPPRESSION_LAG_LAGGING = "lagging"
 SUPPRESSION_LAG_CLASSES = (SUPPRESSION_LAG_HEALTHY, SUPPRESSION_LAG_LAGGING)
 
-# The spellings SUPPRESSION_GATING_ENABLED accepts, compared after strip() and
-# lower(). Anything else is a start-up error rather than a silent default: a
-# kill switch that reads as its default leaves the operator believing gating is
-# off while clips are being dropped.
-_TRUE_SPELLINGS = ("true", "1", "yes", "on")
-_FALSE_SPELLINGS = ("false", "0", "no", "off")
-
 # Distinguishes "the key was not in the decoded object" from "the key was there
 # and held None". Only the first is a legacy state that may be reconstructed;
 # the second is a value this code never wrote (SuppressionState.from_json).
@@ -872,21 +950,6 @@ def _suppression_env_int(name: str, default: int) -> int:
         raise ValueError(
             f"{name} must be a whole number of seconds, got {raw!r}"
         ) from None
-
-
-def _suppression_env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    if normalized in _TRUE_SPELLINGS:
-        return True
-    if normalized in _FALSE_SPELLINGS:
-        return False
-    raise ValueError(
-        f"{name} must be one of {_TRUE_SPELLINGS + _FALSE_SPELLINGS}, "
-        f"got {raw!r}"
-    )
 
 
 @dataclass(frozen=True)
@@ -967,7 +1030,7 @@ class SuppressionConfig:
             raid_window_seconds=_suppression_env_int(
                 "SUPPRESSION_RAID_WINDOW_SECONDS", cls.raid_window_seconds
             ),
-            gating_enabled=_suppression_env_bool(
+            gating_enabled=_env_bool(
                 "SUPPRESSION_GATING_ENABLED", cls.gating_enabled
             ),
             delivery_lag_warn_seconds=_suppression_env_int(

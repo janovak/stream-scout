@@ -150,6 +150,8 @@ class TestShippedDefaults:
     def test_window_and_gate_defaults(self):
         config = DetectorConfig()
         assert config.window_seconds == 5
+        assert config.min_excess_messages == 2.0
+        assert config.min_excess_gating_enabled is True
         assert config.min_baseline_fraction == 0.8
         assert config.cooldown_seconds == 30
         # 0.8 x 300 = 240 seconds of observation before a channel can produce
@@ -165,6 +167,18 @@ class TestShippedDefaults:
         # needed a code change and a redeploy.
         monkeypatch.setenv("DETECTION_MIN_BASELINE_FRACTION", "0.5")
         assert DetectorConfig.from_env().min_baseline_fraction == 0.5
+
+    def test_minimum_lift_is_tunable_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("DETECTION_MIN_EXCESS_MESSAGES", "2.5")
+        monkeypatch.setenv("DETECTION_MIN_EXCESS_GATING_ENABLED", "off")
+        config = DetectorConfig.from_env()
+        assert config.min_excess_messages == 2.5
+        assert config.min_excess_gating_enabled is False
+
+    def test_invalid_minimum_lift_boolean_is_not_silently_defaulted(self, monkeypatch):
+        monkeypatch.setenv("DETECTION_MIN_EXCESS_GATING_ENABLED", "sometimes")
+        with pytest.raises(ValueError, match="DETECTION_MIN_EXCESS_GATING_ENABLED"):
+            DetectorConfig.from_env()
 
     def test_tuned_defaults_come_from_the_corpus(self):
         """Plan 06 Phase 4 replaced two placeholders with measured values.
@@ -201,6 +215,10 @@ class TestShippedDefaults:
             {"baseline_seconds": 1},
             {"hold_cap_seconds": -1},
             {"cooldown_seconds": -1},
+            {"min_excess_messages": -1},
+            {"min_excess_messages": float("inf")},
+            {"min_excess_messages": True},
+            {"min_excess_gating_enabled": "true"},
             {"min_baseline_fraction": 0.0},
             {"min_baseline_fraction": 1.5},
         ],
@@ -418,6 +436,130 @@ class TestWarmUpGate:
         decision = evaluate_at(counts)
         assert decision.emit is None
         assert decision.hold is None
+
+
+class TestMinimumLiftGate:
+    @staticmethod
+    def sparse_counts(config, window_messages):
+        window_start = NOW - config.window_seconds + 1
+        baseline_start = window_start - config.baseline_seconds
+        counts = {baseline_start: 1}
+        counts.update(
+            {NOW - offset: 1 for offset in range(window_messages)}
+        )
+        return counts
+
+    def test_two_messages_clear_shipped_sigma_but_not_minimum_lift(self):
+        config = DetectorConfig()
+        decision = evaluate_at(
+            self.sparse_counts(config, window_messages=2),
+            config=config,
+        )
+
+        assert decision.measurement.intensity > config.k
+        assert (
+            decision.measurement.message_count
+            - decision.measurement.baseline_mean * config.window_seconds
+            < config.min_excess_messages
+        )
+        assert decision.min_lift_candidate is True
+        assert decision.min_lift_would_open is True
+        assert decision.hold is None
+        assert decision.emit is None
+
+    def test_shadow_mode_preserves_the_pre_gate_decision(self):
+        config = DetectorConfig(min_excess_gating_enabled=False)
+        decision = evaluate_at(
+            self.sparse_counts(config, window_messages=2),
+            config=config,
+        )
+
+        assert decision.min_lift_candidate is True
+        assert decision.min_lift_would_open is True
+        assert decision.hold is not None
+        assert decision.emit is None
+
+    def test_a_real_multi_message_spike_still_opens_a_hold(self):
+        config = DetectorConfig()
+        decision = evaluate_at(
+            self.sparse_counts(config, window_messages=3),
+            config=config,
+        )
+
+        assert decision.min_lift_candidate is False
+        assert decision.hold is not None
+        assert decision.hold.peak_message_count == 3
+
+    def test_the_minimum_lift_boundary_is_inclusive(self):
+        config = DetectorConfig(
+            window_seconds=5,
+            baseline_seconds=20,
+            k=0.3,
+            hold_cap_seconds=10,
+            cooldown_seconds=30,
+        )
+        counts = steady_baseline(level=1, wobble=1)
+        counts.update({ts: 1 for ts in WINDOW})
+        counts[NOW] = 3
+
+        decision = evaluate_at(counts, config=config)
+
+        assert decision.measurement.message_count == 7
+        assert decision.measurement.baseline_mean == pytest.approx(1.0)
+        assert decision.hold is not None
+        assert decision.min_lift_candidate is False
+
+    def test_a_blocked_reading_ends_and_reports_an_existing_valid_hold(self):
+        config = DetectorConfig()
+        peak = Spike(
+            message_count=10,
+            baseline_mean=0.1,
+            baseline_std=0.1,
+            intensity=10.0,
+            detected_at_seconds=NOW - 1,
+        )
+        decision = evaluate_at(
+            self.sparse_counts(config, window_messages=2),
+            hold=HoldState.opened(peak),
+            config=config,
+        )
+
+        assert decision.min_lift_candidate is True
+        assert decision.min_lift_would_open is False
+        assert decision.emit == peak
+        assert decision.hold is None
+
+    def test_a_candidate_in_cooldown_would_not_open_without_the_gate(self):
+        config = DetectorConfig(min_excess_gating_enabled=False)
+        decision = evaluate_at(
+            self.sparse_counts(config, window_messages=2),
+            last_fire_second=NOW,
+            config=config,
+        )
+
+        assert decision.min_lift_candidate is True
+        assert decision.min_lift_would_open is False
+        assert decision.hold is None
+
+    def test_would_open_is_computed_after_an_over_age_hold_is_discarded(self):
+        config = DetectorConfig(min_excess_gating_enabled=False)
+        stale_peak = Spike(
+            message_count=10,
+            baseline_mean=0.1,
+            baseline_std=0.1,
+            intensity=10.0,
+            detected_at_seconds=NOW - config.hold_cap_seconds - 1,
+        )
+        decision = evaluate_at(
+            self.sparse_counts(config, window_messages=2),
+            hold=HoldState.opened(stale_peak),
+            config=config,
+        )
+
+        assert decision.min_lift_candidate is True
+        assert decision.min_lift_would_open is True
+        assert decision.hold is not None
+        assert decision.hold.peak_at == NOW
 
 
 class TestPerSecondMeasurement:
@@ -940,6 +1082,11 @@ SUPPRESSION_ENV_VARS = (
     "SUPPRESSION_DELIVERY_LAG_WARN_SECONDS",
 )
 
+MINIMUM_LIFT_ENV_VARS = (
+    "DETECTION_MIN_EXCESS_MESSAGES",
+    "DETECTION_MIN_EXCESS_GATING_ENABLED",
+)
+
 # A sentinel for the record builder: this field is left out of the payload
 # entirely, which is a different failure from carrying it as null.
 OMIT = object()
@@ -1311,6 +1458,23 @@ class TestDockerComposeSuppressionWiring:
     expected to fail until T046 writes both Flink environment blocks -- the
     tasks file makes T046 a hard closure dependency for T029 for exactly this
     reason. Static text assertions only: nothing here starts a container."""
+
+    @pytest.mark.parametrize("service", ["flink-jobmanager", "flink-taskmanager"])
+    def test_both_flink_blocks_ship_minimum_lift_enabled(self, service):
+        env = compose_env(service)
+        defaults = DetectorConfig()
+        assert env["DETECTION_MIN_EXCESS_MESSAGES"] == str(
+            defaults.min_excess_messages
+        )
+        assert env["DETECTION_MIN_EXCESS_GATING_ENABLED"] == "true"
+        assert defaults.min_excess_gating_enabled is True
+
+    def test_the_two_flink_blocks_agree_on_minimum_lift(self):
+        jobmanager = compose_env("flink-jobmanager")
+        taskmanager = compose_env("flink-taskmanager")
+        for name in MINIMUM_LIFT_ENV_VARS:
+            assert jobmanager.get(name) == taskmanager.get(name), name
+            assert jobmanager.get(name) is not None, name
 
     def test_the_suppression_topic_is_created_with_four_partitions(self):
         init = compose_service_block("kafka-init")

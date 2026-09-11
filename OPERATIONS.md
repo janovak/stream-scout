@@ -753,6 +753,195 @@ layout, token, or dependency rollback.
 
 ---
 
+## Feature 008: quiet-stream minimum-lift rollout
+
+The detector still requires `DETECTION_STD_DEV_THRESHOLD=4.0`. Feature 008
+adds a second condition: the five-second message count must exceed its baseline
+expectation by at least `DETECTION_MIN_EXCESS_MESSAGES=2.0`. This prevents a
+tiny positive baseline standard deviation from turning trivial absolute
+activity into a clip. Intensity itself is unchanged.
+
+The checked-in `DETECTION_MIN_EXCESS_GATING_ENABLED=true` ships enforcement
+enabled. Every per-second reading that passes 4 sigma but misses the
+two-message lift is logged as `MINIMUM LIFT CANDIDATE` and increments:
+
+```text
+anomaly_min_lift_candidates_total{broadcaster_id,mode="enforced"}
+```
+
+Set the gate to `false` only for optional shadow validation or rollback. In
+shadow mode, detector output and state follow the previous policy while the
+same log and counter use `mode="shadow"`.
+
+This counter measures candidate seconds, not counterfactual clips. The same
+message can remain inside the five-second window for several evaluations. Each
+log line also states `would_open`. The pure detector calculates that field
+after dropping an over-age hold and with the same cooldown predicate used by
+the state machine, so it identifies candidates capable of opening a new hold
+under shadow policy.
+
+### P0 — offline counterfactual
+
+If the captured corpus is available, compare the exact detector output with
+the gate off and on before deployment. This starts no service or
+infrastructure:
+
+```bash
+cd services/flink-job
+CORPUS=~/stream-scout-corpus/chat-corpus.jsonl
+
+replay_min_lift() {
+  DETECTION_WINDOW_SECONDS=5 \
+  DETECTION_BASELINE_SECONDS=300 \
+  DETECTION_STD_DEV_THRESHOLD=4.0 \
+  DETECTION_MIN_EXCESS_MESSAGES=2.0 \
+  DETECTION_MIN_EXCESS_GATING_ENABLED="$1" \
+  DETECTION_HOLD_CAP_SECONDS=25 \
+  DETECTION_COOLDOWN_SECONDS=30 \
+  DETECTION_MIN_BASELINE_FRACTION=0.8 \
+    python3 tools/replay.py "$CORPUS" | grep ' SPIKE '
+}
+
+replay_min_lift false | sort > /tmp/min-lift-shadow.spikes
+replay_min_lift true  | sort > /tmp/min-lift-enforced.spikes
+comm -23 /tmp/min-lift-shadow.spikes /tmp/min-lift-enforced.spikes \
+  > /tmp/min-lift-removed.spikes
+comm -13 /tmp/min-lift-shadow.spikes /tmp/min-lift-enforced.spikes \
+  > /tmp/min-lift-added.spikes
+wc -l /tmp/min-lift-{shadow,enforced,removed,added}.spikes
+```
+
+Record and review every changed event in the two diff files. Each line contains
+the broadcaster, peak time, count, baseline mean, and intensity. Inspect the
+corresponding clip when one exists, or the surrounding corpus messages.
+Enforcement is blocked if it removes a desirable highlight or if an added
+event cannot be explained by removing an earlier low-lift hold/cooldown.
+
+The corpus characterizes the change; its channel mix may be stale, so it does
+not predict current production volume. If the corpus is absent, record that
+fact. P1 is then the available pre-deployment evidence path: temporarily
+override the checked-in enabled value to collect live shadow candidates before
+restoring enforcement. `tools/analyze_corpus.py` now models Feature 008 by
+default; pass `--min-excess-messages 0` to reproduce the pre-008 Plan 06
+tables.
+
+### P1 — optional shadow validation
+
+The checked-in deployment skips this phase and proceeds directly to P2. To
+collect live shadow evidence first, temporarily override both Flink service
+blocks with `DETECTION_MIN_EXCESS_MESSAGES=2.0` and
+`DETECTION_MIN_EXCESS_GATING_ENABLED=false`, then force-recreate both Flink
+containers because the Python files are individually bind-mounted:
+
+1. Apply the override:
+   ```bash
+   docker compose up -d --force-recreate flink-jobmanager flink-taskmanager
+   docker compose up -d --wait --wait-timeout 500 flink-jobmanager
+   ```
+2. Require both running containers to carry the same settings:
+   ```bash
+   docker exec streamscout-flink-taskmanager env | grep '^DETECTION_MIN_EXCESS'
+   docker exec streamscout-flink-jobmanager env | grep '^DETECTION_MIN_EXCESS'
+   ```
+   Both must report `2.0` and `false`. The TaskManager environment is
+   authoritative because `AnomalyDetector.open()` reads the worker
+   configuration. The JobManager submission log is only submission-side
+   evidence; confirm it as a secondary check:
+   ```text
+   DETECTION_MIN_EXCESS_MESSAGES: 2.0
+   DETECTION_MIN_EXCESS_GATING_ENABLED: False
+   ```
+3. Exclude the first five minutes after the force-recreate from all rate
+   comparisons while each channel rebuilds its baseline. Confirm the job is
+   running and its four worker metric targets are live:
+   ```promql
+   sum(up{job="clip-detector"})
+   ```
+   The result must be `4`.
+4. Run shadow mode without a restart for at least 24 hours, covering one
+   representative peak period. During that single deployment epoch, read the
+   raw counters rather than extrapolating a range longer than the counter has
+   existed:
+   ```promql
+   sum by (broadcaster_id) (
+     anomaly_min_lift_candidates_total{mode="shadow"}
+   )
+   ```
+   Require at least one candidate in either P0 or this live soak; otherwise the
+   new behavior has not been exercised and enforcement remains blocked.
+5. Review the matching `MINIMUM LIFT CANDIDATE` records in Loki.
+   `would_open=true` identifies readings capable of opening a new hold under
+   shadow policy. Extract the emitted anomalies below the lift boundary:
+   ```bash
+   docker logs streamscout-flink-taskmanager --since 24h 2>&1 \
+     | grep 'ANOMALY DETECTED' \
+     | sed -E 's/.*broadcaster ([0-9]+):.*count=([0-9]+), mean=([0-9.]+).*/\1 \2 \3/' \
+     | awk '$2 - $3*5 <= 2.025'
+   ```
+   This computes `count - mean × 5`; because the log rounds `mean` to two
+   decimals, the result has at most ±0.025 message of error. The conservative
+   `2.025` boundary prevents a real sub-2.0 case from being rounded out of the
+   review set; it may include a few safe extra clips. Review every resulting
+   clip. Proceed only if these are the unwanted low-volume cases characterized
+   by P0 and none is a desirable highlight.
+6. Record these as diagnostic context for P2, by broadcaster:
+   ```promql
+   sum by (broadcaster_id) (increase(anomalies_detected_total[24h]))
+   sum by (broadcaster_id) (increase(clips_created_success_total[24h]))
+   ```
+   They are not percentage gates; P0's exact output diff and manual clip
+   review are the acceptance gate.
+
+### P2 — deploy enforcement
+
+The checked-in `DETECTION_MIN_EXCESS_GATING_ENABLED=true` deploys this phase by
+default. If P1 was selected, restore `true` in **both** Flink service blocks.
+Force-recreate both containers:
+
+```bash
+docker compose up -d --force-recreate flink-jobmanager flink-taskmanager
+docker compose up -d --wait --wait-timeout 500 flink-jobmanager
+docker exec streamscout-flink-taskmanager env | grep '^DETECTION_MIN_EXCESS'
+docker exec streamscout-flink-jobmanager env | grep '^DETECTION_MIN_EXCESS'
+```
+
+Both containers must report `2.0` and `true`; the TaskManager value is
+authoritative. Exclude the first five minutes while baselines rebuild. During
+the next representative busy period:
+
+- `anomaly_min_lift_candidates_total{mode="enforced"}` advances for quiet
+  z-score candidates;
+- a candidate with `would_open=true` does not produce an anomaly carrying
+  that candidate's peak second;
+- a candidate with `would_open=false` may end and emit an earlier valid peak,
+  or may already be inside cooldown, as designed;
+- sampled multi-message reactions still produce anomalies and clips;
+- changed outputs retain the low-volume shape accepted in P0/P1; and
+- Flink restarts/errors, watermark health, and clip-creation failures remain at
+  their pre-change levels.
+
+Roll back immediately if a desirable highlight is blocked, the gate emits a
+candidate peak that should have been rejected, or detector health regresses.
+
+### Rollback
+
+Set `DETECTION_MIN_EXCESS_GATING_ENABLED=false` in both Flink service blocks
+and force-recreate both Flink containers:
+
+```bash
+docker compose up -d --force-recreate flink-jobmanager flink-taskmanager
+docker compose up -d --wait --wait-timeout 500 flink-jobmanager
+docker exec streamscout-flink-taskmanager env | grep '^DETECTION_MIN_EXCESS'
+docker exec streamscout-flink-jobmanager env | grep '^DETECTION_MIN_EXCESS'
+```
+
+Both must report `2.0` and `false`; the TaskManager value is authoritative.
+Allow five minutes for baseline rebuild before judging clip recovery. A later
+candidate must carry `mode="shadow"`. There is no database, Kafka, checkpoint,
+or state migration to reverse.
+
+---
+
 ## Important: Postgres and Redis are remote
 
 Postgres and Redis do **not** run on this machine. They run on the Tailscale host `streamer-summaries-api` (100.112.97.111). `docker-compose.override.yml` points `api-frontend`, `stream-monitoring`, and both Flink containers at that host.

@@ -108,6 +108,7 @@ _clips_created_success_total = None
 _clips_created_failed_total = None
 _clip_creation_duration_seconds = None
 _hold_regressed_total = None
+_anomaly_min_lift_candidates_total = None
 # Feature 007 consumer-side signals. Only the reason/category labels are
 # bounded by construction; clips_suppressed_total keeps broadcaster
 # attribution because NFR-006 requires it, under the same finite
@@ -130,6 +131,7 @@ def _init_metrics(subtask_index: int = 0):
     """
     global _metrics_initialized, _anomalies_detected_total, _clips_created_success_total
     global _clips_created_failed_total, _clip_creation_duration_seconds, _hold_regressed_total
+    global _anomaly_min_lift_candidates_total
     global _clips_suppressed_total, _suppression_records_rejected_total
     global _suppression_records_consumed_total, _suppression_delivery_age_seconds
 
@@ -168,6 +170,11 @@ def _init_metrics(subtask_index: int = 0):
         # is now the only production signal for one open question: why does
         # the cursor regress at all?
         _hold_regressed_total = get_or_create_counter("hold_regressed_total", "Total holds passed through with peak ahead of cursor", ["broadcaster_id"])
+        _anomaly_min_lift_candidates_total = get_or_create_counter(
+            "anomaly_min_lift_candidates_total",
+            "Per-second z-score candidates below the minimum absolute lift",
+            ["broadcaster_id", "mode"],
+        )
 
         # Feature 007 (FR-012, NFR-004, NFR-005, NFR-006). One increment per
         # would-have-clipped spike that the gate stopped, attributable to the
@@ -1192,13 +1199,43 @@ class AnomalyDetector(KeyedCoProcessFunction):
             # end. Keep both, or change both together.
             counts_as_of_now = {ts: c for ts, c in all_counts.items() if ts <= now_seconds}
             hold = HoldState.from_json(self.hold.value())
+            last_fire_second = self.last_fire_second.value()
             decision = evaluate(
                 counts_as_of_now,
                 now_seconds,
                 hold,
-                self.last_fire_second.value(),
+                last_fire_second,
                 self.config,
             )
+
+            if decision.min_lift_candidate and decision.measurement is not None:
+                measurement = decision.measurement
+                expected_messages = (
+                    measurement.baseline_mean * self.config.window_seconds
+                )
+                excess_messages = measurement.message_count - expected_messages
+                mode = (
+                    "enforced"
+                    if self.config.min_excess_gating_enabled
+                    else "shadow"
+                )
+                logger.info(
+                    f"MINIMUM LIFT CANDIDATE for broadcaster {broadcaster_id}: "
+                    f"mode={mode}, second={now_seconds}, "
+                    f"would_open={str(decision.min_lift_would_open).lower()}, "
+                    f"count={measurement.message_count}, "
+                    f"expected={expected_messages:.3f}, "
+                    f"excess={excess_messages:.3f}, "
+                    f"required={self.config.min_excess_messages:.3f}, "
+                    f"intensity={measurement.intensity:.2f}, "
+                    f"trigger_k={self.config.k}"
+                )
+                _init_metrics(self.subtask_index)
+                if _anomaly_min_lift_candidates_total:
+                    _anomaly_min_lift_candidates_total.labels(
+                        broadcaster_id=str(broadcaster_id),
+                        mode=mode,
+                    ).inc()
 
             for expired_bucket in decision.expired_buckets:
                 self.message_counts.remove(expired_bucket)
@@ -1525,6 +1562,14 @@ def main():
     # DetectorConfig calls this field `k`; the environment variable keeps its
     # original name, which spec 002 FR-001b and docker-compose.yml refer to.
     logger.info(f"  DETECTION_STD_DEV_THRESHOLD: {detector_config.k}")
+    logger.info(
+        f"  DETECTION_MIN_EXCESS_MESSAGES: "
+        f"{detector_config.min_excess_messages}"
+    )
+    logger.info(
+        f"  DETECTION_MIN_EXCESS_GATING_ENABLED: "
+        f"{detector_config.min_excess_gating_enabled}"
+    )
     logger.info(f"  DETECTION_HOLD_CAP_SECONDS: {detector_config.hold_cap_seconds}")
     logger.info(f"  DETECTION_COOLDOWN_SECONDS: {detector_config.cooldown_seconds}")
     logger.info(f"  SUPPRESSION_GATING_ENABLED: {suppression_config.gating_enabled}")
