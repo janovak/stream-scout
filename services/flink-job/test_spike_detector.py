@@ -1460,13 +1460,13 @@ class TestDockerComposeSuppressionWiring:
     reason. Static text assertions only: nothing here starts a container."""
 
     @pytest.mark.parametrize("service", ["flink-jobmanager", "flink-taskmanager"])
-    def test_both_flink_blocks_declare_minimum_lift_shadow_mode(self, service):
+    def test_both_flink_blocks_ship_minimum_lift_enabled(self, service):
         env = compose_env(service)
         defaults = DetectorConfig()
         assert env["DETECTION_MIN_EXCESS_MESSAGES"] == str(
             defaults.min_excess_messages
         )
-        assert env["DETECTION_MIN_EXCESS_GATING_ENABLED"] == "false"
+        assert env["DETECTION_MIN_EXCESS_GATING_ENABLED"] == "true"
         assert defaults.min_excess_gating_enabled is True
 
     def test_the_two_flink_blocks_agree_on_minimum_lift(self):

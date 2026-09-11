@@ -299,9 +299,9 @@ class DetectorConfig:
     # intensity; stored and displayed intensity keeps its existing meaning.
     min_excess_messages: float = 2.0
 
-    # True in code so direct users and tests get the complete detector policy.
-    # docker-compose.yml checks this in as false for the first deployment, so
-    # production can measure the gate in shadow mode before enforcement.
+    # True in code and docker-compose.yml: the minimum-lift policy ships
+    # enforced. Operators can set it false temporarily for shadow validation
+    # or rollback without changing the threshold.
     min_excess_gating_enabled: bool = True
 
     # The maximum length of one elevated period, before the detector reports a

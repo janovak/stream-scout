@@ -761,14 +761,17 @@ expectation by at least `DETECTION_MIN_EXCESS_MESSAGES=2.0`. This prevents a
 tiny positive baseline standard deviation from turning trivial absolute
 activity into a clip. Intensity itself is unchanged.
 
-The checked-in `DETECTION_MIN_EXCESS_GATING_ENABLED=false` is shadow mode.
-In shadow mode, detector output and state follow the previous policy, while
-each per-second reading that passes 4 sigma but misses the two-message lift is
-logged as `MINIMUM LIFT CANDIDATE` and increments:
+The checked-in `DETECTION_MIN_EXCESS_GATING_ENABLED=true` ships enforcement
+enabled. Every per-second reading that passes 4 sigma but misses the
+two-message lift is logged as `MINIMUM LIFT CANDIDATE` and increments:
 
 ```text
-anomaly_min_lift_candidates_total{broadcaster_id,mode="shadow"}
+anomaly_min_lift_candidates_total{broadcaster_id,mode="enforced"}
 ```
+
+Set the gate to `false` only for optional shadow validation or rollback. In
+shadow mode, detector output and state follow the previous policy while the
+same log and counter use `mode="shadow"`.
 
 This counter measures candidate seconds, not counterfactual clips. The same
 message can remain inside the five-second window for several evaluations. Each
@@ -816,17 +819,21 @@ event cannot be explained by removing an earlier low-lift hold/cooldown.
 
 The corpus characterizes the change; its channel mix may be stale, so it does
 not predict current production volume. If the corpus is absent, record that
-fact and continue to P1, but do not enable enforcement until live shadow
-traffic has supplied candidate episodes for review. `tools/analyze_corpus.py`
-now models Feature 008 by default; pass `--min-excess-messages 0` to reproduce
-the pre-008 Plan 06 tables.
+fact. P1 is then the available pre-deployment evidence path: temporarily
+override the checked-in enabled value to collect live shadow candidates before
+restoring enforcement. `tools/analyze_corpus.py` now models Feature 008 by
+default; pass `--min-excess-messages 0` to reproduce the pre-008 Plan 06
+tables.
 
-### P1 — shadow validation
+### P1 — optional shadow validation
 
-1. Deploy with `DETECTION_MIN_EXCESS_MESSAGES=2.0` and
-   `DETECTION_MIN_EXCESS_GATING_ENABLED=false` in both Flink service blocks.
-   Force-recreate both Flink containers because the Python files are
-   individually bind-mounted:
+The checked-in deployment skips this phase and proceeds directly to P2. To
+collect live shadow evidence first, temporarily override both Flink service
+blocks with `DETECTION_MIN_EXCESS_MESSAGES=2.0` and
+`DETECTION_MIN_EXCESS_GATING_ENABLED=false`, then force-recreate both Flink
+containers because the Python files are individually bind-mounted:
+
+1. Apply the override:
    ```bash
    docker compose up -d --force-recreate flink-jobmanager flink-taskmanager
    docker compose up -d --wait --wait-timeout 500 flink-jobmanager
@@ -885,10 +892,11 @@ the pre-008 Plan 06 tables.
    They are not percentage gates; P0's exact output diff and manual clip
    review are the acceptance gate.
 
-### P2 — enforce and verify
+### P2 — deploy enforcement
 
-Set `DETECTION_MIN_EXCESS_GATING_ENABLED=true` in **both** Flink service
-blocks and force-recreate both containers:
+The checked-in `DETECTION_MIN_EXCESS_GATING_ENABLED=true` deploys this phase by
+default. If P1 was selected, restore `true` in **both** Flink service blocks.
+Force-recreate both containers:
 
 ```bash
 docker compose up -d --force-recreate flink-jobmanager flink-taskmanager

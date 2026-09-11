@@ -65,9 +65,9 @@ minimum lift is a second eligibility gate, not a replacement score.
    bounded to `shadow` or `enforced`, and an INFO log containing the count,
    expected count, excess, intensity, configured threshold, event-time second,
    and whether the candidate would open a new hold under the shadow policy.
-5. Add the threshold to both Flink compose blocks. Check the gate in disabled
-   so the first production deployment runs in shadow mode; the code default
-   remains enabled for direct use and unit tests.
+5. Add the threshold to both Flink compose blocks with enforcement enabled,
+   matching the code default. Setting the gate to `false` remains available
+   for optional shadow validation and rollback.
 6. Log the submission-side settings at job startup. The runbook verifies the
    TaskManager environment separately because the worker re-reads
    `DetectorConfig` in `AnomalyDetector.open()`.
@@ -130,13 +130,15 @@ added event cannot be explained by removing an earlier low-lift hold/cooldown.
 The corpus characterizes the change; it does not predict current production
 volume because the channel mix may be stale.
 
-If the corpus is unavailable, record that fact. P1 then remains blocking until
-live traffic supplies candidate episodes that can be reviewed. Do not enable a
-gate that neither offline replay nor shadow traffic exercised.
+If the corpus is unavailable, record that fact. P1 is then the available
+pre-deployment validation path: temporarily override the checked-in enabled
+setting to collect live shadow evidence before restoring enforcement.
 
-### P1: Deploy in shadow mode
+### P1: Optional shadow validation
 
-Deploy with:
+The checked-in deployment skips this phase and starts with P2 enforcement.
+When live shadow evidence is wanted before enforcement, temporarily override
+both Flink environments with:
 
 ```text
 DETECTION_MIN_EXCESS_MESSAGES=2.0
@@ -173,12 +175,13 @@ behavior accepted in P0 and no desirable highlight is in the removed set.
 Record the shadow-period anomaly and successful-clip counters by broadcaster
 as diagnostic context for P2. They are not a fabricated percentage gate.
 
-### P2: Enable enforcement
+### P2: Deploy enforcement
 
-Set `DETECTION_MIN_EXCESS_GATING_ENABLED=true` in both Flink environments and
-force-recreate both Flink containers. Require both container environments to
-report `true`; the TaskManager value is authoritative. Exclude the first five
-minutes while baselines rebuild, then verify:
+The checked-in `DETECTION_MIN_EXCESS_GATING_ENABLED=true` ships this phase by
+default. If P1 was selected, restore `true` in both Flink environments.
+Force-recreate both Flink containers, require both environments to report
+`true`, and treat the TaskManager value as authoritative. Exclude the first
+five minutes while baselines rebuild, then verify:
 
 - the metric advances under `mode="enforced"`;
 - a candidate logged with `would_open=true` does not create an anomaly with
